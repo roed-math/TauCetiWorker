@@ -47,10 +47,64 @@ class FakeRun:
 
 
 orig_run, orig_platform, orig_user = tc.subprocess.run, sys.platform, os.environ.get("USER")
+orig_home = os.environ.get("HOME")
 os.environ["USER"] = "alice"
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
 tc.sys.platform = "darwin"
 try:
+    # 0. Which item(s) a read consults. Claude Code keys the Keychain item of a non-default
+    #    $CLAUDE_CONFIG_DIR by service "Claude Code-credentials-<first 8 hex of sha256(dir)>", so an
+    #    isolated worker must read ITS OWN item first and the operator's only as the fallback for an item
+    #    that does not exist yet. The default dir reads exactly what it always read.
+    FIND = ["security", "find-generic-password", "-s"]
+    os.environ["HOME"] = "/Users/roed"
+    os.environ["CLAUDE_CONFIG_DIR"] = "/Users/roed/.tauceti/worker1/.claude"  # sha256[:8] measured: 4afde20f
+    check("isolated dir hashes the env value verbatim", tc._claude_keychain_suffix(), "4afde20f")
+    check(
+        "isolated dir reads its own item first, then the operator's",
+        tc._claude_keychain_attempts(),
+        [
+            [*FIND, "Claude Code-credentials-4afde20f", "-a", "alice", "-w"],
+            [*FIND, "Claude Code-credentials-4afde20f", "-w"],
+            [*FIND, "Claude Code-credentials", "-a", "alice", "-w"],
+            [*FIND, "Claude Code-credentials", "-w"],
+        ],
+    )
+    check(
+        "the operator-only read never consults the worker's item",
+        tc._claude_keychain_attempts("operator"),
+        [[*FIND, "Claude Code-credentials", "-a", "alice", "-w"], [*FIND, "Claude Code-credentials", "-w"]],
+    )
+    check(
+        "the worker-only read never falls back to the operator's",
+        tc._claude_keychain_attempts("worker"),
+        [
+            [*FIND, "Claude Code-credentials-4afde20f", "-a", "alice", "-w"],
+            [*FIND, "Claude Code-credentials-4afde20f", "-w"],
+        ],
+    )
+    # A worker whose item does not exist yet (44 twice) reads the operator's: today's behaviour.
+    fr = FakeRun([(44, ""), (44, ""), (0, json.dumps(OAUTH))])
+    tc.subprocess.run = fr
+    check("a worker without its own item falls back to the operator's", tc._claude_keychain_creds(), OAUTH)
+    check(
+        "the fallback is the un-suffixed -a read", fr.calls[2], [*FIND, "Claude Code-credentials", "-a", "alice", "-w"]
+    )
+    os.environ["CLAUDE_CONFIG_DIR"] = "/Users/roed/.claude"  # the default dir spelled out explicitly
+    check("the default dir has no suffix", tc._claude_keychain_suffix(), None)
+    check(
+        "the default dir reads only the un-suffixed item",
+        tc._claude_keychain_attempts(),
+        [[*FIND, "Claude Code-credentials", "-a", "alice", "-w"], [*FIND, "Claude Code-credentials", "-w"]],
+    )
+    check("the worker-only read is empty under the default dir", tc._claude_keychain_attempts("worker"), [])
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    check("an unset dir reads only the un-suffixed item", len(tc._claude_keychain_attempts()), 2)
+    if orig_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = orig_home
+
     # 1. The plain `-a $USER -w` hit parses to the same dict as the file would.
     tc.subprocess.run = FakeRun([(0, json.dumps(OAUTH))])
     check("keychain read parses the OAuth blob", tc._claude_keychain_creds(), OAUTH)
@@ -207,13 +261,19 @@ try:
         seen["blob"] = json.loads((private_dir / ".credentials.json").read_text())
         return types.SimpleNamespace(returncode=0)
 
+    old_mirror_kc = tc.quota.mirror_claude_keychain
+    mirrored = []
     try:
         tc.agents.ensure_bubble_home = lambda _cfg: dict(os.environ)
         tc.agents._bubble_pop = lambda _cfg, _env: None
         tc.agents._claude_keychain_creds_interactive = lambda: FRESH
+        # The pre-launch mirror_creds now re-mirrors the worker's Keychain item; that is `security`
+        # traffic this test must not send. Record the call instead.
+        tc.quota.mirror_claude_keychain = lambda cfg: mirrored.append(cfg)
         tc.agents.subprocess.run = fake_bubble_run
         rc = tc.run_in_bubble(w, "review", "PROMPT", opts, inner_cmd="true", cred_model="claude")
         check("bubble launch succeeds with a private seed", rc, 0)
+        check("bubble launch re-mirrors the worker's Keychain item first", len(mirrored), 1)
         check("bubble subprocess receives current Keychain creds", seen["blob"], FRESH)
         check("bubble subprocess does not receive the host config dir", seen["private_dir"] != launch_cfgdir, True)
         check("private seed is removed after bubble exits", seen["private_dir"].exists(), False)
@@ -266,6 +326,7 @@ try:
         tc.agents._bubble_pop = old_pop
         tc.agents._claude_keychain_creds_interactive = old_keychain
         tc.agents.subprocess.run = old_subprocess_run
+        tc.quota.mirror_claude_keychain = old_mirror_kc
         if old_cfgdir is None:
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
         else:

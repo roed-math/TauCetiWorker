@@ -103,7 +103,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`. Empty means the whole cascade |
 | `sandbox` | string | `"host"` | `host` or `bubble`. Progress-report rounds always run on the host |
 | `ignore_quota` | bool | `false` | Skip soft pacing. Provider hard limits still apply; an `auto` worker cannot launch with this enabled |
-| `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
+| `auto_refresh` | bool | `false` | Renew this worker's Claude and Codex access tokens when they expire, instead of parking until a human runs `claude` or `codex`. Only safe when nothing else uses the same credential file — the refresh token is single-use. On macOS the Claude half is a no-op: set `TAUCETI_CLAUDE_WARM = "1"` in the worker's `env` table instead, which renews the operator's Keychain token with a one-turn `claude` warm-up. See [quota and pacing](quota.md) |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
 | `roadmap_targets` | string | unset | Path of an operator target list for roadmap rounds (see [the reference](reference.md#target-lists)). Several workers may name the same file: each claims its own target before authoring |

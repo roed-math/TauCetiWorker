@@ -170,9 +170,9 @@ case(
     True,
 )
 case(
-    "...without offering --auto-refresh, which codex does not have",
+    "...and offers --auto-refresh, which now rotates the operator's codex source file too",
     "--auto-refresh" in resolve(None, codex_expired, agent="codex")[0],
-    False,
+    True,
 )
 case(
     "a timed block says when instead",

@@ -29,9 +29,11 @@ RUN_STDLIB=(
   build_status_rollup.py
   claude_config_dir.py
   claude_keychain.py
+  claude_warm.py
   claims_repo.py
   codex_account.py
   codex_fallback.py
+  codex_refresh.py
   contest_claim.py
   dispatch_revalidation.py
   fix_diagnostic.py

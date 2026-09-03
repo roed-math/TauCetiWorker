@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import oauth as credential_refresh
 from .config import Config, log
-from .constants import CLAUDE_CMD
+from .constants import CLAUDE_CMD, CODEX_REFRESH_SKEW_S
 from .github import GitHubError, _parse_retry_after
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -59,6 +59,19 @@ CLAUDE_BOOTSTRAP_TIMEOUT_S = 120
 # a credential that cannot be rotated at all must not turn into a request flood.
 CLAUDE_REFRESH_SKEW_S = 5400
 CLAUDE_REFRESH_RETRY_S = 600
+
+# The same bound for the operator's Codex source file (its skew, CODEX_REFRESH_SKEW_S, lives in
+# constants.py because it is env-overridable). A codex access token is a ~10-day JWT, so the skew is
+# days, not minutes; the retry bound is the same request-flood guard as Claude's.
+CODEX_REFRESH_RETRY_S = 600
+
+# macOS: the login Keychain is Claude Code's store and Claude Code stays its only writer, so the pacer
+# cannot rotate the token itself. What it CAN do, when the operator opts in with TAUCETI_CLAUDE_WARM=1,
+# is run one minimal `claude -p` turn against the OPERATOR's store: Claude Code notices the expired
+# token, refreshes it, and writes the Keychain itself. Haiku, one turn, so the run costs about nothing.
+CLAUDE_WARM_PROMPT = "Reply with the single word OK"
+CLAUDE_WARM_MODEL = "claude-haiku-4-5-20251001"
+CLAUDE_WARM_TIMEOUT_S = 180
 
 # How long past its timeout an in-progress reservation is still believed. Covers a request that is
 # slower than the timeout we gave it plus clock skew between workers, so a crashed worker's claim
@@ -745,17 +758,65 @@ def _safe_exists(path: Path) -> bool:
         return False
 
 
-def _claude_keychain_attempts() -> list[list[str]]:
-    """The `security` reads that locate Claude Code's Keychain item: service "Claude Code-credentials"
-    keyed by the login user, then a service-only fallback for older CLI builds that stored it without an
-    account (https://github.com/anthropics/claude-code/issues/9403)."""
-    service = "Claude Code-credentials"
+_CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _host_home() -> Path:
+    """The login user's real home, unaffected by per-worker ``$HOME`` isolation."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return Path(os.path.expanduser("~"))
+
+
+def _claude_keychain_suffix() -> str | None:
+    """The service-name suffix Claude Code gives the Keychain item of a non-default $CLAUDE_CONFIG_DIR,
+    or None when this process uses the default dir. Claude Code keys the item by the first 8 hex chars
+    of sha256 over the config-dir path string EXACTLY as it sees it in the environment — no
+    normalisation, no symlink resolution — so the env value is hashed verbatim: a trailing slash or a
+    `~` would name a different item, and it would name the same different item for Claude Code."""
+    value = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not value:
+        return None
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    if value == os.path.join(home, ".claude"):
+        return None
+    return hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def _claude_keychain_services(scope: str = "auto") -> list[str]:
+    """The Keychain services to consult, in order. `worker` is this process's own suffixed item (empty
+    under the default config dir); `operator` is the un-suffixed item of the login user's own `claude`;
+    `auto` is the worker's item first, then the operator's as the fallback for a worker whose item does
+    not exist yet — which is exactly what every read did before the suffixed item was consulted."""
+    suffix = _claude_keychain_suffix()
+    worker = [] if suffix is None else [f"{_CLAUDE_KEYCHAIN_SERVICE}-{suffix}"]
+    operator = [_CLAUDE_KEYCHAIN_SERVICE]
+    return {"auto": worker + operator, "worker": worker, "operator": operator}[scope]
+
+
+def _claude_keychain_attempts(scope: str = "auto") -> list[list[str]]:
+    """The `security` reads that locate Claude Code's Keychain item(s): each service keyed by the login
+    user, then a service-only fallback for older CLI builds that stored it without an account
+    (https://github.com/anthropics/claude-code/issues/9403). Under an isolated $CLAUDE_CONFIG_DIR the
+    worker's own suffixed service comes first (see _claude_keychain_services)."""
     user = os.environ.get("USER") or ""
     attempts = []
-    if user:
-        attempts.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
-    attempts.append(["security", "find-generic-password", "-s", service, "-w"])
+    for service in _claude_keychain_services(scope):
+        if user:
+            attempts.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
+        attempts.append(["security", "find-generic-password", "-s", service, "-w"])
     return attempts
+
+
+def _claude_expires_at(block: dict) -> float | None:
+    """Unix expiry of a Claude OAuth block's access token (Claude Code stores milliseconds), or None."""
+    value = block.get("expiresAt")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value / 1000 if value >= 100_000_000_000 else float(value)
 
 
 def _claude_keychain_creds() -> dict | None:
@@ -763,16 +824,40 @@ def _claude_keychain_creds() -> dict | None:
     instead of <config>/.credentials.json. Returns the same {"claudeAiOauth": {…}} dict as the file,
     or None when absent / locked / malformed.
 
-    READ-ONLY on purpose — never writes the Keychain. The Keychain is one per-login-user store shared
-    with the operator's interactive claude, and its single-use OAuth refresh token rotates on refresh.
-    If the pacer refreshed and wrote it back, it would rotate the token out from under the operator's
-    claude and log it out. So on token expiry the pacer just reports Claude unavailable for the cycle;
-    the spawned claude refreshes the Keychain on its own runs.
+    Under an isolated $CLAUDE_CONFIG_DIR this is the WORKER's own suffixed item first — the one the
+    spawned claude reads and the one mirror_claude_keychain keeps current — and the operator's
+    un-suffixed item only as the fallback for a worker whose item does not exist yet. Reading only the
+    operator's item judged every worker by the operator's token: when that expired, every worker parked
+    even though its own item was valid, and vice versa.
 
-    The item's service name is "Claude Code-credentials" with the login user as the account; older CLI
-    builds stored it without an account, so fall back to a service-only search
-    (https://github.com/anthropics/claude-code/issues/9403)."""
-    for cmd in _claude_keychain_attempts():
+    Never writes the operator's item, and never rotates ANY token. The Keychain is one per-login-user
+    store, and an OAuth refresh token is single-use: exchanging it retires it, so a chain can be
+    continued by exactly one holder. If the pacer refreshed and wrote it back, it would rotate the token
+    out from under the operator's claude and log it out. Renewal is Claude Code's alone
+    (_warm_claude_keychain runs it against the operator's store when opted in); the worker's item holds
+    an access-token-only mirror (mirror_claude_keychain).
+
+    The item's service name is "Claude Code-credentials" (suffixed per config dir) with the login user
+    as the account; older CLI builds stored it without an account, so fall back to a service-only
+    search (https://github.com/anthropics/claude-code/issues/9403)."""
+    return _claude_keychain_read(_claude_keychain_attempts())
+
+
+def _claude_keychain_operator_creds() -> dict | None:
+    """The OPERATOR's un-suffixed Keychain item only — the one interactive `claude` renews — never the
+    worker's mirror. This is the source mirror_claude_keychain copies from and the store the warm-up
+    renews; reading the worker's item here would mirror a mirror."""
+    return _claude_keychain_read(_claude_keychain_attempts("operator"))
+
+
+def _claude_keychain_worker_creds() -> dict | None:
+    """This worker's own suffixed Keychain item only, with NO fallback to the operator's: None under
+    the default config dir or when the item does not exist yet."""
+    return _claude_keychain_read(_claude_keychain_attempts("worker"))
+
+
+def _claude_keychain_read(attempts: list[list[str]]) -> dict | None:
+    for cmd in attempts:
         try:
             # Bound the read: an unattended GUI ACL prompt would otherwise block the pacer indefinitely
             # (headless/SSH returns 36 right away instead). On timeout, treat Claude as unavailable.
@@ -799,6 +884,66 @@ def _claude_keychain_creds() -> dict | None:
             return None
         # else (e.g. 44 = errSecItemNotFound for this service/account) → try the next attempt
     return None
+
+
+def _claude_keychain_write(service: str, blob: dict) -> bool:
+    """Create or replace ONE generic-password item in the login Keychain. The value travels on the
+    `security` command line exactly the way Claude Code itself stores it; it is never logged, and only
+    the exit status is reported on failure. Callers pass a suffixed (per-worker) service — nothing in
+    the worker writes the operator's un-suffixed item."""
+    if service == _CLAUDE_KEYCHAIN_SERVICE:
+        raise ValueError("refusing to write the operator's Keychain item")
+    user = os.environ.get("USER") or ""
+    cmd = ["security", "add-generic-password", "-U", "-s", service]
+    if user:
+        cmd += ["-a", user]
+    cmd += ["-w", json.dumps(blob)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"claude creds: could not write the {service!r} Keychain item ({type(e).__name__})")
+        return False
+    if p.returncode != 0:
+        log(f"claude creds: writing the {service!r} Keychain item failed (security exited {p.returncode})")
+        return False
+    return True
+
+
+def mirror_claude_keychain(cfg: Config) -> None:
+    """macOS, isolated workers only: keep this worker's own suffixed Keychain item an ACCESS-TOKEN
+    mirror of the operator's item, the way mirror_creds keeps a file mirror elsewhere.
+
+    Refresh tokens are strictly single-use and a chain cannot be forked: two items holding the same
+    refresh token means the second one to refresh fails, and Claude Code then WIPES that item
+    (expiresAt 0, empty refreshToken — measured). So a worker's item must never hold a copy of the
+    operator's refresh token, and no warm-up may ever run inside a worker's config dir. The worker's
+    item carries the operator's current access token with `refreshToken` set to "", the empty value
+    Claude Code itself writes on a failed refresh, so its schema accepts the blob. Consequence: the
+    worker's claude can never refresh; an access token that expires mid-round fails the round, which
+    the pre-launch renewal at CLAUDE_REFRESH_SKEW_S exists to prevent.
+
+    Writes only when the access token changed (or the item still carries a refresh token / is absent);
+    in steady state it is two reads and a compare. Never writes the un-suffixed item. `cfg` is accepted
+    for symmetry with mirror_creds — the isolation itself is the environment's $CLAUDE_CONFIG_DIR."""
+    if sys.platform != "darwin":
+        return
+    suffix = _claude_keychain_suffix()
+    if suffix is None:
+        return  # not isolated: this process reads the operator's item directly
+    src = _claude_keychain_operator_creds()
+    sblk = (src or {}).get("claudeAiOauth") or {}
+    stok = sblk.get("accessToken")
+    if not isinstance(src, dict) or not stok:
+        return  # nothing usable to mirror this cycle (absent, locked, or wiped) — keep what we have
+    cur = _claude_keychain_worker_creds()
+    cblk = (cur or {}).get("claudeAiOauth") or {}
+    if cblk.get("accessToken") == stok and cblk.get("refreshToken") == "":
+        return
+    out = dict(src)
+    blk = dict(sblk)
+    blk["refreshToken"] = ""
+    out["claudeAiOauth"] = blk
+    _claude_keychain_write(f"{_CLAUDE_KEYCHAIN_SERVICE}-{suffix}", out)
 
 
 def _claude_keychain_creds_interactive() -> dict | None:
@@ -947,6 +1092,19 @@ def _mirror_creds_file(
         pass  # best-effort; a failed mirror just keeps the prior copy
 
 
+def _mirror_codex_creds_file(src: Path, dst: Path) -> None:
+    """The codex half of mirror_creds, shared with isolate_home's first seed so a worker's auth.json
+    never holds the operator's real refresh token — not even on its first round."""
+    _mirror_creds_file(
+        src,
+        dst,
+        block_key="tokens",
+        tok_key="access_token",
+        rt_key="refresh_token",
+        rt_placeholder=CODEX_RT_PLACEHOLDER,
+    )
+
+
 def mirror_creds(cfg: Config) -> None:
     """Keep an isolated worker's credential copies in step with the operator's real, externally-refreshed
     files — without ever using a refresh token. The operator runs their own processes that rotate
@@ -957,14 +1115,17 @@ def mirror_creds(cfg: Config) -> None:
     pacer cycle and before every bubble launch: in steady state it is two small reads + a string compare
     and no write.
 
-    macOS skips the CLAUDE half only. There the login Keychain is the store, so there is no source file
-    to mirror and the keychain-first pacer and _stage_claude_creds_for_bubble handle it instead. Codex
-    keeps a FILE on every platform, including macOS, and isolate_home writes its source marker there too
-    — so returning early for the whole function left an isolated macOS worker pinned to whatever account
-    was seeded, forever: never re-synced after an operator account switch, and still holding the real
-    refresh token the once-only seed copied verbatim, which is exactly what this function exists to
-    strip."""
-    if sys.platform != "darwin":
+    On macOS the CLAUDE half is a Keychain mirror instead of a file one. There the login Keychain is the
+    store, so there is no source file; mirror_claude_keychain copies the operator's access token into the
+    worker's own suffixed item (refresh token stripped, as here), and the keychain-first pacer and
+    _stage_claude_creds_for_bubble read that. Codex keeps a FILE on every platform, including macOS, and
+    isolate_home writes its source marker there too — so returning early for the whole function left an
+    isolated macOS worker pinned to whatever account was seeded, forever: never re-synced after an
+    operator account switch, and still holding the real refresh token the once-only seed used to copy
+    verbatim, which is exactly what this function exists to strip."""
+    if sys.platform == "darwin":
+        mirror_claude_keychain(cfg)
+    else:
         iso_claude = claude_dir(cfg.home)
         src_claude = _read_marker(iso_claude / ".tauceti-creds-source")
         if src_claude:
@@ -977,14 +1138,7 @@ def mirror_creds(cfg: Config) -> None:
             )
     src_codex = _read_marker(codex_dir(cfg.home) / ".tauceti-creds-source")
     if src_codex:  # absent on homes seeded before this marker existed
-        _mirror_creds_file(
-            Path(src_codex) / "auth.json",
-            codex_dir(cfg.home) / "auth.json",
-            block_key="tokens",
-            tok_key="access_token",
-            rt_key="refresh_token",
-            rt_placeholder=CODEX_RT_PLACEHOLDER,
-        )
+        _mirror_codex_creds_file(Path(src_codex) / "auth.json", codex_dir(cfg.home) / "auth.json")
 
 
 def _jwt_claims(token: str | None) -> dict:
@@ -1442,7 +1596,14 @@ class Quota:
         tok = auth.get("tokens") or {}
         return self._fingerprint(self._codex_account_id(auth) or tok.get("access_token"))
 
-    def codex(self, *, refresh: bool = False) -> Provider:
+    def codex(self, *, refresh: bool = False, renew: bool = False) -> Provider:
+        """Read the Codex usage endpoint and report whether codex may run. PURE unless `renew`: an
+        inspecting caller (`tauceti status`, the dashboard) reads and never rotates. `renew` is the same
+        opt-in per caller as Quota.claude's — only a caller about to act on the verdict passes it, and
+        it renews the operator's SOURCE file (see _refresh_codex_credential), never the mirror."""
+        # Renew before reading, then mirror, so a rotation reaches the worker's copy in the same call.
+        if renew:
+            self._refresh_codex_credential()
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         # The pacer reads auth.json for the token it measures usage with, so it inherits the same
         # assumption --account does: that auth.json is the credential codex uses. Under a non-file
@@ -1488,10 +1649,13 @@ class Quota:
             if still is not None:
                 return self._codex_from_payload(*still)
             return Provider("codex", False, None, error=str(e))
-        # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
-        # access token simply reads as unavailable until the operator's external refresher rotates it
-        # and mirror_creds picks it up next cycle.
+        # A 401 is the endpoint refusing the access token. A renewing caller under --auto-refresh may
+        # rotate the operator's SOURCE file once (rate-limited) and re-read; every other case reads as
+        # unavailable until the operator's own refresher (or `codex login`) rotates the file and
+        # mirror_creds picks it up next cycle.
         if code != 200 or not payload:
+            if code == 401 and renew and self._refresh_codex_credential(force=True):
+                return self.codex(refresh=True)  # ONE re-read with the rotated token; never renews again
             still = self._cached_codex(fp) if code != 401 else None
             if still is not None:
                 return self._codex_from_payload(*still)
@@ -1571,6 +1735,48 @@ class Quota:
         nxt = self._next_eligible(wins, now)
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
 
+    def _refresh_codex_credential(self, *, force: bool = False) -> bool:
+        """Rotate the OPERATOR's Codex access token when it has expired or is about to, and report whether
+        the source file actually changed. The codex twin of _refresh_claude_credential, with the same
+        opt-in (--auto-refresh / $TAUCETI_AUTO_REFRESH=1) and the same reasoning: the refresh token is
+        single-use, so this is only safe when nothing else uses that file.
+
+        On the host nothing ever rotated ~/.codex/auth.json: the worker mirrors it with the refresh token
+        stripped, so once the operator's ~10-day access token lapsed every codex worker read "refresh left
+        to the operator" until a human ran `codex`. The refresher itself already existed (oauth.py, used by
+        the Docker deployment); it was just never invoked here.
+
+        Targets the SOURCE (the isolate_home marker, else the live file) and never the mirror — a mirror
+        carries no refresh token, so `renewable` refuses it anyway, and mirror_creds overwrites it from the
+        source every cycle. On success the mirror is re-synced immediately so this worker's copy picks up
+        the new access token in the same call. Rate-limited by the markers beside the credential, shared
+        across every worker on the host. Failures are reported and swallowed: an unrefreshable credential
+        still reads as an unavailable provider."""
+        if os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
+            return False
+        prov = credential_refresh.provider("codex", credentials=self._codex_creds_source() / "auth.json")
+        if not credential_refresh.renewable(prov):
+            return False
+        if not force:
+            expiry = credential_refresh.expires_at(prov)
+            if expiry is None or expiry > time.time() + CODEX_REFRESH_SKEW_S:
+                return False
+        try:
+            result = credential_refresh.refresh_if_due(
+                prov,
+                CODEX_REFRESH_SKEW_S,
+                force=force,
+                attempt_interval_seconds=CODEX_REFRESH_RETRY_S,
+            )
+        except (OSError, RuntimeError, ValueError) as e:
+            log(f"codex credential: refresh failed ({e}) — codex stays unavailable until it is renewed")
+            return False
+        if result == "refreshed":
+            mirror_creds(self.cfg)
+            log(f"codex credential: access token renewed ({prov.credentials})")
+            return True
+        return False
+
     # --- Claude ------------------------------------------------------------
     def _claude_creds(self) -> tuple[dict | None, bool]:
         """Returns (oauth_block, from_keychain). The block is Claude Code's {accessToken, refreshToken,
@@ -1608,10 +1814,12 @@ class Quota:
 
         Even when opted in it is skipped where the token still is not ours to spend:
 
-          * macOS, where the login Keychain is the store and any file beside it shares the operator's one
-            refresh token — rotating it would log out their interactive claude;
           * a credential with no real refresh token, which is exactly what a worker MIRROR is. The Docker
             deployment strips it on purpose and runs one dedicated refresher; the worker must not race it.
+
+        macOS is a different mechanism entirely: the login Keychain is the store and Claude Code is its
+        only writer, so the file refresh never applies there. _warm_claude_keychain renews the operator's
+        item by running `claude` itself, under its own opt-in (TAUCETI_CLAUDE_WARM=1).
 
         `force` is for the case where the stored expiry said the token was fine and the endpoint said
         otherwise. Both paths are rate-limited by markers beside the credential, shared across every
@@ -1619,7 +1827,9 @@ class Quota:
         rather than once per poll, and a rotation another process just performed is not immediately
         spent again. A failure is reported and swallowed: an unrefreshable credential still reads as an
         unavailable provider, which is the honest answer."""
-        if sys.platform == "darwin" or os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
+        if sys.platform == "darwin":
+            return self._warm_claude_keychain(force=force)
+        if os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
             return False
         # The ORIGINAL, never the mirror the pacer reads: mirror_creds overwrites the mirror from the
         # original every cycle, so rotating the mirror would be undone and leave the real credential
@@ -1647,6 +1857,126 @@ class Quota:
             log(f"claude credential: access token renewed ({prov.credentials})")
             return True
         return False
+
+    def _claude_warm_spec(self) -> tuple[list[str], dict, str]:
+        """(argv, env, cwd) for the warm-up run — built separately from running it so its isolation is
+        directly testable. The run is ONE Haiku turn, max one turn, plain text output.
+
+        $CLAUDE_CONFIG_DIR is REMOVED from the environment: the warm-up must renew the OPERATOR's Keychain
+        item, the one chain on this login that can be continued. Run inside a worker's config dir it would
+        rotate against the worker's own item, which holds no refresh token (mirror_claude_keychain) and
+        must never hold one. $HOME stays untouched so `security` resolves the login Keychain. The same
+        alternative-auth variables the bootstrap request drops are dropped here: an API key or a Bedrock
+        route would make the run bill something else and never touch the Keychain at all. cwd is a
+        throwaway temp dir outside any checkout, so no CLAUDE.md, hooks or MCP config load."""
+        import tempfile
+
+        argv = [
+            *(shlex.split(CLAUDE_CMD) or ["claude"]),
+            "-p",
+            CLAUDE_WARM_PROMPT,
+            "--model",
+            CLAUDE_WARM_MODEL,
+            "--max-turns",
+            "1",
+            "--output-format",
+            "text",
+        ]
+        drop = CLAUDE_BOOTSTRAP_DROP_ENV | {"CLAUDE_CONFIG_DIR"}
+        env = {k: v for k, v in os.environ.items() if k not in drop}
+        return argv, env, tempfile.mkdtemp(prefix="tauceti-claude-warm-")
+
+    def _claude_warm_request(self) -> tuple[bool, str]:
+        """Run the warm-up. Output is captured and never logged in full: only the exit status and the
+        last line, trimmed, reach the log on failure."""
+        argv, env, cwd = self._claude_warm_spec()
+        try:
+            p = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=CLAUDE_WARM_TIMEOUT_S,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"{argv[0]} timed out after {CLAUDE_WARM_TIMEOUT_S}s"
+        except FileNotFoundError:
+            return False, f"{argv[0]} not found on PATH"
+        except OSError as e:
+            return False, f"could not run {argv[0]}: {e}"
+        finally:
+            shutil.rmtree(cwd, ignore_errors=True)
+        if p.returncode != 0:
+            return False, f"{argv[0]} exited {p.returncode}{_tail_detail(p.stderr or p.stdout)}"
+        return True, "ok"
+
+    @staticmethod
+    def _claude_warm_paths() -> tuple[Path, Path]:
+        """(lock, attempt marker) for the warm-up. HOST-WIDE, under the login user's real home rather than
+        any worker's state: there is one operator Keychain item per login, so every worker on the host
+        must contend for the same lock, or N workers whose tokens lapse together (they share the token)
+        each start a `claude` that races the others' refresh."""
+        d = _host_home() / ".cache" / "tauceti"
+        return d / "claude-warm.lock", d / "claude-warm.last-attempt"
+
+    def _warm_claude_keychain(self, *, force: bool = False) -> bool:
+        """macOS: renew the OPERATOR's Keychain token by running `claude` once, and report whether the
+        Keychain token actually advanced. OFF unless $TAUCETI_CLAUDE_WARM=1.
+
+        The pacer must not write the operator's item (see _claude_keychain_creds), but a `claude` run
+        renews it on its own: Claude Code sees the expired token, exchanges the refresh token, and writes
+        the new pair back — Keychain written by Claude Code, exactly as an interactive run would. So the
+        renewal is one Haiku turn against the operator's store, roughly once per token lifetime (8 h).
+        The worker's own item is then re-mirrored from it by mirror_claude_keychain in the same cycle.
+
+        Serialized host-wide (one operator item per login, N workers) and rate-limited by an attempt
+        marker beside the lock, so a token that can no longer be renewed costs one run per
+        CLAUDE_REFRESH_RETRY_S rather than one per poll. `force` skips the stored-expiry pre-check (the
+        endpoint said 401) but not the rate limit."""
+        if os.environ.get("TAUCETI_CLAUDE_WARM") != "1":
+            return False
+        before = ((_claude_keychain_operator_creds() or {}).get("claudeAiOauth")) or {}
+        if not _str_or_none(before.get("refreshToken")):
+            return False  # nothing Claude Code could renew with either (never logged in, or wiped)
+        if not force:
+            expiry = _claude_expires_at(before)
+            if expiry is None or expiry > time.time() + CLAUDE_REFRESH_SKEW_S:
+                return False
+        lock, marker = self._claude_warm_paths()
+        try:
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_CREAT | os.O_WRONLY, 0o600)
+        except OSError as e:
+            log(f"claude credential: cannot take the warm-up lock {lock} ({e}) — not renewing")
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # Re-read under the lock: another worker may have just renewed it while we waited.
+            held = ((_claude_keychain_operator_creds() or {}).get("claudeAiOauth")) or {}
+            if held.get("accessToken") and held.get("accessToken") != before.get("accessToken"):
+                return True
+            now = time.time()
+            last = credential_refresh._marker_time(marker)
+            if last is not None and now < last + CLAUDE_REFRESH_RETRY_S:
+                return False
+            # Stamped BEFORE the run, so a failure (or a crash mid-run) still throttles the next attempt.
+            credential_refresh._write_atomic(marker, {"at": now})
+            ok, detail = self._claude_warm_request()
+            after = ((_claude_keychain_operator_creds() or {}).get("claudeAiOauth")) or {}
+            old_exp, new_exp = _claude_expires_at(before), _claude_expires_at(after)
+            if after.get("accessToken") and new_exp is not None and (old_exp is None or new_exp > old_exp):
+                log(
+                    "claude credential: Keychain token renewed by a warm-up run "
+                    f"(expires in {(new_exp - time.time()) / 3600:.1f} h)"
+                )
+                return True
+            why = detail if not ok else "the run succeeded but the Keychain expiry did not advance"
+            log(f"claude credential: warm-up run did not renew the Keychain token ({why}) — claude stays unavailable")
+            return False
+        finally:
+            os.close(fd)
 
     def claude(self, *, refresh: bool = False, renew: bool = False) -> Provider:
         """Read the Claude usage endpoint and report whether opus may run. PURE: it reads, it never
@@ -2142,12 +2472,12 @@ class Quota:
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
         fallback. Kiro and OpenRouter agents bypass this entirely (handled by the caller).
 
-        `renew` is passed through to Quota.claude: a caller that is about to act on the answer may
-        renew an expiring access token, an inspection command may not.
+        `renew` is passed through to Quota.codex and Quota.claude: a caller that is about to act on
+        the answer may renew an expiring access token, an inspection command may not.
         """
         snap = {}
         if forced in (None, "auto", "codex"):
-            snap["codex"] = self.codex(refresh=refresh)
+            snap["codex"] = self.codex(refresh=refresh, renew=renew)
         if forced in (None, "auto", "claude"):
             snap["claude"] = self.claude(refresh=refresh, renew=renew)
         codex_ok = snap.get("codex") and snap["codex"].available

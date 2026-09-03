@@ -129,7 +129,8 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
-  TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
+  TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude/Codex token; see --auto-refresh)
+  TAUCETI_CLAUDE_WARM=1  macOS: renew an expired Claude Keychain token with a one-turn `claude` warm-up
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
@@ -303,8 +304,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         dest="auto_refresh",
         action="store_true",
         default=None,
-        help="renew this worker's Claude access token when it expires, instead of reporting Claude "
-        "unavailable until a human runs `claude` again. ONLY safe when nothing else uses the same "
+        help="renew this worker's Claude and Codex access tokens when they expire, instead of reporting the "
+        "provider unavailable until a human runs `claude`/`codex` again. ONLY safe when nothing else uses the same "
         "credential file: the refresh token is single-use, so an interactive `claude`, a second "
         "refresher, or a copy of the credential on another host can be logged out by the rotation. "
         "Off by default; sets $TAUCETI_AUTO_REFRESH=1 (inherited by loop children)",

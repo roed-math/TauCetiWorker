@@ -316,11 +316,11 @@ def _credential_hint(agent: str, prov: Provider | None) -> str:
     if "usage HTTP 401" not in error and "token expired; refresh left to the operator" not in error:
         return ""
     if agent != "claude":
-        return ". Run `codex login` to renew the credential"
+        return ". Run `codex login` to renew the credential, or --auto-refresh to let an unattended worker rotate it"
     if sys.platform == "darwin":
-        # The Keychain is the store here and the worker never writes it, so --auto-refresh does nothing
-        # and offering it would send the operator after a flag that cannot help.
-        return ". Run `claude` to renew the Keychain credential"
+        # The Keychain is the store here and the worker never writes the operator's item, so the file
+        # refresh behind --auto-refresh does nothing; the warm-up run is the flag that can help.
+        return ". Run `claude` to renew the Keychain credential, or TAUCETI_CLAUDE_WARM=1 to let a warm-up run do it"
     return (
         ". Run `claude` to renew the credential, or --auto-refresh to let an unattended worker rotate it"
         " (see docs/quota.md)"

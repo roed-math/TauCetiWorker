@@ -12,6 +12,7 @@ This pins both platforms with a faked sys.platform and a faked worker home, touc
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import json
 import os
 import sqlite3
 import sys
@@ -76,7 +77,9 @@ def seeded_real_home(root):
     """A plausible operator home: a codex credential to isolate, and a gh config to redirect to."""
     real = Path(root) / "real"
     (real / ".codex").mkdir(parents=True)
-    (real / ".codex" / "auth.json").write_text('{"tokens": {"access_token": "operator"}}')
+    (real / ".codex" / "auth.json").write_text(
+        json.dumps({"tokens": {"access_token": "operator", "refresh_token": "operator-real-rt"}})
+    )
     (real / ".claude").mkdir(parents=True)
     (real / ".config" / "gh").mkdir(parents=True)
     # The test switches sys.platform after constructing this fixture, so seed
@@ -109,6 +112,21 @@ with tempfile.TemporaryDirectory() as root:
     check("macOS redirects HOME only for Kiro", env["TAUCETI_KIRO_PROCESS_HOME"], str(iso))
     check("data root is exported", env["TAUCETI_DATA_HOME"], str(iso))
     check("codex credential is copied in", (iso / ".codex" / "auth.json").exists(), True)
+    # The FIRST seed goes through the same stripping mirror as every later re-mirror: a byte copy handed
+    # the worker the operator's real, single-use refresh token for its whole first round.
+    seeded = json.loads((iso / ".codex" / "auth.json").read_text())["tokens"]
+    check("seed carries the operator's access token", seeded["access_token"], "operator")
+    check("seed carries the placeholder refresh token", seeded["refresh_token"], tc.CODEX_RT_PLACEHOLDER)
+    check(
+        "seed never holds the real refresh token",
+        "operator-real-rt" in (iso / ".codex" / "auth.json").read_text(),
+        False,
+    )
+    check(
+        "the operator's file is untouched by the seed",
+        json.loads((real / ".codex" / "auth.json").read_text())["tokens"]["refresh_token"],
+        "operator-real-rt",
+    )
     check("codex source marker recorded", (iso / ".codex" / ".tauceti-creds-source").read_text(), str(real / ".codex"))
     check(
         "Kiro credential database is snapshotted",
@@ -198,8 +216,8 @@ with tempfile.TemporaryDirectory() as root:
     check("the worker copy is not empty", (iso / ".codex" / "auth.json").exists(), True)
     check(
         "seeded from the custom dir",
-        (iso / ".codex" / "auth.json").read_text(),
-        '{"tokens": {"access_token": "the-one-actually-in-use"}}',
+        json.loads((iso / ".codex" / "auth.json").read_text())["tokens"]["access_token"],
+        "the-one-actually-in-use",
     )
     check("marker names the custom dir", (iso / ".codex" / ".tauceti-creds-source").read_text(), str(custom))
 

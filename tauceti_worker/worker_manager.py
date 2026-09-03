@@ -1179,7 +1179,9 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
 
     # Worth stating rather than leaving implicit: this worker rotates the operator's Claude credential.
     if spec.get("auto_refresh"):
-        lines.extend(_status_field("credential", ["renews its own Claude access token (--auto-refresh)"], width))
+        lines.extend(
+            _status_field("credential", ["renews its own Claude and Codex access tokens (--auto-refresh)"], width)
+        )
 
     if "roadmap" in phases:
         focus = spec.get("roadmap_only")

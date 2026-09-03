@@ -23,7 +23,13 @@ is fine at a keyboard and fatal unattended: `work --loop` will sit at
 someone intervenes.
 
 `tauceti work --loop --auto-refresh` (or `$TAUCETI_AUTO_REFRESH=1`) lets the
-worker renew the token itself once it is within 90 minutes of expiry.
+worker renew the token itself once it is within 90 minutes of expiry. The same
+flag covers Codex: the operator's `~/.codex/auth.json` (a ~10-day access token
+that nothing on the host otherwise rotated) is renewed once it is within
+`TAUCETI_CODEX_REFRESH_SKEW` (default 48 h) of expiry, under the same host
+flock and the same caveat below — no copy of that refresh token may exist
+anywhere else. Without it every Codex worker reads `codex token expired; refresh
+left to the operator` until a human runs `codex`.
 
 **Only turn it on when nothing else uses that credential file.** Claude and Codex
 issue single-use refresh tokens: exchanging one retires it and returns a
@@ -33,26 +39,59 @@ refresher, or a copy of the credential on another machine — a rotation here lo
 any of those out. The shape this is meant for is a worker running as its own
 user, with its own Claude account nobody signs into interactively;
 `$CLAUDE_CONFIG_DIR` gives the same separation on a shared login. On macOS the
-flag does nothing: the Keychain is the store, and the section below applies
-instead.
+Claude half of the flag does nothing: the Keychain is the store, and the section
+below applies instead. The Codex half works everywhere.
 
 When it is on: it renews the file the operator owns, never a worker's stripped
 mirror, and it never touches a credential carrying no refresh token, so the
-Docker deployment's dedicated refresher stays the single writer there. Rotations
-are rate-limited by markers beside the credential, shared across every worker on
-the host. Only the paths about to run something renew — the loop pacing towards a
-round, a round resolving the model it will launch, and the launch stage. Reading
+Docker deployment's dedicated refresher stays the single writer there. A
+worker's copy never holds one: the first seed at `--isolate-home` goes through
+the same stripping mirror as every later re-mirror. Rotations are rate-limited
+by markers beside the credential, shared across every worker on the host. Only
+the paths about to run something renew — the loop pacing towards a round, a
+round resolving the model it will launch, and the launch stage. Reading
 commands stay reads: `tauceti status` and the dashboard report an expired token
 rather than rotating it behind you.
 
 ## macOS and the login Keychain
 
 On macOS, Claude Code keeps its credentials in the login Keychain rather than in
-a file. The pacer reads them from the Keychain, read-only. It never refreshes
-the Keychain, because that would log out your interactive `claude`. So on token
-expiry it simply reports Claude unavailable for the cycle, and your next `claude`
-run refreshes the Keychain so the pacer can read it again. `--auto-refresh` does
-nothing here, so that run is the only way back.
+a file: service `Claude Code-credentials` for the default config dir, and
+`Claude Code-credentials-<suffix>` for a non-default `$CLAUDE_CONFIG_DIR`
+(`<suffix>` is the first 8 hex characters of the SHA-256 of the directory path,
+exactly as set). An isolated worker therefore has its own item, and the pacer
+reads that item first, falling back to the operator's un-suffixed one only for
+a worker whose item does not exist yet. It used to read only the operator's
+item, so every worker parked when the operator's token expired and ran on when
+its own had.
+
+**Refresh tokens are single-use, one chain per login, and copies are fatal.**
+Exchanging a refresh token retires it; a second holder of the same token fails
+its next refresh, and Claude Code then wipes that holder's item. So no worker
+ever holds one. The worker's own Keychain item is an access-token mirror of the
+operator's: whenever the operator's access token changes, the worker's item is
+rewritten with it and an empty `refreshToken`, the way `mirror_creds` keeps a
+stripped file copy elsewhere. The operator's un-suffixed item is never written
+by TauCeti, and a worker's `claude` can never refresh — an access token that
+expires mid-round fails that round, which is what the 90-minute pre-launch
+renewal is there to prevent. Bubble's private Keychain handoff seeds the
+container from the worker's item, so the in-container `claude` cannot refresh
+either.
+
+Renewal is Claude Code's alone. With `TAUCETI_CLAUDE_WARM=1` (put it in a
+worker's `env` table, or export it for `work --loop`), a token within 90 minutes
+of expiry — or one the usage endpoint has just rejected — is renewed by a
+warm-up run: one `claude -p` Haiku turn, one turn at most, run with
+`$CLAUDE_CONFIG_DIR` removed from its environment so it refreshes the
+*operator's* item, the one chain on this login. Claude Code notices the expired
+token, exchanges the refresh token and writes the Keychain itself; the worker's
+item is re-mirrored from it in the same cycle. The run is serialized host-wide
+(`~/.cache/tauceti/claude-warm.lock`, so N workers whose shared token lapses
+together do not race) and attempted at most once per ten minutes, so it costs
+roughly one Haiku call per token lifetime — about every eight hours. Without the
+flag the pacer reports Claude unavailable on expiry, as before, and your next
+interactive `claude` run is the way back. The file-based `--auto-refresh` never
+touches the Keychain.
 
 A locked Keychain, which is what you get headless or over SSH, reports
 unavailable with a hint to `security unlock-keychain` first.

@@ -39,6 +39,8 @@ from .paths import HERE
 from .quota import (
     Quota,
     _claude_keychain_creds_interactive,
+    _host_home,
+    _mirror_codex_creds_file,
     _read_json_file,
     _safe_exists,
     _write_json_atomic,
@@ -958,16 +960,6 @@ def tauceti_cache_unreachable_reason() -> str | None:
         return None
 
 
-def _host_home() -> Path:
-    """The login user's real home, unaffected by per-worker ``$HOME`` isolation."""
-    try:
-        import pwd
-
-        return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError, OSError):
-        return Path(os.path.expanduser("~"))
-
-
 def bubble_cmd_is_disposable(cmd: list[str] | None = None) -> bool:
     """Whether Bubble would run from uv's disposable one-shot tool cache."""
     cmd = cmd or bubble_cmd()
@@ -1879,10 +1871,11 @@ def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
     review / the --isolate-home flag). Gives the config dir its own agent-facing surface rather than
     the operator's (seed_worker_claude_config) and symlinks the worker's own tooling from the real
-    config dir; copies the mutable Claude/Codex auth files in ONCE, then records the source dirs in
-    .tauceti-creds-source markers so mirror_creds() can re-mirror a fresher access token whenever the
-    operator's external refresher rotates it. The worker itself never refreshes (never touches the
-    single-use refresh token). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is repointed
+    config dir; copies the mutable Claude/Codex auth files in ONCE (the codex one through the same
+    refresh-token-stripping mirror mirror_creds() uses, so the copy never holds a rotatable token), then
+    records the source dirs in .tauceti-creds-source markers so mirror_creds() can re-mirror a fresher
+    access token whenever the operator's refresher rotates it. The worker itself never refreshes (never
+    touches the single-use refresh token). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is repointed
     there, so both the pacer and the spawned claude read the isolated creds even when the operator's real
     config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
 
@@ -1891,10 +1884,12 @@ def isolate_home(wid: str) -> Path:
     Claude creds and parked every non-default worker in a 300s sleep for ever (#135, Jeremy Kahn), and
     gh lost its token (Bryan's report) until a $GH_TOKEN seed was bolted on to compensate. Nothing was
     bought in exchange. The Keychain is ONE per-login-user store, so the credential copy never isolated
-    Claude on macOS in the first place — which is why mirror_creds() returns early there and the pacer
-    reads the Keychain ahead of any file. So on macOS isolate the two things that genuinely are
-    per-worker and are addressed by environment variable, $CLAUDE_CONFIG_DIR and $CODEX_HOME, and leave
-    $HOME alone. Workers share the one Claude account there, which is what was already happening.
+    Claude on macOS in the first place — there the pacer reads the Keychain ahead of any file, and
+    mirror_creds() keeps the worker's own suffixed Keychain item (Claude Code keys items by
+    $CLAUDE_CONFIG_DIR) an access-token mirror of the operator's. So on macOS isolate the two things
+    that genuinely are per-worker and are addressed by environment variable, $CLAUDE_CONFIG_DIR and
+    $CODEX_HOME, and leave $HOME alone. Workers share the one Claude account there, which is what was
+    already happening.
 
     Returns the worker home. Children inherit the exported variables (and, off macOS, $HOME)."""
     import shutil
@@ -1961,7 +1956,10 @@ def isolate_home(wid: str) -> Path:
     real_codex = codex_dir(real)
     src, dst = real_codex / "auth.json", iso_codex / "auth.json"
     if _safe_exists(src) and not dst.exists():
-        shutil.copy2(src, dst)
+        # The same stripping mirror mirror_creds() applies every cycle, not a byte copy: a verbatim
+        # copy handed the worker the operator's REAL refresh token for its whole first round, and that
+        # token is single-use — a worker's copy must never be able to rotate the operator's chain.
+        _mirror_codex_creds_file(src, dst)
     # Record the real ~/.codex so mirror_creds() can re-mirror the codex token too (the Claude marker only
     # names the Claude source). Written unconditionally so homes seeded before this marker existed get it
     # backfilled on their next isolate_home() run.

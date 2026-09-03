@@ -263,6 +263,11 @@ PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/script
 # $TAUCETI_CODEX_MODEL. (Bubble rounds run claude inside the container, so this is host-mode only.)
 CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
+# How early --auto-refresh rotates the OPERATOR's Codex access token (a ~10-day JWT), in seconds.
+# Days rather than Claude's 90 minutes: the loop polls every few minutes, so anything above one poll
+# interval works, and a wide margin means a worker asleep over a weekend still wakes to a live token.
+CODEX_REFRESH_SKEW_S = int(os.environ.get("TAUCETI_CODEX_REFRESH_SKEW", str(48 * 3600)))
+
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
