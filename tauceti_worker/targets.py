@@ -29,7 +29,7 @@ file is not a target list and the round dies rather than authoring against a mis
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .config import Die, log
@@ -166,6 +166,60 @@ def open_items(targets: Targets, area: str) -> list[TargetItem]:
 def open_areas(targets: Targets) -> list[str]:
     """Areas with at least one `[ ]` item, in file order."""
     return [a for a, items in targets.areas.items() if any(it.status == "open" for it in items)]
+
+
+Key = tuple[str, str]  # (area, slug) — what a PR's target marker identifies
+
+
+def overlay_live(targets: Targets, inflight: set[Key], done: set[Key]) -> Targets:
+    """The list with each item's status replaced by its EFFECTIVE status: done if the file says `[x]`
+    or a merged PR carries its marker; else in flight if the file says `[~]` or an open PR carries
+    its marker; else open. The file's marks go stale between the operator's edits, so a fleet reads
+    the live view and never re-authors what has already landed or is already in flight."""
+    areas: dict[str, list[TargetItem]] = {}
+    for area, items in targets.areas.items():
+        out = []
+        for it in items:
+            status = it.status
+            if status != "done" and (area, it.slug) in done:
+                status = "done"
+            elif status == "open" and (area, it.slug) in inflight:
+                status = "inflight"
+            out.append(replace(it, status=status))
+        areas[area] = out
+    return Targets(preamble=targets.preamble, areas=areas)
+
+
+def eligible_items(targets: Targets, area: str) -> list[TargetItem]:
+    """The area's open items whose every `needs` slug is done, in file order. A slug the file does
+    not define anywhere counts as done (with a one-line warning): an operator's typo must not stall
+    a whole fleet, and the agent still sees the prerequisite rendered as `[?]`."""
+    out = []
+    warned: set[str] = set()
+    for it in targets.areas.get(area, []):
+        if it.status != "open":
+            continue
+        ok = True
+        for slug in it.needs:
+            dep = targets.find(slug)
+            if dep is None:
+                if slug not in warned:
+                    warned.add(slug)
+                    log(
+                        f"roadmap targets: `{it.slug}` needs `{slug}`, which the list does not define — treating it as done"
+                    )
+                continue
+            if dep.status != "done":
+                ok = False
+                break
+        if ok:
+            out.append(it)
+    return out
+
+
+def eligible_areas(targets: Targets) -> list[str]:
+    """Areas with at least one eligible item, in file order."""
+    return [a for a in targets.areas if eligible_items(targets, a)]
 
 
 def render_item(targets: Targets, it: TargetItem) -> str:

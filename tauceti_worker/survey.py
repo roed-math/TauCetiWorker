@@ -96,6 +96,25 @@ def target_marker_focuses(body: str) -> tuple[str, ...]:
     return tuple(sorted(focuses))
 
 
+def target_marker_ids(body: str) -> tuple[tuple[str, str], ...]:
+    """Every (focus, id) pair in the body's target markers — the identity of the roadmap target a PR
+    covers, as the authoring prompt has the agent record it. Unlike `target_marker_focuses` this keeps
+    the scope words too: an operator target list matches on the exact (area, slug) pair, and a marker
+    that names no id (or no focus) identifies nothing and is dropped."""
+    ids: set[tuple[str, str]] = set()
+    for match in TARGET_MARKER_RE.finditer(body):
+        try:
+            data = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        focus, ident = data.get("focus"), data.get("id")
+        if isinstance(focus, str) and focus and isinstance(ident, str) and ident:
+            ids.add((focus, ident))
+    return tuple(sorted(ids))
+
+
 @dataclass(frozen=True)
 class PRInfo:
     number: int
@@ -111,6 +130,7 @@ class PRInfo:
     author_is_bot: bool = False  # a GitHub App / bot author (e.g. the review bot's bump PRs)
     title: str = ""
     target_focuses: tuple[str, ...] = ()  # synchronous fallback while the derived roadmap label is pending
+    target_ids: tuple[tuple[str, str], ...] = ()  # (focus, id) of every target marker in the body
     labels: tuple[str, ...] = ()  # label names carried by the PR (the status pipeline + roadmap area)
     # When the authoritative `build` status was posted for THIS head (epoch seconds), i.e. the instant
     # the PR became reviewable — so "awaiting review since" is exactly this, and a new push resets it
@@ -143,6 +163,7 @@ class PRInfo:
             number=d["number"],
             title=d.get("title", ""),
             target_focuses=target_marker_focuses(d.get("body", "")),
+            target_ids=target_marker_ids(d.get("body", "")),
             head_oid=d.get("headRefOid", ""),
             head_ref=d.get("headRefName", ""),
             head_owner=head_owner,

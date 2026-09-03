@@ -12,6 +12,12 @@ milestones grouped by roadmap area. This harness pins, without GitHub or a model
      an area with open targets and never lists areas over the network; --roadmap-skip removes an
      area; a pinned area with no open item is NoProgress; the rendered block reaches the prompt on
      both the bubble and host paths; with the env unset the prompt says `none` and nothing changes.
+  4. The live overlay: an open PR's target marker puts a listed item in flight, a merged PR's marks
+     it done, an unknown `needs` slug is warned about and treated as done, and a GitHubError on the
+     merged fetch falls back to the file's marks. Eligibility = open and every need done.
+  5. The worker-side claim loop, with claim.sh scripted: rc [1, 0] takes the second candidate and
+     sets the push-arbiter env; all-1 is NoProgress; rc 2 proceeds unclaimed; the acquire cap holds;
+     the prompt assigns the chosen slug; areas are visited in random order.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -28,8 +34,11 @@ sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 from tauceti_worker import targets as T
 
+S = sys.modules["tauceti_worker.survey"]  # the package exports survey() the function under that name
+
 FORK = "alice/TauCeti"
 fails = 0
+ST: dict = {}  # scripted claim.sh verdicts, acquires made, log lines, heartbeat/cleanup registrations
 
 
 def check(name, cond):
@@ -51,6 +60,7 @@ Items are ordered; take the first open one whose needs are done.
 - [x] `site-basics` — sites and sieves (serves: B1; done: #5513)
 > a note line, ignored
 - [ ] this line has no slug and must be ignored with a warning
+- [ ] `sheaf-hom` — internal hom of sheaves (serves: B4; needs: `site-basics`)
 
 ## Cohomology
 - [ ]   `derived-pushforward`   —   derived pushforward along a morphism (serves: B7; needs: `sheaf-pullback-exact`, `ghost-slug`)
@@ -74,10 +84,10 @@ def test_parser():
     sh = t.areas["Sheaves"]
     check(
         "parser: malformed item line ignored",
-        [it.slug for it in sh] == ["sheaf-pullback-exact", "stalk-functor", "site-basics"],
+        [it.slug for it in sh] == ["sheaf-pullback-exact", "stalk-functor", "site-basics", "sheaf-hom"],
     )
-    check("parser: statuses", [it.status for it in sh] == ["open", "inflight", "done"])
-    check("parser: markers", [it.marker for it in sh] == ["[ ]", "[~]", "[x]"])
+    check("parser: statuses", [it.status for it in sh] == ["open", "inflight", "done", "open"])
+    check("parser: markers", [it.marker for it in sh] == ["[ ]", "[~]", "[x]", "[ ]"])
     check("parser: needs as backtick slugs", sh[0].needs == ["site-basics", "stalk-functor"])
     check("parser: needs none -> []", sh[1].needs == [])
     check("parser: text stops before the metadata", sh[0].text == "pullback of sheaves is exact")
@@ -139,8 +149,37 @@ def test_helpers():
 
 
 # ---- 3. selection in do_roadmap --------------------------------------------------------------------
+class FakeGitHub:
+    """`pr_list` only: the merged bodies the live overlay reads, or a GitHubError when `fail` is set."""
+
+    def __init__(self, merged_bodies=(), fail=False):
+        self.merged_bodies = list(merged_bodies)
+        self.fail = fail
+        self.calls = []
+
+    def pr_list(self, fields, *, author=None, state="open"):
+        self.calls.append((tuple(fields), state))
+        if self.fail:
+            raise tc.github.GitHubError("gh pr list failed: 504")
+        return [{"number": 9000 + n, "body": body} for n, body in enumerate(self.merged_bodies)]
+
+
+def _marker(area, slug):
+    return f'<!--tauceti-target:v1 {{"focus":"{area}","id":"{slug}"}}-->'
+
+
+def _survey(*open_markers):
+    """A minimal Survey-shaped object: `open_prs` carrying PRInfo built the way the real survey does."""
+    prs = []
+    for n, (area, slug) in enumerate(open_markers):
+        prs.append(S.PRInfo.from_json({"number": 100 + n, "body": f"This PR …\n{_marker(area, slug)}\n"}))
+    return types.SimpleNamespace(open_prs=prs)
+
+
 def _stub_round(tmp):
-    """The same stubbing as tests/fork_authoring.py::test_roadmap, minus the source material."""
+    """The same stubbing as tests/fork_authoring.py::test_roadmap, minus the source material, plus a
+    real Claims whose claim.sh verdicts are scripted (ST["script"], default 0) and whose heartbeat is
+    recorded instead of spawned."""
     os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     tc.work_units.ensure_fork = lambda: FORK
@@ -165,15 +204,41 @@ def _stub_round(tmp):
         raise AssertionError("roadmap_areas must not be consulted under a target list")
 
     tc.work_units.roadmap_areas = no_network
-    w = types.SimpleNamespace(
-        cfg=types.SimpleNamespace(state=tmp, wid="worker3", checkout=tmp / "checkout", logdir=tmp / "logs"), gh=None
-    )
+    ST.clear()
+    ST.update(acquires=[], script=[], log=[], cleanups=[])
+
+    def fake_claim_sh(args, claim_repo):
+        ST["acquires"].append((tuple(args), claim_repo))
+        return ST["script"].pop(0) if ST["script"] else 0
+
+    tc.round.run_claim_sh = fake_claim_sh
+    tc.round.claims_repo = lambda: "alice/tauceti-claims"
+    tc.round.Claims.start_heartbeat = lambda self, key, repo: ST.__setitem__("heartbeat", (key, repo))
+    real_log = tc.config.log
+
+    def capture_log(msg):
+        ST["log"].append(msg)
+        real_log(msg)
+
+    tc.work_units.log = capture_log
+    tc.round.log = capture_log
+    tc.targets.log = capture_log
+    cfg = types.SimpleNamespace(state=tmp, wid="worker3", checkout=tmp / "checkout", logdir=tmp / "logs")
+    ctx = types.SimpleNamespace(add_cleanup=lambda fn: ST["cleanups"].append(fn))
+    w = types.SimpleNamespace(cfg=cfg, gh=None, claims=tc.round.Claims(cfg, ctx))
     opts = types.SimpleNamespace(agent_name="Claude Code", work_model="claude", source=None)
     return w, opts, cap
 
 
-def _run(w, opts, reason, bubble=True):
-    return tc.work_units.do_roadmap(w, None, types.SimpleNamespace(reason=reason, pr=0, head=""), opts, bubble=bubble)
+def _run(w, opts, reason, bubble=True, sv=None):
+    w.claims.held = None
+    os.environ.pop("TAUCETI_CLAIM_KEY", None)
+    os.environ.pop("TAUCETI_CLAIM_REPO", None)
+    return tc.work_units.do_roadmap(w, sv, types.SimpleNamespace(reason=reason, pr=0, head=""), opts, bubble=bubble)
+
+
+def _first_key():
+    return ST["acquires"][0][0][1] if ST["acquires"] else None
 
 
 def test_selection():
@@ -247,6 +312,11 @@ def test_selection():
     check("prompt(bubble): other areas not listed", "`stalk-functor` —" not in prompt)
     check("prompt(bubble): the operator-list rule is in the prompt", "**Operator target list.**" in prompt)
     check("prompt(bubble): block sits inside the rule's fence", "  ```\n  Goal: discharge" in prompt)
+    check("prompt(bubble): assigned target precedes the fence", "Assigned target: `no-needs-clause`" in prompt)
+    check(
+        "prompt(bubble): context lead-in between assignment and fence",
+        "  Context — the rest of this area's list:\n  ```\n  Goal: discharge" in prompt,
+    )
     check("prompt(bubble): continuation lines indented under the bullet", "\n  - [ ] `derived-pushforward`" in prompt)
     check(
         "prompt(bubble): blank lines stay blank",
@@ -283,9 +353,12 @@ def test_selection():
         check(f"config: roadmap_targets() is None for {value!r}", tc.config.roadmap_targets() is None)
     os.environ.pop("TAUCETI_ROADMAP_TARGETS", None)
     cap.clear()
+    ST["acquires"].clear()
     _run(w, opts, "Topology")
     prompt = cap["prompt"]
     check("prompt(unset): `none` fills the block", "  ```\n  none\n  ```" in prompt)
+    check("prompt(unset): assigned target is none", "  Assigned target: none\n  ```\n  none\n  ```" in prompt)
+    check("prompt(unset): no claim taken by the worker", not ST["acquires"] and "TAUCETI_CLAIM_KEY" not in os.environ)
     check("prompt(unset): no target list text", "Targets in `" not in prompt)
     check("prompt(unset): pinned area still used", "Start with `Topology`" in prompt)
     # Unset + auto consults the area list as before (the stub proves it is called).
@@ -304,10 +377,309 @@ def test_selection():
     os.environ.pop("TAUCETI_ROADMAP_TARGETS", None)
 
 
+# ---- 4. the live overlay -------------------------------------------------------------------------
+def test_overlay():
+    ids = S.target_marker_ids
+    check("marker ids: focus+id pair", ids(_marker("Sheaves", "stalk-functor")) == (("Sheaves", "stalk-functor"),))
+    check(
+        "marker ids: several, sorted, deduplicated",
+        ids(_marker("B", "y") + " text " + _marker("A", "x") + _marker("B", "y")) == (("A", "x"), ("B", "y")),
+    )
+    check("marker ids: no id -> dropped", ids('<!--tauceti-target:v1 {"focus":"Sheaves"}-->') == ())
+    check("marker ids: malformed json -> dropped", ids('<!--tauceti-target:v1 {"focus":"S","id":}-->') == ())
+    check("marker ids: focus any is kept (exact match later)", ids(_marker("any", "x")) == (("any", "x"),))
+    p = S.PRInfo.from_json({"number": 1, "body": "a\n" + _marker("Cohomology", "no-needs-clause")})
+    check("PRInfo.from_json: target_ids populated", p.target_ids == (("Cohomology", "no-needs-clause"),))
+    check("PRInfo.from_json: target_focuses unchanged", p.target_focuses == ("Cohomology",))
+
+    t = T.parse_targets(SAMPLE)
+    warned = []
+    saved_log = T.log
+    T.log = lambda msg: warned.append(msg)
+    try:
+        # (a) an open marker puts an open item in flight; a merged marker marks an item done, even one
+        # the file still shows in flight; an item the file already marks done stays done.
+        live = T.overlay_live(
+            t,
+            inflight={("Cohomology", "no-needs-clause"), ("Sheaves", "site-basics")},
+            done={("Sheaves", "stalk-functor")},
+        )
+        check("overlay: open marker -> in flight", live.find("no-needs-clause").status == "inflight")
+        check("overlay: merged marker beats the file's [~]", live.find("stalk-functor").status == "done")
+        check("overlay: file [x] stays done under an open marker", live.find("site-basics").status == "done")
+        check("overlay: untouched item keeps its mark", live.find("sheaf-pullback-exact").status == "open")
+        check("overlay: the source list is not mutated", t.find("stalk-functor").status == "inflight")
+        check(
+            "overlay: render shows effective statuses",
+            "- [~] `no-needs-clause`" in T.render_area_block(live, "Cohomology"),
+        )
+        # (b) eligibility: open + every need done; needs resolve on the live view.
+        check(
+            "eligible: file view — pullback blocked on [~] stalk-functor",
+            [it.slug for it in T.eligible_items(t, "Sheaves")] == ["sheaf-hom"],
+        )
+        check(
+            "eligible: live view — pullback unblocked once stalk-functor merged",
+            [it.slug for it in T.eligible_items(live, "Sheaves")] == ["sheaf-pullback-exact", "sheaf-hom"],
+        )
+        check(
+            "eligible: in-flight item is not eligible", [it.slug for it in T.eligible_items(live, "Cohomology")] == []
+        )
+        check("eligible_areas: file order", T.eligible_areas(live) == ["Sheaves"])
+        # (c) an unknown `needs` slug counts as done, with one warning naming it.
+        warned.clear()
+        live2 = T.overlay_live(t, inflight=set(), done={("Sheaves", "sheaf-pullback-exact")})
+        check(
+            "eligible: unknown need treated as done",
+            "derived-pushforward" in [it.slug for it in T.eligible_items(live2, "Cohomology")],
+        )
+        check("eligible: unknown need warned once, by name", len(warned) == 1 and "ghost-slug" in warned[0])
+        check(
+            "eligible: pullback still blocked while sheaf-pullback-exact open",
+            "derived-pushforward" not in [it.slug for it in T.eligible_items(t, "Cohomology")],
+        )
+    finally:
+        T.log = saved_log
+
+    # (d) _live_target_view: sv None is fine; merged comes from gh.pr_list(state="merged"); a
+    # GitHubError falls back to the file's marks; markers for unlisted pairs are ignored.
+    tmp = Path(tempfile.mkdtemp(prefix="targets-live-"))
+    w, opts, cap = _stub_round(tmp)
+    gh = FakeGitHub(merged_bodies=[_marker("Sheaves", "stalk-functor"), _marker("Sheaves", "not-listed"), "no marker"])
+    live, n_in, n_done = tc.work_units._live_target_view(t, tmp / "f.md", None, gh)
+    check("live view: sv None -> nothing in flight", n_in == 0)
+    check("live view: merged fetch asks for merged PRs with bodies", gh.calls == [(("number", "body"), "merged")])
+    check("live view: merged marker counted and applied", n_done == 1 and live.find("stalk-functor").status == "done")
+    sv = _survey(("Cohomology", "no-needs-clause"), ("Nowhere", "no-needs-clause"))
+    live, n_in, n_done = tc.work_units._live_target_view(t, tmp / "f.md", sv, None)
+    check(
+        "live view: open markers matched on (area, slug) only",
+        n_in == 1 and live.find("no-needs-clause").status == "inflight",
+    )
+    check(
+        "live view: gh None -> no merged fetch, file marks stand",
+        n_done == 0 and live.find("stalk-functor").status == "inflight",
+    )
+    ST["log"].clear()
+    live, n_in, n_done = tc.work_units._live_target_view(t, tmp / "f.md", sv, FakeGitHub(fail=True))
+    check("live view: GitHubError -> file marks used", n_done == 0 and live.find("stalk-functor").status == "inflight")
+    check(
+        "live view: GitHubError logged, names the file",
+        any("could not list merged PRs" in m and "f.md" in m for m in ST["log"]),
+    )
+    check("live view: GitHubError keeps the open overlay", n_in == 1)
+
+
+# ---- 5. the worker-side claim loop -----------------------------------------------------------------
+CLAIMS = """\
+<!-- tauceti-targets:v1 -->
+## Alpha
+- [ ] `a-one` — first (serves: X)
+- [ ] `a-two` — second (serves: X; needs: none)
+- [ ] `a-three` — third (serves: X)
+
+## Beta
+- [ ] `b-one` — beta first (serves: Y)
+"""
+
+
+def test_claim_loop():
+    tmp = Path(tempfile.mkdtemp(prefix="targets-claim-"))
+    tfile = tmp / "claims.md"
+    tfile.write_text(CLAIMS)
+    w, opts, cap = _stub_round(tmp)
+    os.environ["TAUCETI_ROADMAP_TARGETS"] = str(tfile)
+    os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+
+    # (a) rc [1, 0]: the first candidate is held elsewhere, the second is ours.
+    ST["script"][:] = [1, 0]
+    ST["acquires"].clear()
+    ST["log"].clear()
+    ST.pop("heartbeat", None)
+    _run(w, opts, "Alpha")
+    keys = [a[0] for a in ST["acquires"]]
+    check(
+        "claim: acquires in file order until one is ours",
+        keys
+        == [
+            ("acquire", "author/Alpha/a-one", str(tc.constants.CLAIM_TTL_S)),
+            ("acquire", "author/Alpha/a-two", str(tc.constants.CLAIM_TTL_S)),
+        ],
+    )
+    check("claim: against the claim namespace", {a[1] for a in ST["acquires"]} == {"alice/tauceti-claims"})
+    check("claim: push arbiter fails closed on this key", os.environ.get("TAUCETI_CLAIM_KEY") == "author/Alpha/a-two")
+    check("claim: push arbiter told the namespace", os.environ.get("TAUCETI_CLAIM_REPO") == "alice/tauceti-claims")
+    check(
+        "claim: heartbeat started on the held key",
+        ST.get("heartbeat") == ("author/Alpha/a-two", "alice/tauceti-claims"),
+    )
+    check("claim: lease recorded for release", w.claims.held == ("author/Alpha/a-two", "alice/tauceti-claims"))
+    check("claim: release registered on cleanup", w.claims.release in ST["cleanups"])
+    check(
+        "claim: held candidate logged",
+        any("target Alpha/a-one held by another worker — trying the next" in m for m in ST["log"]),
+    )
+    check(
+        "claim: one summary line",
+        any(
+            m == "→ ROADMAP target: Alpha/a-two (claimed; 3 eligible of 4 open in 1 areas; live: 0 in flight, 0 merged)"
+            for m in ST["log"]
+        ),
+    )
+    prompt = cap["prompt"]
+    check(
+        "prompt: assigned target is the claimed slug",
+        "  Assigned target: `a-two` — second (serves: X; needs: none)\n  Context — the rest of this area's list:\n  ```"
+        in prompt,
+    )
+    check("prompt: the rule tells the agent it must author it", "You MUST author the assigned target" in prompt)
+    check(
+        "prompt: the claim step knows the worker holds the lease",
+        "the worker already holds `author/<target-roadmap>/<slug>`" in prompt,
+    )
+    check(
+        "prompt: area block still follows", "Targets in `Alpha` (3 open of 3):" in prompt and "- [ ] `a-one`" in prompt
+    )
+    check("prompt: pinned area used", "Start with `Alpha`" in prompt)
+
+    # (b) every candidate held -> NoProgress, no lease, no env.
+    ST["script"][:] = [1, 1, 1]
+    ST["acquires"].clear()
+    try:
+        _run(w, opts, "Alpha")
+        check("claim: all held -> NoProgress", False)
+    except tc.NoProgress as e:
+        check("claim: all held -> NoProgress", "claimed by another worker" in str(e) and str(tfile) in str(e))
+    check("claim: all held -> three acquires, nothing kept", len(ST["acquires"]) == 3 and w.claims.held is None)
+    check("claim: all held -> no push-arbiter key", "TAUCETI_CLAIM_KEY" not in os.environ)
+
+    # (c) rc 2: the claim cannot be registered; the item is taken unclaimed with the hint logged.
+    ST["script"][:] = [2]
+    ST["acquires"].clear()
+    ST["log"].clear()
+    ST.pop("heartbeat", None)
+    _run(w, opts, "Alpha")
+    check(
+        "claim: rc 2 -> first item taken unclaimed",
+        len(ST["acquires"]) == 1 and "Assigned target: `a-one`" in cap["prompt"],
+    )
+    check(
+        "claim: rc 2 -> no lease, no key, no heartbeat",
+        w.claims.held is None and "TAUCETI_CLAIM_KEY" not in os.environ and "heartbeat" not in ST,
+    )
+    check("claim: rc 2 -> CLAIM_REPO hint logged once", sum("set CLAIM_REPO=" in m for m in ST["log"]) == 1)
+    check(
+        "claim: rc 2 -> summary says unclaimed",
+        any(m.startswith("→ ROADMAP target: Alpha/a-one (unclaimed;") for m in ST["log"]),
+    )
+
+    # (d) the acquire cap: a long list of held items stops after MAX_TARGET_ACQUIRES pushes.
+    many = tmp / "many.md"
+    many.write_text(
+        "<!-- tauceti-targets:v1 -->\n## Gamma\n" + "".join(f"- [ ] `g-{n}` — item {n}\n" for n in range(20))
+    )
+    os.environ["TAUCETI_ROADMAP_TARGETS"] = str(many)
+    ST["script"][:] = [1] * 20
+    ST["acquires"].clear()
+    try:
+        _run(w, opts, "Gamma")
+        check("claim: cap -> NoProgress", False)
+    except tc.NoProgress as e:
+        check("claim: cap -> NoProgress names the cap", "attempt cap" in str(e) and "12 more untried" in str(e))
+    check(
+        "claim: cap -> exactly MAX_TARGET_ACQUIRES acquires",
+        len(ST["acquires"]) == tc.work_units.MAX_TARGET_ACQUIRES == 8,
+    )
+    ST["script"].clear()
+    os.environ["TAUCETI_ROADMAP_TARGETS"] = str(tfile)
+
+    # (e) auto: areas are visited in random order, so the first acquire is not always Alpha.
+    firsts = set()
+    for _ in range(24):
+        ST["acquires"].clear()
+        _run(w, opts, "auto")
+        firsts.add(_first_key())
+    check("claim: auto spreads the first acquire across areas", firsts == {"author/Alpha/a-one", "author/Beta/b-one"})
+    # Within an area the order is the file's.
+    ST["script"][:] = [1, 1, 1, 0]
+    ST["acquires"].clear()
+    _run(w, opts, "auto")
+    keys = [a[0][1] for a in ST["acquires"]]
+    check(
+        "claim: within an area, file order; then the other area",
+        keys
+        in (
+            ["author/Alpha/a-one", "author/Alpha/a-two", "author/Alpha/a-three", "author/Beta/b-one"],
+            ["author/Beta/b-one", "author/Alpha/a-one", "author/Alpha/a-two", "author/Alpha/a-three"],
+        ),
+    )
+
+    # (f) the live overlay feeds selection: an open PR on a-one and a merged one on a-two leave a-three.
+    ST["acquires"].clear()
+    ST["log"].clear()
+    w.gh = FakeGitHub(merged_bodies=[_marker("Alpha", "a-two")])
+    _run(w, opts, "Alpha", sv=_survey(("Alpha", "a-one")))
+    check(
+        "claim: live view skips in-flight and merged items",
+        [a[0][1] for a in ST["acquires"]] == ["author/Alpha/a-three"],
+    )
+    check(
+        "claim: summary counts the live view",
+        any("(claimed; 1 eligible of 2 open in 1 areas; live: 1 in flight, 1 merged)" in m for m in ST["log"]),
+    )
+    check(
+        "prompt: context shows effective statuses",
+        "- [~] `a-one`" in cap["prompt"]
+        and "- [x] `a-two`" in cap["prompt"]
+        and "Targets in `Alpha` (1 open of 3):" in cap["prompt"],
+    )
+    # All of an area's items covered live -> a pinned area is NoProgress; auto moves to the other area.
+    w.gh = FakeGitHub(merged_bodies=[_marker("Alpha", "a-two"), _marker("Alpha", "a-three")])
+    try:
+        _run(w, opts, "Alpha", sv=_survey(("Alpha", "a-one")))
+        check("claim: pinned area fully covered live -> NoProgress", False)
+    except tc.NoProgress as e:
+        check("claim: pinned area fully covered live -> NoProgress", "Alpha" in str(e))
+    ST["acquires"].clear()
+    _run(w, opts, "auto", sv=_survey(("Alpha", "a-one")))
+    check("claim: auto skips a live-covered area", _first_key() == "author/Beta/b-one")
+    # Blocked needs: an open item waiting on an open need is not a candidate, and the message says so.
+    blocked = tmp / "blocked.md"
+    blocked.write_text(
+        "<!-- tauceti-targets:v1 -->\n## Delta\n- [ ] `d-two` — second (needs: `d-one`)\n- [~] `d-one` — first (in flight: #1)\n"
+    )
+    os.environ["TAUCETI_ROADMAP_TARGETS"] = str(blocked)
+    w.gh = None
+    try:
+        _run(w, opts, "auto")
+        check("claim: only blocked items -> NoProgress", False)
+    except tc.NoProgress as e:
+        check(
+            "claim: only blocked items -> NoProgress explains",
+            "wait on unmet needs" in str(e) and "1 open item" in str(e),
+        )
+    # (g) the assigned line: known needs are "all landed"; an unknown one is named, not called landed.
+    ghost = tmp / "ghost.md"
+    ghost.write_text(
+        "<!-- tauceti-targets:v1 -->\n## Eps\n- [x] `e-one` — first (done: #1)\n"
+        "- [ ] `e-two` — second (serves: Z; needs: `e-one`, `ghost`)\n"
+    )
+    os.environ["TAUCETI_ROADMAP_TARGETS"] = str(ghost)
+    _run(w, opts, "Eps")
+    check(
+        "prompt: assigned line distinguishes landed from unknown needs",
+        "Assigned target: `e-two` — second (serves: Z; needs: `e-one` — all landed; `ghost` — not in the list, "
+        "assumed landed)" in cap["prompt"],
+    )
+    os.environ.pop("TAUCETI_ROADMAP_TARGETS", None)
+
+
 def main():
     test_parser()
     test_helpers()
     test_selection()
+    test_overlay()
+    test_claim_loop()
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
     return 1 if fails else 0
 

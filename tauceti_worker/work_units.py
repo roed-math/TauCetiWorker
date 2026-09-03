@@ -94,8 +94,18 @@ from .survey import (
     progress_argv,
     spread_candidates,
     survey,
+    target_marker_ids,
 )
-from .targets import load_targets, open_areas, open_items, render_area_block
+from .targets import (
+    TargetItem,
+    Targets,
+    eligible_areas,
+    eligible_items,
+    load_targets,
+    open_items,
+    overlay_live,
+    render_area_block,
+)
 
 # ============================================================================
 # Round — the want-gated cascade over survey(): classify every open PR, then do ONE work unit.
@@ -1466,31 +1476,103 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
         return None
 
 
-def _pick_target_area(targets, path: Path, only: str, skip: list[str]) -> str:
-    """Area selection under an operator target list: the auto/any pick is restricted to areas that
-    still have an open `[ ]` item (minus --roadmap-skip; no network needed, so roadmap_areas is never
-    consulted), and a pinned --roadmap-only area must itself have open items — the pin still wins
-    over a skip, exactly as without a list."""
-    openers = open_areas(targets)
+MAX_TARGET_ACQUIRES = 8  # claim.sh acquires per round — each is a git push round-trip
+
+
+def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, int, int]:
+    """The operator's list under the live PR overlay (see targets.overlay_live): an open PR whose
+    target marker names a listed (area, slug) puts that item in flight; a merged one marks it done.
+    The open side is the survey the round already ran; the merged side is one `gh pr list` per round,
+    and if that call fails the file's marks stand — cooperative, fail-open, like every claim. Returns
+    the overlaid list and how many listed items the two live sources touched."""
+    listed = {(area, it.slug) for area, items in targets.areas.items() for it in items}
+    inflight: set[tuple[str, str]] = set()
+    for p in sv.open_prs if sv is not None else []:
+        inflight.update(p.target_ids)
+    done: set[tuple[str, str]] = set()
+    if gh is not None:
+        try:
+            for d in gh.pr_list(["number", "body"], state="merged"):
+                done.update(target_marker_ids(d.get("body") or ""))
+        except GitHubError as e:
+            log(f"roadmap: could not list merged PRs for the live target view ({e}) — using the marks in {path}")
+    inflight &= listed
+    done &= listed
+    return overlay_live(targets, inflight, done), len(inflight), len(done)
+
+
+def _target_candidates(live: Targets, path: Path, only: str, skip: list[str]) -> list[tuple[str, TargetItem]]:
+    """The (area, item) candidates under an operator target list, in the order they are claimed. An
+    item is eligible when it is effectively open and every prerequisite has effectively landed. Areas:
+    a pinned --roadmap-only area, which must have an eligible item and still beats a skip, exactly as
+    without a list; else every area with an eligible item minus --roadmap-skip, in RANDOM order so
+    workers starting together on one file spread out instead of queueing on the first item. Within
+    an area, file order. No network: roadmap_areas is never consulted."""
+    eligible = eligible_areas(live)
+    n_open = sum(len(open_items(live, a)) for a in live.areas)
     if only in ("auto", "any", ""):
-        candidates = [a for a in openers if a not in skip]
-        if not candidates:
-            if openers:
+        areas = [a for a in eligible if a not in skip]
+        if not areas:
+            if eligible:
                 raise NoProgress(
                     f"roadmap: every area with open targets in {path} is in --roadmap-skip "
-                    f"({', '.join(a for a in openers if a in skip)}) — nothing to author"
+                    f"({', '.join(a for a in eligible if a in skip)}) — nothing to author"
+                )
+            if n_open:
+                raise NoProgress(
+                    f"roadmap: no open targets in any area of {path} are eligible ({n_open} open item(s) wait on "
+                    f"unmet needs) — nothing to author"
                 )
             raise NoProgress(f"roadmap: no open targets in any area of {path} — nothing to author")
-        only = random.choice(candidates)
-    elif only not in openers:
-        raise NoProgress(f"roadmap: --roadmap-only {only} has no open targets in {path} — nothing to author")
-    elif only in skip:
-        log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
-    log(
-        f"→ ROADMAP targets: {path} — {only} ({len(open_items(targets, only))} open of "
-        f"{len(targets.areas.get(only, []))}; {len(openers)} areas with open targets)"
+        random.shuffle(areas)
+    elif only not in eligible:
+        blocked = len(open_items(live, only))
+        detail = f" ({blocked} open item(s) wait on unmet needs)" if blocked else ""
+        raise NoProgress(
+            f"roadmap: --roadmap-only {only} has no eligible open targets in {path}{detail} — nothing to author"
+        )
+    else:
+        areas = [only]
+        if only in skip:
+            log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
+    return [(a, it) for a in areas for it in eligible_items(live, a)]
+
+
+def _claim_target(claims: Claims, candidates: list[tuple[str, TargetItem]], path: Path) -> tuple[str, TargetItem, bool]:
+    """Walk the candidates and take the first whose `author/<area>/<slug>` claim this worker can hold
+    (Claims.begin_target_work). Held by another worker → the next one. A claim that cannot be
+    registered at all is taken unclaimed. Returns (area, item, claimed). Bounded: each acquire is a
+    push round-trip, so after MAX_TARGET_ACQUIRES misses the round yields rather than crawl the list."""
+    for n, (area, it) in enumerate(candidates):
+        if n >= MAX_TARGET_ACQUIRES:
+            raise NoProgress(
+                f"roadmap: the first {MAX_TARGET_ACQUIRES} eligible targets in {path} are all claimed by other "
+                f"workers ({len(candidates) - n} more untried; attempt cap reached) — nothing to author this round"
+            )
+        rc = claims.begin_target_work(area, it.slug)
+        if rc == 1:
+            log(f"target {area}/{it.slug} held by another worker — trying the next")
+            continue
+        return area, it, rc == 0
+    raise NoProgress(
+        f"roadmap: every eligible target in {path} is claimed by another worker — nothing to author this round"
     )
-    return only
+
+
+def _render_assigned(live: Targets, it: TargetItem) -> str:
+    """The `__ASSIGNED__` lines: the one target the agent must author, with its metadata, and the
+    lead-in to the area block that follows (continuation lines sit two spaces in, under the bullet).
+    Every known prerequisite has landed (that is what made the item eligible); one the list never
+    defines is said so, not called landed."""
+    known = [s for s in it.needs if live.find(s) is not None]
+    unknown = [s for s in it.needs if live.find(s) is None]
+    parts = []
+    if known:
+        parts.append(", ".join(f"`{s}`" for s in known) + " — all landed")
+    if unknown:
+        parts.append(", ".join(f"`{s}`" for s in unknown) + " — not in the list, assumed landed")
+    clauses = [*it.meta, "needs: " + ("; ".join(parts) if parts else "none")]
+    return f"Assigned target: `{it.slug}` — {it.text} ({'; '.join(clauses)})\n  Context — the rest of this area's list:"
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:
@@ -1498,8 +1580,20 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     skip = roadmap_skip()
     targets_path = roadmap_targets()
     targets = load_targets(targets_path) if targets_path is not None else None  # per round; Die on failure
+    assigned_str = "Assigned target: none"
     if targets is not None:
-        only = _pick_target_area(targets, targets_path, only, skip)
+        # The worker, not the agent, chooses and claims the target: N workers started on one file
+        # settle who does what here, before any model runs, through the round's lease + heartbeat.
+        targets, n_inflight, n_merged = _live_target_view(targets, targets_path, sv, w.gh)
+        candidates = _target_candidates(targets, targets_path, only, skip)
+        only, item, claimed = _claim_target(w.claims, candidates, targets_path)
+        n_open = sum(len(open_items(targets, a)) for a in targets.areas)
+        log(
+            f"→ ROADMAP target: {only}/{item.slug} ({'claimed' if claimed else 'unclaimed'}; {len(candidates)} "
+            f"eligible of {n_open} open in {len({a for a, _ in candidates})} areas; live: {n_inflight} in flight, "
+            f"{n_merged} merged)"
+        )
+        assigned_str = _render_assigned(targets, item)
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         raw_areas = roadmap_areas(w.gh)
         areas = [a for a in raw_areas if a not in skip]
@@ -1578,6 +1672,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 HERE / "prompts" / "roadmap.md",
                 ONLY=only,
                 SKIP=skip_str,
+                ASSIGNED=assigned_str,
                 TARGETS=targets_str,
                 CLAIMED=claimed_str,
                 AGENT=opts.agent_name,
@@ -1603,6 +1698,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         HERE / "prompts" / "roadmap.md",
         ONLY=only,
         SKIP=skip_str,
+        ASSIGNED=assigned_str,
         TARGETS=targets_str,
         CLAIMED=claimed_str,
         AGENT=opts.agent_name,

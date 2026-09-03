@@ -21,7 +21,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
-| `--roadmap-targets FILE` | A markdown target list (format below) restricting roadmap rounds to the operator's listed milestones. The auto/all-areas pick is limited to areas with open `[ ]` items (minus `--roadmap-skip`), a pinned `--roadmap-only` area with no open items ends the round with no progress, and the prompt names the area's items with their prerequisites' statuses. Resolved to an absolute path and re-read every round. |
+| `--roadmap-targets FILE` | A markdown target list (format below) restricting roadmap rounds to the operator's listed milestones. Statuses are refreshed live from PR target markers, the worker claims one eligible item before launching the agent, and the prompt assigns exactly that item; several workers may share one file. The auto/all-areas pick is limited to areas with an eligible item (minus `--roadmap-skip`), and a pinned `--roadmap-only` area with none ends the round with no progress. Resolved to an absolute path and re-read every round. |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
@@ -45,11 +45,11 @@ in every scope until its area label resolves.
 ## Target lists
 
 `--roadmap-targets FILE` points roadmap rounds at an operator-written list of
-milestones on the path to one goal — finer-grained than choosing areas. The
-worker restricts area selection to areas with open items and hands the agent
-exactly the milestones in scope, with each prerequisite's current status
-resolved. The file is re-read every round, so ticking an item off (or marking it
-in flight) takes effect on the next round without a restart.
+milestones on the path to one goal — finer-grained than choosing areas. Each
+round the worker refreshes the list's statuses from the live PRs, picks one
+eligible item, claims it, and hands the agent that single assigned target with
+the rest of its area for context. The file is re-read every round, so editing
+it takes effect on the next round without a restart.
 
 ```markdown
 # GQ2 axiom targets
@@ -76,13 +76,33 @@ to the first `## ` heading is shown to the agent verbatim.
 - `needs:` is a comma list of backtick slugs or `none`, and may be omitted.
   Slugs are looked up across all areas; one the file does not define renders
   as `[?]`.
-- Selection: with no `--roadmap-only` (auto or all areas) the round picks a
-  random area that has an open item and is not in `--roadmap-skip`, without
-  fetching the area list from GitHub; with none left it ends as no progress. A
-  pinned `--roadmap-only` area must have an open item and, as always, beats a
-  skip. The agent must take the first open item whose prerequisites are all done
-  (or already merged) and that no open or merged PR covers, and stop without a
-  PR when nothing qualifies.
+- Live statuses: the file's marks go stale, so the worker overlays them every
+  round. An open PR whose body carries the target marker
+  `<!--tauceti-target:v1 {"focus":"<Area>","id":"<slug>"}-->` for a listed item
+  puts it in flight; a merged PR carrying the marker marks it done (one
+  `gh pr list --state merged` per round; if that call fails, the file's marks
+  stand). An item is *eligible* when it is open under this view and every
+  `needs` slug is done under it (a slug the file never defines counts as done,
+  with a warning, so a typo cannot stall a fleet).
+- Selection: with no `--roadmap-only` (auto or all areas) the areas with an
+  eligible item, minus `--roadmap-skip`, are visited in random order, without
+  fetching the area list from GitHub; a pinned `--roadmap-only` area must have
+  an eligible item and, as always, beats a skip. Within an area, file order.
+- The claim: for each candidate the worker runs `claim.sh acquire
+  author/<area>/<slug>` (in [the claim namespace](#the-claim-namespace)) and
+  takes the first it can hold; one held by another worker is skipped, and after
+  eight misses the round yields. The lease lasts `CLAIM_TTL` seconds (default
+  1500) and is renewed every `CLAIM_HEARTBEAT` seconds (300) while the agent
+  runs — the same lease and heartbeat as branch claims — so a dead worker's
+  claim expires on its own; it is released when the round ends.
+  The agent is told the assigned slug, must use it verbatim as claim key and
+  marker id, must not pick another item, and stops without a PR when the target
+  turns out to be covered or blocked. With no candidate left (none eligible, or
+  every one claimed) the round ends as no progress.
+- Sharing a file: run N loops with distinct `--worker-id`s and the same
+  `--roadmap-targets`; the claims partition the work, and no per-worker
+  `--roadmap-only`/`--roadmap-skip` is needed (both remain available as
+  carve-outs).
 
 ## The claim namespace
 

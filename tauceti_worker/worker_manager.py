@@ -48,6 +48,7 @@ _WORKER_KEYS = {
     "auto_refresh",
     "roadmap_only",
     "roadmap_skip",
+    "roadmap_targets",
     "roadmap_extra_identities",
     "respect_claims",
     "source",
@@ -249,6 +250,7 @@ class WorkerSpec:
     auto_refresh: bool = False
     roadmap_only: str | None = None
     roadmap_skip: tuple[str, ...] = ()
+    roadmap_targets: str | None = None
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
     source: str | None = None
@@ -297,6 +299,7 @@ class WorkerSpec:
             auto_refresh=_boolean(raw.get("auto_refresh", False), f"workers[{index}].auto_refresh"),
             roadmap_only=_string(raw.get("roadmap_only"), f"workers[{index}].roadmap_only", optional=True),
             roadmap_skip=_strings(raw.get("roadmap_skip", []), f"workers[{index}].roadmap_skip"),
+            roadmap_targets=_string(raw.get("roadmap_targets"), f"workers[{index}].roadmap_targets", optional=True),
             roadmap_extra_identities=_strings(
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
@@ -332,6 +335,8 @@ class WorkerSpec:
             value["roadmap_only"] = self.roadmap_only
         if self.roadmap_skip:
             value["roadmap_skip"] = list(self.roadmap_skip)
+        if self.roadmap_targets is not None:
+            value["roadmap_targets"] = self.roadmap_targets
         if self.roadmap_extra_identities:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if not self.respect_claims:
@@ -372,6 +377,8 @@ class WorkerSpec:
             argv += ["--roadmap-only", self.roadmap_only]
         if self.roadmap_skip:
             argv += ["--roadmap-skip", ",".join(self.roadmap_skip)]
+        if self.roadmap_targets is not None:
+            argv += ["--roadmap-targets", self.roadmap_targets]
         if self.roadmap_extra_identities:
             argv += ["--roadmap-extra-identities", ",".join(self.roadmap_extra_identities)]
         if not self.respect_claims:
@@ -1181,6 +1188,8 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         skips = spec.get("roadmap_skip")
         if isinstance(skips, list) and skips:
             roadmap_values.append("skip: " + ", ".join(map(str, skips)))
+        if spec.get("roadmap_targets"):
+            roadmap_values.append("targets: " + os.path.basename(str(spec["roadmap_targets"])))
         identities = spec.get("roadmap_extra_identities")
         if isinstance(identities, list) and identities:
             roadmap_values.append("also treat as self: " + ", ".join(map(str, identities)))
@@ -1631,6 +1640,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                 "--only": "only",
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
+                "--roadmap-targets": "roadmap_targets",
                 "--roadmap-extra-identities": "roadmap_extra_identities",
                 "--source": "source",
                 "--author-model": "author_model",
@@ -1699,6 +1709,7 @@ def add_workers_parser(subparsers) -> None:
     )
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
+    add.add_argument("--roadmap-targets", help="operator target list (markdown) restricting roadmap rounds")
     add.add_argument("--source", help="source repository; requires roadmap in --only and one pinned roadmap area")
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
@@ -1786,7 +1797,7 @@ def cmd_workers(args) -> int:
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
                 }
-                for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
+                for key in ("roadmap_only", "roadmap_targets", "source", "author_model", "author_effort", "pace"):
                     value = getattr(args, key)
                     if value is not None:
                         raw[key] = value

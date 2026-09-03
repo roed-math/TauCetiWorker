@@ -168,6 +168,14 @@ def reap_round_group(pgid: int, term_grace: float = 2.0) -> None:
         log(f"WARNING: round group {pgid} ignored SIGTERM and refused SIGKILL; stragglers may survive")
 
 
+def run_claim_sh(args: list[str], claim_repo: str) -> int:
+    """Run `claim.sh <args>` against `claim_repo` and return its verdict (see scripts/claim.sh: acquire
+    is 0 mine, 1 held by another worker, 2 could not be registered). One seam, so a test can script
+    the verdicts without a git remote."""
+    env = {**os.environ, "CLAIM_REPO": claim_repo}
+    return subprocess.run([CLAIM_SH, *args], capture_output=True, env=env).returncode
+
+
 class Claims:
     """[COOP] branch claims + the [HARD] push-arbiter env. Mutating tasks take a branch/<pr> claim and
     heartbeat it (dedup only; git-safe-push's branch CAS is the real guarantee). The heartbeat is a
@@ -217,6 +225,36 @@ class Claims:
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
         return True
+
+    def begin_target_work(self, area: str, slug: str) -> int:
+        """Take the authoring claim `author/<area>/<slug>` for one operator-list target BEFORE the agent
+        launches, so workers sharing a target list settle who does what without the agents racing.
+        Returns claim.sh's verdict: 0 = ours (lease held, heartbeat running, released on cleanup, and
+        the push-arbiter env set so git-safe-push fails closed if the lease is lost); 1 = another worker
+        holds it (the caller moves to its next candidate); 2 = the claim could not be registered (the
+        caller proceeds unclaimed — the same cooperative fail-open as begin_branch_work). The agent's
+        own `claim.sh acquire` of the same key later returns 0, a renewal, because the lease is ours."""
+        key = f"author/{area}/{slug}"
+        claim_repo = claims_repo()
+        rc = run_claim_sh(["acquire", key, str(CLAIM_TTL_S)], claim_repo)
+        if rc == 1:
+            return 1
+        os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
+        if rc == 0:
+            self.held = (key, claim_repo)
+            os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
+            os.environ["TAUCETI_CLAIM_KEY"] = key
+            self.ctx.add_cleanup(self.release)
+            self.start_heartbeat(key, claim_repo)
+        else:
+            log(
+                f"claim acquire {key} errored (rc={rc}) against {claim_repo} — proceeding unclaimed. If this "
+                f"repeats, this account cannot push there; set CLAIM_REPO=<a repo your whole fleet can push "
+                f"to> to pick the namespace yourself."
+            )
+            os.environ.pop("TAUCETI_CLAIM_KEY", None)
+            os.environ.pop("TAUCETI_CLAIM_REPO", None)
+        return rc
 
     def start_heartbeat(self, key: str, claim_repo: str) -> None:
         rfd, wfd = os.pipe()
