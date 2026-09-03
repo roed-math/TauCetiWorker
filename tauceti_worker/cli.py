@@ -106,6 +106,8 @@ examples:
   tauceti work --pr 412,415 --only review,fix   only those two PRs, only those two units
   tauceti work --only roadmap --roadmap-only ReductiveGroups
   tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
+  tauceti work --loop --only roadmap --roadmap-targets gq2-targets.md
+                                        author only milestones on an operator's target list
   tauceti work --only review --agent claude --bubble
                                         review with Opus inside the Bubble sandbox
   tauceti work --dry-run                show what it WOULD do; act on nothing
@@ -121,6 +123,7 @@ environment (flags win; full reference linked below):
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_PR             comma-separated PR numbers; default for --pr
+  TAUCETI_ROADMAP_TARGETS  markdown target list restricting authoring to listed milestones
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
@@ -262,6 +265,20 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
         "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
         "$TAUCETI_ROADMAP_SKIP for this run",
+    )
+    p.add_argument(
+        "--roadmap-targets",
+        dest="roadmap_targets",
+        default=None,
+        metavar="FILE",
+        type=_abs_path_or_blank,
+        help="for roadmap rounds, a markdown target list (see docs/reference.md for the format): "
+        "the operator's ordered milestones on the path to one goal, grouped by roadmap area. "
+        "Restricts the area pick (auto or all-areas) to areas with open `[ ]` items, honours "
+        "--roadmap-skip, and tells the agent exactly which milestones are in scope; a pinned "
+        "--roadmap-only area with no open items stops the round. Re-read every round, so tick "
+        "items off while the loop runs. Empty string = no list. Overrides "
+        "$TAUCETI_ROADMAP_TARGETS for this run",
     )
     p.add_argument(
         "--roadmap-extra-identities",
@@ -475,6 +492,13 @@ def resolve_review_throttle(cli_value: int | None, env: str, flag: str) -> int:
 
 def resolve_agent(args) -> str:
     return getattr(args, "agent", None) or os.environ.get("TAUCETI_AGENT") or "auto"
+
+
+def _abs_path_or_blank(raw: str) -> str:
+    """argparse type for --roadmap-targets: resolve to an absolute path at parse time so loop
+    children and `_round` (which may run with another cwd) open the same file; blank stays blank
+    (= no list)."""
+    return str(Path(raw).expanduser().resolve()) if raw.strip() else ""
 
 
 def resolve_source(args, only: list[str]) -> str | None:
@@ -775,6 +799,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # --roadmap-targets likewise (read live via roadmap_targets(), loaded per round in do_roadmap).
+    # Fail here, not on the first roadmap round, if the file is not there to be read.
+    if getattr(args, "roadmap_targets", None) is not None:
+        os.environ["TAUCETI_ROADMAP_TARGETS"] = args.roadmap_targets
+        if args.roadmap_targets and not Path(args.roadmap_targets).is_file():
+            raise Die(f"--roadmap-targets: {args.roadmap_targets} is not a file")
     # --roadmap-extra-identities and --ignore-claims override the env and are inherited by loop
     # children (read live via roadmap_extra_identities() / respect_claims()).
     if getattr(args, "roadmap_extra_identities", None) is not None:

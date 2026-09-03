@@ -47,6 +47,16 @@ def roadmap_skip() -> list[str]:
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
 
 
+def roadmap_targets() -> Path | None:
+    """The operator's target list for `--roadmap-targets`, read live from TAUCETI_ROADMAP_TARGETS
+    each call so loop children and `_round` inherit it. Tri-state like roadmap_only: None (unset or
+    blank) = no target list, roadmap rounds pick areas as usual; else the path of a markdown file
+    in the format `tauceti_worker.targets` parses. The file is loaded per round (see do_roadmap),
+    so edits land on the next round without a restart."""
+    raw = os.environ.get("TAUCETI_ROADMAP_TARGETS", "").strip()
+    return Path(raw) if raw else None
+
+
 def roadmap_extra_identities() -> list[str]:
     """Additional GitHub logins, beyond the worker's own `gh auth` identity, whose registered
     intentions this worker should treat as its own (so it won't avoid targets they've claimed).
@@ -69,8 +79,11 @@ def _only_label(sv=None) -> str:
     value ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""
     v = sv.roadmap_only if (sv is not None and sv.roadmap_only) else roadmap_only()
     if v is None or v == "auto":
-        return "auto (random each round)"
-    return "all areas" if v in ("", "any") else v
+        label = "auto (random each round)"
+    else:
+        label = "all areas" if v in ("", "any") else v
+    targets = roadmap_targets()
+    return f"{label} · targets: {targets.name}" if targets is not None else label
 
 
 def _skip_label(sv=None) -> str:

@@ -144,6 +144,12 @@ Roadmap rounds steer toward one area, a subdirectory of the
   whole roadmap over time.
 - `--roadmap-skip <area>[,<area>...]` excludes areas from both the random pick
   and the all-areas case. `--roadmap-only` wins on overlap.
+- `--roadmap-targets <file>` restricts authoring to an operator's target list: a
+  markdown file of milestones on the path to one goal, grouped by area (see
+  [the reference](docs/reference.md#target-lists)). The random pick is limited to
+  areas with open items, and the agent must take the first open item whose
+  prerequisites are done. The file is re-read every round, so tick items off
+  while a loop runs.
 - `--source <path-or-url>` adapts compatible material from an existing repository,
   and needs the roadmap phase enabled plus one pinned area. It is supplementary:
   the agent prioritizes the roadmap as written, then review-quality library code,

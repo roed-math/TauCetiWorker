@@ -48,6 +48,7 @@ CALL_SITES = {
     "roadmap.md": dict(
         ONLY="CFSGStatement",
         SKIP="none",
+        TARGETS="none",
         CLAIMED="none",
         AGENT="Claude Code",
         FORK="alice",

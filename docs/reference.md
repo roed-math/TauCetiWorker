@@ -21,6 +21,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--roadmap-targets FILE` | A markdown target list (format below) restricting roadmap rounds to the operator's listed milestones. The auto/all-areas pick is limited to areas with open `[ ]` items (minus `--roadmap-skip`), a pinned `--roadmap-only` area with no open items ends the round with no progress, and the prompt names the area's items with their prerequisites' statuses. Resolved to an absolute path and re-read every round. |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
@@ -40,6 +41,48 @@ automatic run counts roadmap PRs in every non-skipped area. Drafts, non-roadmap
 PRs, and PRs for roadmaps outside the selected scope do not consume its authoring
 limit. An open roadmap PR whose area is temporarily unknown counts conservatively
 in every scope until its area label resolves.
+
+## Target lists
+
+`--roadmap-targets FILE` points roadmap rounds at an operator-written list of
+milestones on the path to one goal — finer-grained than choosing areas. The
+worker restricts area selection to areas with open items and hands the agent
+exactly the milestones in scope, with each prerequisite's current status
+resolved. The file is re-read every round, so ticking an item off (or marking it
+in flight) takes effect on the next round without a restart.
+
+```markdown
+# GQ2 axiom targets
+<!-- tauceti-targets:v1 -->
+Free-text preamble: the goal, and how the items below serve it. Everything up
+to the first `## ` heading is shown to the agent verbatim.
+
+## Sheaves
+- [ ] `sheaf-pullback-exact` — pullback of sheaves is exact (serves: B10; needs: `site-basics`, `stalk-functor`)
+- [~] `stalk-functor` — the stalk functor on a site (serves: B3c; needs: none; in flight: #5504)
+- [x] `site-basics` — sites and sieves (serves: B1; done: #5513)
+> Notes and anything else that is not an item line are ignored.
+
+## Gaps
+- [ ] `not-on-any-roadmap` — sections whose title starts with `Gaps` are skipped entirely
+```
+
+- The `<!-- tauceti-targets:v1 -->` marker is required; a file without it stops
+  the round (the file is not a target list).
+- Each `## ` heading is the exact roadmap directory name. `[ ]` is open, `[~]`
+  in flight, `[x]` done. The slug is the first backtick token on the line; it
+  becomes the claim key `author/<area>/<slug>` and the `id` in the PR's target
+  marker, so keep slugs stable.
+- `needs:` is a comma list of backtick slugs or `none`, and may be omitted.
+  Slugs are looked up across all areas; one the file does not define renders
+  as `[?]`.
+- Selection: with no `--roadmap-only` (auto or all areas) the round picks a
+  random area that has an open item and is not in `--roadmap-skip`, without
+  fetching the area list from GitHub; with none left it ends as no progress. A
+  pinned `--roadmap-only` area must have an open item and, as always, beats a
+  skip. The agent must take the first open item whose prerequisites are all done
+  (or already merged) and that no open or merged PR covers, and stop without a
+  PR when nothing qualifies.
 
 ## The claim namespace
 
@@ -173,6 +216,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | Path of the target list for `--roadmap-targets`; blank = no list. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |

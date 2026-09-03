@@ -37,6 +37,7 @@ from . import (
     round,
     runtime_status,
     survey,
+    targets,  # noqa: F401 — a submodule attribute, deliberately not flattened below
     transcript,
     tui,
     usage,
@@ -48,6 +49,7 @@ from . import (
 # dependency order, so the entire former single-module surface is reachable as tauceti_worker.<NAME>.
 # `oauth` is deliberately absent: it is a self-contained credential-rotation module whose names
 # (Provider, provider, expires_at) would collide with the pacer's. Reach it as tauceti_worker.oauth.
+# `targets` likewise: its names (Targets, open_areas, …) are generic. Reach it as tauceti_worker.targets.
 _MODULES = (
     paths,
     constants,

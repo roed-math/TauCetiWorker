@@ -45,6 +45,7 @@ from .config import (
     respect_claims,
     roadmap_areas,
     roadmap_skip,
+    roadmap_targets,
     warn_red,
 )
 from .constants import (
@@ -94,6 +95,7 @@ from .survey import (
     spread_candidates,
     survey,
 )
+from .targets import load_targets, open_areas, open_items, render_area_block
 
 # ============================================================================
 # Round — the want-gated cascade over survey(): classify every open PR, then do ONE work unit.
@@ -1464,10 +1466,41 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
         return None
 
 
+def _pick_target_area(targets, path: Path, only: str, skip: list[str]) -> str:
+    """Area selection under an operator target list: the auto/any pick is restricted to areas that
+    still have an open `[ ]` item (minus --roadmap-skip; no network needed, so roadmap_areas is never
+    consulted), and a pinned --roadmap-only area must itself have open items — the pin still wins
+    over a skip, exactly as without a list."""
+    openers = open_areas(targets)
+    if only in ("auto", "any", ""):
+        candidates = [a for a in openers if a not in skip]
+        if not candidates:
+            if openers:
+                raise NoProgress(
+                    f"roadmap: every area with open targets in {path} is in --roadmap-skip "
+                    f"({', '.join(a for a in openers if a in skip)}) — nothing to author"
+                )
+            raise NoProgress(f"roadmap: no open targets in any area of {path} — nothing to author")
+        only = random.choice(candidates)
+    elif only not in openers:
+        raise NoProgress(f"roadmap: --roadmap-only {only} has no open targets in {path} — nothing to author")
+    elif only in skip:
+        log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
+    log(
+        f"→ ROADMAP targets: {path} — {only} ({len(open_items(targets, only))} open of "
+        f"{len(targets.areas.get(only, []))}; {len(openers)} areas with open targets)"
+    )
+    return only
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
-    if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
+    targets_path = roadmap_targets()
+    targets = load_targets(targets_path) if targets_path is not None else None  # per round; Die on failure
+    if targets is not None:
+        only = _pick_target_area(targets, targets_path, only, skip)
+    elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         raw_areas = roadmap_areas(w.gh)
         areas = [a for a in raw_areas if a not in skip]
         if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
@@ -1479,6 +1512,13 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is
     # already excluded from the auto pick above, so this only matters for an explicit --roadmap-only.
     skip_str = ", ".join(a for a in skip if a != only) or "none"
+    # The placeholder sits two spaces in under its bullet; indent the block's later lines the same
+    # way so it stays inside that list item (blank lines stay blank).
+    targets_str = (
+        "\n".join(f"  {ln}" if ln else "" for ln in render_area_block(targets, only).split("\n")).lstrip()
+        if targets is not None
+        else "none"
+    )
     # Administrative holds are binding, including for the holder's own workers, and fail closed.
     # Ordinary cross-contributor claims remain cooperative, fail-open, and optional.
     hold_area = None if only in ("any", "") else only
@@ -1538,6 +1578,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 HERE / "prompts" / "roadmap.md",
                 ONLY=only,
                 SKIP=skip_str,
+                TARGETS=targets_str,
                 CLAIMED=claimed_str,
                 AGENT=opts.agent_name,
                 FORK=fork_owner,
@@ -1562,6 +1603,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         HERE / "prompts" / "roadmap.md",
         ONLY=only,
         SKIP=skip_str,
+        TARGETS=targets_str,
         CLAIMED=claimed_str,
         AGENT=opts.agent_name,
         FORK=fork_owner,
