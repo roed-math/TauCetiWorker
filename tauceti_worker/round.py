@@ -14,6 +14,7 @@ import time
 from .config import Config, Die, log
 from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_TIMEOUT
 from .github import claims_repo
+from .local_claims import LocalLease, holder
 from .paths import CLAIM_SH, self_argv, self_env
 
 # ============================================================================
@@ -181,14 +182,67 @@ class Claims:
     heartbeat it (dedup only; git-safe-push's branch CAS is the real guarantee). The heartbeat is a
     detached child that dies with the parent via an inherited pipe (EOF when the parent goes, even on
     SIGKILL), never runs the round's cleanup, and never holds the round.lock fd (pass_fds keeps only
-    the pipe; the lock fd is non-inheritable + closed by close_fds)."""
+    the pipe; the lock fd is non-inheritable + closed by close_fds).
+
+    Every claim is taken in two layers, local first. The host-local flock (local_claims) is consulted
+    before any network call: a key a sibling worker on this host holds is skipped for free, and only a
+    key that is locally ours goes on to the GitHub lease that peers on other hosts can see. The local
+    lock is kept for as long as the GitHub lease would be — including when the GitHub claim cannot be
+    registered at all (rc 2), so same-host dedup works with no writable claim repo — and released
+    wherever the GitHub lease is."""
 
     def __init__(self, cfg: Config, ctx: RoundContext):
         self.cfg = cfg
         self.ctx = ctx
         self.held: tuple[str, str] | None = None
+        self.local: LocalLease | None = None
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
+
+    def _owner(self) -> str:
+        return getattr(self.cfg, "wid", None) or os.environ.get("TAUCETI_WORKER_ID") or f"pid-{os.getpid()}"
+
+    def _take_local(self, key: str, what: str) -> bool:
+        """The local layer: True when `key` is now locked by this round. A Claims holds one local lock
+        at a time, so any earlier one (a candidate this round moved on from) is dropped first."""
+        self._drop_local()
+        lease = LocalLease.acquire(key, self._owner())
+        if lease is None:
+            who = holder(key)
+            log(f"{what} held by a sibling on this host{f' ({who})' if who else ''} — skipping (no network)")
+            return False
+        self.local = lease
+        return True
+
+    def _drop_local(self) -> None:
+        if self.local is not None:
+            self.local.release()
+            self.local = None
+        os.environ.pop("TAUCETI_CLAIM_HELD", None)
+
+    def _keep(self, key: str, claim_repo: str, rc: int, what: str) -> None:
+        """The key is this round's, either as a live GitHub lease (rc 0) or locally only (rc 2, the lease
+        could not be registered). Either way the agent's own `claim.sh acquire <key>` has nothing left
+        to do, so TAUCETI_CLAIM_HELD lets claim.sh answer it without a push."""
+        os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
+        os.environ["TAUCETI_CLAIM_HELD"] = key
+        self.ctx.add_cleanup(self.release)
+        if rc == 0:
+            self.held = (key, claim_repo)
+            # TAUCETI_CLAIM_REPO names the lease git-safe-push renews before pushing. An agent-invoked
+            # claim.sh reads $CLAIM_REPO instead, which do_roadmap points at this same namespace.
+            os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
+            os.environ["TAUCETI_CLAIM_KEY"] = key
+            self.start_heartbeat(key, claim_repo)
+        else:
+            log(
+                f"claim acquire {what} errored (rc={rc}) against {claim_repo} — proceeding unclaimed "
+                f"(branch CAS still protects; same-host dedup still holds through the local lock). If this "
+                f"repeats, this account cannot push there; set CLAIM_REPO=<a repo your whole fleet can push "
+                f"to> to pick the namespace yourself."
+            )
+            os.environ.pop("TAUCETI_CLAIM_KEY", None)
+            os.environ.pop("TAUCETI_CLAIM_REPO", None)
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -199,32 +253,18 @@ class Claims:
         claim in someone else's fork is one only its owner can push. `owner`/`repo` still name the head
         repo, because that is where the push arbiter's branch CAS runs."""
         key = f"branch/{pr}"
+        if not self._take_local(key, f"branch #{pr}"):
+            return False
         claim_repo = claims_repo()
-        claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
-        rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
+        rc = run_claim_sh(["acquire", key, str(CLAIM_TTL_S)], claim_repo)
         if rc == 1:
+            self._drop_local()
             log(f"branch #{pr} claimed by another worker — skipping (COOP dedup)")
             return False
         os.environ["TAUCETI_PUSH_REF"] = refname
         os.environ["TAUCETI_PUSH_EXPECT"] = head
         os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{owner}/{repo}"
-        os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
-        if rc == 0:
-            self.held = (key, claim_repo)
-            # TAUCETI_CLAIM_REPO names the lease git-safe-push renews before pushing. An agent-invoked
-            # claim.sh reads $CLAIM_REPO instead, which do_roadmap points at this same namespace.
-            os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
-            os.environ["TAUCETI_CLAIM_KEY"] = key
-            self.ctx.add_cleanup(self.release)
-            self.start_heartbeat(key, claim_repo)
-        else:
-            log(
-                f"claim acquire #{pr} errored (rc={rc}) against {claim_repo} — proceeding unclaimed "
-                f"(branch CAS still protects). If this repeats, this account cannot push there; set "
-                f"CLAIM_REPO=<a repo your whole fleet can push to> to pick the namespace yourself."
-            )
-            os.environ.pop("TAUCETI_CLAIM_KEY", None)
-            os.environ.pop("TAUCETI_CLAIM_REPO", None)
+        self._keep(key, claim_repo, rc, f"#{pr}")
         return True
 
     def begin_target_work(self, area: str, slug: str) -> int:
@@ -234,27 +274,19 @@ class Claims:
         the push-arbiter env set so git-safe-push fails closed if the lease is lost); 1 = another worker
         holds it (the caller moves to its next candidate); 2 = the claim could not be registered (the
         caller proceeds unclaimed — the same cooperative fail-open as begin_branch_work). The agent's
-        own `claim.sh acquire` of the same key later returns 0, a renewal, because the lease is ours."""
+        own `claim.sh acquire` of the same key later returns 0 without a push: the key is exported as
+        TAUCETI_CLAIM_HELD on both 0 and 2, since the worker chose the target either way.
+
+        A key a sibling worker on this host already holds is reported as 1 without any network call."""
         key = f"author/{area}/{slug}"
+        if not self._take_local(key, f"target {area}/{slug}"):
+            return 1
         claim_repo = claims_repo()
         rc = run_claim_sh(["acquire", key, str(CLAIM_TTL_S)], claim_repo)
         if rc == 1:
+            self._drop_local()
             return 1
-        os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
-        if rc == 0:
-            self.held = (key, claim_repo)
-            os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
-            os.environ["TAUCETI_CLAIM_KEY"] = key
-            self.ctx.add_cleanup(self.release)
-            self.start_heartbeat(key, claim_repo)
-        else:
-            log(
-                f"claim acquire {key} errored (rc={rc}) against {claim_repo} — proceeding unclaimed. If this "
-                f"repeats, this account cannot push there; set CLAIM_REPO=<a repo your whole fleet can push "
-                f"to> to pick the namespace yourself."
-            )
-            os.environ.pop("TAUCETI_CLAIM_KEY", None)
-            os.environ.pop("TAUCETI_CLAIM_REPO", None)
+        self._keep(key, claim_repo, rc, key)
         return rc
 
     def start_heartbeat(self, key: str, claim_repo: str) -> None:
@@ -290,6 +322,7 @@ class Claims:
             self._hb = None
 
     def release(self) -> None:
+        """Give the claim back: the GitHub lease (one push) if one was registered, then the local lock."""
         if self.held:
             key, claim_repo = self.held
             subprocess.run(
@@ -298,6 +331,7 @@ class Claims:
             self.held = None
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
+        self._drop_local()
 
 
 def cmd_heartbeat(args) -> int:

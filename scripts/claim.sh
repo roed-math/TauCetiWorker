@@ -24,14 +24,17 @@
 #   claim.sh gc                            # CAS-delete expired claims
 #
 # Env: CLAIM_REPO (default TauCetiProject/TauCeti), TAUCETI_WORKER_ID (default host-pid),
-#      CLAIM_TTL (default 1500), CLAIM_GITDIR_BASE (per-repo scratch parent),
-#      CLAIM_GITDIR (explicit scratch object store override).
+#      CLAIM_TTL (default 3600), CLAIM_GITDIR_BASE (per-repo scratch parent),
+#      CLAIM_GITDIR (explicit scratch object store override),
+#      TAUCETI_CLAIM_HELD (a key the worker's round already holds and heartbeats: `acquire` of that
+#      exact key returns 0 at once, with no git traffic — the agent's own claim of the target the
+#      worker chose for it is otherwise a second push of a lease that is already ours).
 set -uo pipefail
 
 REPO="${CLAIM_REPO:-TauCetiProject/TauCeti}"
 URL="https://github.com/$REPO"
 WID="${TAUCETI_WORKER_ID:-$(hostname)-$$}"
-DEFAULT_TTL="${CLAIM_TTL:-1500}"
+DEFAULT_TTL="${CLAIM_TTL:-3600}"
 GITDIR="${CLAIM_GITDIR:-${CLAIM_GITDIR_BASE:-$HOME/.cache/tauceti-claims}/${REPO//\//__}.git}"
 NS="refs/tauceti-claims"
 export GIT_AUTHOR_NAME="tauceti-claim" GIT_AUTHOR_EMAIL="claim@tauceti.invalid"
@@ -89,6 +92,10 @@ push_delete() { g push --force-with-lease="$1:$2" origin ":$1" >/dev/null 2>&1; 
 
 cmd_acquire() {
     local key="$1" ttl="${2:-$DEFAULT_TTL}" ref cur js owner exp n
+    if [[ -n "${TAUCETI_CLAIM_HELD:-}" && "$key" == "$TAUCETI_CLAIM_HELD" ]]; then
+        echo "claim: $key is already held by this worker's round (its heartbeat renews it) — nothing to push" >&2
+        return 0
+    fi
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref")
     if [[ -n "$cur" ]]; then

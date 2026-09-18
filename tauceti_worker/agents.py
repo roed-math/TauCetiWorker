@@ -1441,8 +1441,10 @@ def run_in_bubble(
 
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
-    # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
-    # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
+    # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_KEY/_REPO/_SH (the
+    # claim+heartbeat are host-side; the branch CAS is the [HARD] guarantee and needs no in-container
+    # claim). TAUCETI_CLAIM_HELD does cross: it only names the key the host round already holds, so the
+    # agent's own `claim.sh acquire` of it inside the container returns 0 without a push, as on the host.
     # CLAIM_REPO does cross, for the agent's own [COOP] target claim (roadmap): without it claim.sh
     # falls back to canonical, which the container cannot push to. It can only reach the claim repo
     # when --allow-push covers it (the fork, not the shared namespace); when it does not, claim.sh
@@ -1454,6 +1456,7 @@ def run_in_bubble(
         "TAUCETI_PUSH_REMOTE",
         "TAUCETI_TARGET_MARKER",
         "TAUCETI_REQUIRE_TARGET_MARKER",
+        "TAUCETI_CLAIM_HELD",
         "CLAIM_REPO",
     ):
         val = os.environ.get(var)

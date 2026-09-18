@@ -88,13 +88,17 @@ to the first `## ` heading is shown to the agent verbatim.
   eligible item, minus `--roadmap-skip`, are visited in random order, without
   fetching the area list from GitHub; a pinned `--roadmap-only` area must have
   an eligible item and, as always, beats a skip. Within an area, file order.
-- The claim: for each candidate the worker runs `claim.sh acquire
-  author/<area>/<slug>` (in [the claim namespace](#the-claim-namespace)) and
-  takes the first it can hold; one held by another worker is skipped, and after
-  eight misses the round yields. The lease lasts `CLAIM_TTL` seconds (default
-  1500) and is renewed every `CLAIM_HEARTBEAT` seconds (300) while the agent
-  runs — the same lease and heartbeat as branch claims — so a dead worker's
-  claim expires on its own; it is released when the round ends.
+- The claim: for each candidate the worker first takes a host-local lock on
+  `author/<area>/<slug>` (free; a sibling worker on the same host that holds it
+  is skipped with no network call), then runs `claim.sh acquire` for it (in
+  [the claim namespace](#the-claim-namespace)) and takes the first it can hold;
+  one held by another worker is skipped, and after eight misses the round
+  yields. The lease lasts `CLAIM_TTL` seconds (default 3600) and is renewed
+  every `CLAIM_HEARTBEAT` seconds (1200) while the agent runs — the same lease
+  and heartbeat as branch claims — so a dead worker's claim expires on its own;
+  it is released when the round ends. The agent's own `claim.sh acquire` of the
+  assigned slug returns 0 at once (the round exports the held key as
+  `TAUCETI_CLAIM_HELD`), so it costs no push either.
   The agent is told the assigned slug, must use it verbatim as claim key and
   marker id, must not pick another item, and stops without a PR when the target
   turns out to be covered or blocked. With no candidate left (none eligible, or
@@ -135,6 +139,23 @@ the guarantee that two workers cannot clobber each other's branch is the
 `--force-with-lease` CAS in `git-safe-push`, which does not depend on claims at
 all. So a claim that cannot be acquired (a namespace this account cannot push to,
 a GitHub outage) is logged and the round proceeds unclaimed.
+
+Every claim has a host-local layer in front of the GitHub lease. Before any
+network call the round takes an `flock` on a per-key file under
+`~/.cache/tauceti-claims/local/` (the login user's home, shared by every worker
+on the host; `TAUCETI_LOCAL_CLAIMS_DIR` overrides it). A key a sibling worker on
+the same host holds is skipped for free; only a key that is locally ours goes on
+to the GitHub lease, which is what workers on other hosts see. The lock is held
+by the open file descriptor, so a crashed round releases it with no TTL to wait
+out, and it is kept even when the GitHub lease could not be registered, so
+same-host de-duplication works with no writable claim repository at all.
+
+## Background GitHub traffic from claims
+
+Claims cost pushes: one to acquire, one per heartbeat renewal (every
+`CLAIM_HEARTBEAT` seconds, 20 minutes by default, so a full-length round renews
+about four times), one to release. A round's own agent re-claiming the target
+the worker chose for it, and any same-host contention, cost nothing.
 
 ## Claims on the intentions board
 
@@ -279,8 +300,9 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `TAUCETI_LOCAL_CLAIMS_DIR` | `~/.cache/tauceti-claims/local` | Where the host-local claim locks live (login home, shared by every worker on the host). |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
-| `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
+| `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `3600` / `1200` | Claim lease TTL and heartbeat interval (seconds); each renewal is a push. Keep the TTL above twice the heartbeat. |
 
 Worker configuration paths (`TAUCETI_WORKERS_CONFIG`, `TAUCETI_CONFIG_HOME`,
 `TAUCETI_WORKERS_STATE_DIR`, `TAUCETI_RUNTIME_DIR`) are documented in

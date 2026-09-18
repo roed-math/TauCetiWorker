@@ -30,6 +30,7 @@ RUN_STDLIB=(
   claude_config_dir.py
   claude_keychain.py
   claude_warm.py
+  claim_local_first.py
   claims_repo.py
   codex_account.py
   codex_fallback.py
@@ -48,6 +49,7 @@ RUN_STDLIB=(
   isolate_home_paths.py
   kiro.py
   ledger_blocking.py
+  local_claims.py
   loop_sigterm.py
   mirror_creds.py
   mirror_creds_macos.py

@@ -193,9 +193,17 @@ _GH_TRANSIENT_RE = re.compile(
 
 
 # Claims / scoreboard cache.
-CLAIM_TTL_S = int(os.environ.get("CLAIM_TTL", "1500"))  # 25 min lease; expires if a worker stops heartbeating
+#
+# A GitHub claim lease is a push (a new orphan commit behind a force-with-lease CAS) on acquire, on
+# every renewal, and on release, so the heartbeat cadence IS the claim's background traffic. A round
+# is capped at ROUND_TIMEOUT (90 min), so a 20-minute heartbeat renews a full-length round ~4 times
+# where the old 5-minute one renewed it ~18 times. The TTL must stay comfortably above twice the
+# heartbeat, so one missed renewal (a rate-limit wait, a slow push) cannot lose a live lease.
+# Same-host dedup does not wait on any of this: workers on one host settle a claim on a local flock
+# (tauceti_worker.local_claims) before the first GitHub call.
+CLAIM_TTL_S = int(os.environ.get("CLAIM_TTL", "3600"))  # 60 min lease; expires if a worker stops heartbeating
 
-CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every 5 min while the agent runs
+CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "1200"))  # renew every 20 min while the agent runs
 
 SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached scoreboard meta stays fresh
 
