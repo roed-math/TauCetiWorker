@@ -35,6 +35,7 @@ from pathlib import Path
 from .config import Die, log
 
 MARKER_RE = re.compile(r"<!--\s*tauceti-targets:v1\s*-->")
+_AREA_RE = re.compile(r"[A-Za-z0-9_-]+")
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _ITEM_RE = re.compile(r"^\s*-\s*\[\s*([ xX~])\s*\]\s*(.*?)\s*$")
 _ITEM_START_RE = re.compile(r"^\s*-\s*\[")
@@ -123,6 +124,14 @@ def parse_targets(text: str) -> Targets:
             if title.lower().startswith("gaps"):
                 area = None
             else:
+                # An area is a roadmap DIRECTORY name; the agent is told to author against it and the
+                # claim key embeds it. A heading carrying prose ("Foo (drafted, not yet a PR)") would
+                # otherwise become an area a worker tries to author against. Refuse rather than guess.
+                if not _AREA_RE.fullmatch(title):
+                    raise Die(
+                        f"target list: heading {title!r} is not a roadmap area name (letters, digits, '-', '_'); "
+                        "keep drafted or annotated areas under the Gaps section until their roadmap exists"
+                    )
                 area = title
                 areas.setdefault(area, [])
             continue

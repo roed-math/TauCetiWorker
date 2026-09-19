@@ -112,6 +112,12 @@ def test_parser():
         check("parser: missing marker -> Die", False)
     except tc.Die as e:
         check("parser: missing marker -> Die", "tauceti-targets:v1" in str(e))
+    # a heading carrying prose is not an area: refuse rather than author against a non-existent roadmap
+    try:
+        T.parse_targets("<!--tauceti-targets:v1-->\n## Foo (drafted 2026-09-18, not yet a PR)\n- [ ] `x` — y\n")
+        check("parser: annotated heading -> Die", False)
+    except tc.Die as e:
+        check("parser: annotated heading -> Die", "not a roadmap area name" in str(e))
     # spaced hyphen and a spaced-out marker are accepted
     t2 = T.parse_targets("<!--tauceti-targets:v1-->\n## A\n- [ ] `s` - text here (needs: `q`)\n")
     check(
