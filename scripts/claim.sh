@@ -33,7 +33,16 @@
 #      TAUCETI_CLAIM_HELD (a key the worker's round already holds and heartbeats: `acquire` of that
 #      exact key returns 0 at once, with no git traffic — the agent's own claim of the target the
 #      worker chose for it is otherwise a second push of a lease that is already ours).
+#      TAUCETI_GATE_DIR / TAUCETI_GATE_REQUIRED (the fleet GitHub gate, docs/gate.md: every network
+#      subcommand is admitted before git runs — the lease writers as a git_push to CLAIM_REPO, the
+#      rest as a git_read — and recorded after; a refusal exits 2 like any other registration failure.
+#      A TAUCETI_GATE_TOKEN from the worker means it admitted this call already).
+#      TAUCETI_REAL_GIT (the git to run; the agent's PATH leads with a shim of it).
 set -uo pipefail
+# shellcheck source=gate-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-lib.sh"
+REAL_GIT="${TAUCETI_REAL_GIT:-git}"
+LAST_OUT=""
 
 REPO="${CLAIM_REPO:-}"
 URL="https://github.com/$REPO"
@@ -70,13 +79,22 @@ require_repo() {
 ensure_repo() {
     if [[ ! -d "$GITDIR" ]]; then
         mkdir -p "$(dirname "$GITDIR")"
-        git init -q --bare "$GITDIR"
+        "$REAL_GIT" init -q --bare "$GITDIR"
     fi
-    git -C "$GITDIR" remote get-url origin >/dev/null 2>&1 \
-        || git -C "$GITDIR" remote add origin "$URL"
-    git -C "$GITDIR" remote set-url origin "$URL"
+    "$REAL_GIT" -C "$GITDIR" remote get-url origin >/dev/null 2>&1 \
+        || "$REAL_GIT" -C "$GITDIR" remote add origin "$URL"
+    "$REAL_GIT" -C "$GITDIR" remote set-url origin "$URL"
 }
-g() { git -C "$GITDIR" "$@"; }
+g() { "$REAL_GIT" -C "$GITDIR" "$@"; }
+
+# admit SUB — the gate, after require_repo and before any git: a refused lease op is "could not be
+# registered" (2) to every caller, the same cooperative fail-open as a push the namespace rejected.
+admit() {
+    case "$1" in
+        acquire|renew|release|gc) gate_admit git_push "$1" "$REPO" || return 2;;
+        *) gate_admit git_read "$1" "$REPO" || return 2;;
+    esac
+}
 
 empty_tree() { g hash-object -t tree -w /dev/null; }
 
@@ -108,10 +126,15 @@ push_cas() {
     local out
     out=$(g push --force-with-lease="$1:$2" origin "$3:$1" 2>&1)
     if [[ $? -eq 0 ]]; then return 0; fi
+    LAST_OUT="$out"
     grep -qiE 'rejected|stale info|failed to push' <<<"$out" && return 1
     echo "claim: unexpected push error on $1: $out" >&2; return 2
 }
-push_delete() { g push --force-with-lease="$1:$2" origin ":$1" >/dev/null 2>&1; }
+push_delete() {
+    local out
+    out=$(g push --force-with-lease="$1:$2" origin ":$1" 2>&1) && return 0
+    LAST_OUT="$out"; return 1
+}
 
 cmd_acquire() {
     local key="$1" ttl="${2:-$DEFAULT_TTL}" ref cur js owner exp n
@@ -120,6 +143,7 @@ cmd_acquire() {
         return 0
     fi
     require_repo
+    admit acquire || return 2
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref")
     if [[ -n "$cur" ]]; then
@@ -139,6 +163,7 @@ cmd_acquire() {
 cmd_renew() {
     local key="$1" ttl="${2:-$DEFAULT_TTL}" ref cur js owner n
     require_repo
+    admit renew || return 2
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 1
     js=$(lease_json "$cur" "$ref"); owner=$(jq -r '.owner // ""' <<<"$js" 2>/dev/null)
@@ -150,6 +175,7 @@ cmd_renew() {
 cmd_release() {
     local key="$1" ref cur js owner
     require_repo
+    admit release || return 2
     ref=$(ref_of "$key"); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 0
     js=$(lease_json "$cur" "$ref"); owner=$(jq -r '.owner // ""' <<<"$js" 2>/dev/null)
@@ -160,6 +186,7 @@ cmd_release() {
 cmd_holds() {
     local key="$1" ref cur js owner exp n
     require_repo
+    admit holds || return 2
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 1
     js=$(lease_json "$cur" "$ref"); owner=$(jq -r '.owner // ""' <<<"$js" 2>/dev/null)
@@ -168,13 +195,13 @@ cmd_holds() {
 }
 
 cmd_read() {
-    local ref cur; require_repo; ref=$(ref_of "$1"); ensure_repo
+    local ref cur; require_repo; admit read || return 2; ref=$(ref_of "$1"); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 0
     lease_json "$cur" "$ref"
 }
 
 cmd_list() {
-    require_repo; ensure_repo
+    require_repo; admit list || return 2; ensure_repo
     g ls-remote origin "$NS/*" 2>/dev/null | while read -r oid ref; do
         local key="${ref#"$NS"/}"
         if [[ "${1:-}" == "--full" ]]; then
@@ -186,7 +213,7 @@ cmd_list() {
 }
 
 cmd_gc() {
-    local n; require_repo; n=$(now); ensure_repo
+    local n; require_repo; admit gc || return 2; n=$(now); ensure_repo
     g ls-remote origin "$NS/*" 2>/dev/null | while read -r oid ref; do
         local js exp; js=$(lease_json "$oid" "$ref"); exp=$(jq -r '.expires_at // 0' <<<"$js" 2>/dev/null)
         if [[ "$exp" =~ ^[0-9]+$ && "$exp" -le "$n" ]]; then
@@ -197,12 +224,23 @@ cmd_gc() {
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
-    acquire) cmd_acquire "$@";;
-    renew)   cmd_renew "$@";;
-    release) cmd_release "$@";;
-    holds)   cmd_holds "$@";;
-    read)    cmd_read "$@";;
-    list)    cmd_list "$@";;
-    gc)      cmd_gc "$@";;
+    acquire) cmd_acquire "$@"; rc=$?;;
+    renew)   cmd_renew "$@"; rc=$?;;
+    release) cmd_release "$@"; rc=$?;;
+    holds)   cmd_holds "$@"; rc=$?;;
+    read)    cmd_read "$@"; rc=$?;;
+    list)    cmd_list "$@"; rc=$?;;
+    gc)      cmd_gc "$@"; rc=$?;;
     *) echo "usage: claim.sh {acquire|renew|release|holds|read|list|gc} <key> [ttl]" >&2; exit 64;;
 esac
+# Record the outcome of the admission this process made (none, when the worker admitted for it, or
+# when the held-key short-circuit / require_repo answered before any git ran). 0 and 1 are verdicts
+# (mine / another's), not transport failures; 2 carries the last git output for classification.
+if [[ "$GATE_OWNED" == 1 ]]; then
+    if [[ "$rc" -le 1 ]]; then gate_record ok
+    else
+        detail=$(mktemp); printf '%s\n' "$LAST_OUT" > "$detail"
+        gate_record fail "$detail"; rm -f "$detail"
+    fi
+fi
+exit "$rc"

@@ -20,7 +20,13 @@
 #   TAUCETI_CLAIM_KEY    optional claim key to verify/renew before pushing
 #   TAUCETI_CLAIM_REPO   repository containing that claim (default: claim.sh's normal selection)
 #   TAUCETI_CLAIM_SH     path to claim.sh (default: alongside this script)
+#   TAUCETI_GATE_DIR / TAUCETI_GATE_REQUIRED   the fleet GitHub gate (docs/gate.md): the push is admitted
+#                        as a git_push to the head repository before git runs and recorded after
+#   TAUCETI_REAL_GIT     the git to run (the agent's PATH leads with a shim of it)
 set -uo pipefail
+# shellcheck source=gate-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-lib.sh"
+REAL_GIT="${TAUCETI_REAL_GIT:-git}"
 
 REF="${1:-${TAUCETI_PUSH_REF:-}}"
 EXPECT="${TAUCETI_PUSH_EXPECT:-}"
@@ -47,11 +53,24 @@ if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then
     fi
 fi
 
-# 2) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
+# 2) The gate: one git_push to the head repository. A remote NAME is resolved to its URL so the target
+#    is the repository, not the alias; a refusal is final for this round (exit 75, nothing pushed).
+TARGET="$REMOTE"
+case "$REMOTE" in
+    http://*|https://*|git@*|ssh://*) ;;
+    *) TARGET=$("$REAL_GIT" remote get-url "$REMOTE" 2>/dev/null || echo "$REMOTE");;
+esac
+gate_admit git_push push "$TARGET" || { echo "git-safe-push: the fleet gate refused this push — nothing was pushed" >&2; exit 75; }
+
+# 3) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
 echo "git-safe-push: $REMOTE HEAD:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2
-if git push --force-with-lease="$REF:$EXPECT" "$REMOTE" "HEAD:$REF"; then
-    exit 0
-fi
+OUT=$(mktemp)
+"$REAL_GIT" push --force-with-lease="$REF:$EXPECT" "$REMOTE" "HEAD:$REF" 2> >(tee "$OUT" >&2)
+rc=$?
+wait
+if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
+rm -f "$OUT"
+[[ "$rc" -eq 0 ]] && exit 0
 die "push rejected — the branch '$REF' moved since checkout (a concurrent push), or it already exists.
 This is the safety mechanism working: we did NOT overwrite anyone. Re-sync to the current head and retry
 next round; do not retry a plain 'git push'."

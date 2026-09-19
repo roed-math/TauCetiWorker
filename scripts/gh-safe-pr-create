@@ -10,8 +10,14 @@
 #   TAUCETI_AUTHOR_CLAIM_KEY   the author/<area>/<target-id> claim acquired in shell before the agent ran
 #   TAUCETI_TARGET_MARKER      the exact <!--tauceti-target:v1 {...}--> string the PR body must contain
 #   TAUCETI_CLAIM_SH           path to claim.sh (default: alongside this script)
+#   TAUCETI_GATE_DIR / TAUCETI_GATE_REQUIRED   the fleet GitHub gate (docs/gate.md): the create is admitted
+#                              as one api_mutation (op pr_create) against --repo before gh runs
+#   TAUCETI_REAL_GH            the gh to run (the agent's PATH leads with a shim of it)
 # All `gh pr create` flags pass through unchanged.
 set -uo pipefail
+# shellcheck source=gate-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-lib.sh"
+REAL_GH="${TAUCETI_REAL_GH:-gh}"
 
 CLAIM_KEY="${TAUCETI_AUTHOR_CLAIM_KEY:-}"
 MARKER="${TAUCETI_TARGET_MARKER:-}"
@@ -56,5 +62,21 @@ elif [[ "$REQUIRE_MARKER" == "1" ]]; then
 It lets other agents and the dup-sweeper recognize which roadmap target this PR authors."
 fi
 
+# 3) The gate: one mutation against the base repository (--repo/-R, else canonical).
+TARGET="TauCetiProject/TauCeti"; prev=""
+for a in "$@"; do
+    case "$prev" in --repo|-R) TARGET="$a";; esac
+    case "$a" in --repo=*) TARGET="${a#--repo=}";; esac
+    prev="$a"
+done
+gate_admit api_mutation pr_create "$TARGET" || die "the fleet gate refused this PR creation — nothing was created"
+
 echo "gh-safe-pr-create: gh pr create $*" >&2
-exec gh pr create "$@"
+OUT=$(mktemp)
+gate_spawn "$REAL_GH" pr create "$@"
+"$REAL_GH" pr create "$@" 2> >(tee "$OUT" >&2)
+rc=$?
+wait
+if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
+rm -f "$OUT"
+exit "$rc"
