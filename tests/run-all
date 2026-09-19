@@ -47,8 +47,14 @@ RUN_STDLIB=(
   gate_t04_403_classes.py
   gate_t05_rate_limits.py
   gate_t06_restart_cooldown.py
+  gate_t07_lost_response.py
+  gate_t08_crash_between_steps.py
+  gate_t09_stale_head.py
+  gate_t10_lease_lost.py
   gate_t11_partial_data.py
+  gate_t12_coalesced_misses.py
   gate_t13_identity_override.py
+  gate_t14_noop_suppression.py
   gate_t15_offline_escape.py
   gate_t16_store_unavailable.py
   github_failure_reason.py
