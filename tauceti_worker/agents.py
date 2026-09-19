@@ -1551,6 +1551,7 @@ def run_in_bubble(
         "TAUCETI_REQUIRE_TARGET_MARKER",
         "TAUCETI_CLAIM_HELD",
         "CLAIM_REPO",
+        "TAUCETI_PUBLICATION_ID",
     ):
         val = os.environ.get(var)
         if val:

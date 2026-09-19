@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import gate as gate_mod
+from . import publications as pub_mod
 from .agents import (
     AuthoringProfile,
     _codex_review_model_override,
@@ -71,6 +72,7 @@ from .constants import (
 )
 from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
 from .intentions import administrative_hold_avoid_list, claimed_avoid_list
+from .interaction import contest_max_exchanges, record_incident
 from .paths import HERE
 from .quota import Quota, _unavail_reason, mirror_creds
 from .review_diagnostics import (
@@ -324,6 +326,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # credential mirror.
     if not opts.dry_run:
         mirror_creds(w.cfg)
+        _reconcile_previous_publications(w)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
@@ -488,6 +491,19 @@ PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
 # inside the container, so the host checkout would say nothing about it either way.
 FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
 _MAX_CHANGED_FILES = 25
+
+
+def _reconcile_previous_publications(w: Worker) -> None:
+    """Design §6, on round start: a step the previous round left `sent` is `uncertain` and is reconciled
+    (one admitted read each) before this round does anything new. A step that cannot be resolved parks
+    its publication, which `tauceti gate status` shows; nothing is resent."""
+    try:
+        results = pub_mod.reconcile_stale(w.cfg.wid)
+    except (Die, gate_mod.StoreError) as e:
+        log(f"publication reconcile skipped: {e}")
+        return
+    for pub_id, verdicts in results:
+        log(f"  publication {pub_id}: reconciled " + " ".join(f"{k}={v}" for k, v in verdicts.items()))
 
 
 def _checkout_head(cfg: Config) -> str | None:
@@ -842,6 +858,25 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
     errkey = f"review-err-{pr}"
     if c.contest:
+        # Brief §8.1: a bounded number of automated exchanges per head, then a human. At the cap nothing
+        # is posted — no claim, no engine, no reply — and a local incident says so (once per head).
+        headkey = f"review-contest-{pr}-head-{head[:12]}"
+        cap = contest_max_exchanges()
+        if w.counters.read(headkey) >= cap:
+            path = record_incident(
+                "contest-cap",
+                f"{pr}-{head[:12]}",
+                pr=pr,
+                head=head,
+                rubric=c.contest,
+                exchanges=w.counters.read(headkey),
+                cap=cap,
+                message="needs a human: the automated contest exchanges on this head reached the cap",
+            )
+            log(
+                f"  review #{pr}: contest on {c.contest} @ {head[:12]} reached {cap} exchanges — needs a human ({path})"
+            )
+            raise NoProgress(f"review #{pr}: contest exchanges on this head reached the cap ({cap}) — needs a human")
         # Claim the in-flight contest with a 👀 on the contesting reply so a peer worker re-surveying
         # before the new scoreboard lands skips it (cross-fleet dedup). The engine auto-detects the
         # contest from the thread reply (no extra flag); a contest-only round is recorded as a reply
@@ -920,6 +955,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 # is dropped. Just bump the contest caps.
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
+                w.counters.incr(f"review-contest-{pr}-head-{head[:12]}")
             w.rs.bust(pr)
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
             # The engine stopped because the reviewer's provider is unusable — a revoked credential or
@@ -1112,7 +1148,14 @@ def _do_fixlike(
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
+    pub_kind = pub_mod.KIND_REBASE if label == "rebase" else pub_mod.KIND_FIX
+    pub_id = ""
     if bubble:
+        # The publication (design §6) is created before the agent launches; its id crosses into the
+        # container with the push-arbiter env so the scripts there record their steps against it.
+        pub_id = pub_mod.create_for_round(
+            pub_kind, branch=p.head_ref, head_sha=head, pr=pr, remote=f"https://github.com/{p.head_owner}/{p.head_repo}"
+        )
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
         rc = run_in_bubble(
@@ -1136,7 +1179,19 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
+        pub_id = pub_mod.create_for_round(
+            pub_kind,
+            branch=p.head_ref,
+            head_sha=checked,
+            pr=pr,
+            remote=f"https://github.com/{p.head_owner}/{p.head_repo}",
+        )
         rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+    if pub_id:
+        os.environ.pop(pub_mod.ID_ENV, None)
+        outcome = pub_mod.round_summary(pub_id)
+        if outcome:
+            log(f"  publication: {outcome}")
     if rc == 0:
         w.rs.bust(pr)
     else:
@@ -1657,7 +1712,6 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # worker never needs write access to canonical (and canonical stays free of WIP branches). The agent
     # builds against canonical main (the bubble/checkout still targets TAUCETI) — only the push redirects.
     fork = ensure_fork()
-    fork_owner = fork.split("/", 1)[0]
     os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{fork}"
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)  # a fresh branch ⇒ create-only CAS on the fork
     # The agent's own target claim (`claim.sh acquire author/<roadmap>/<slug>` in prompts/roadmap.md)
@@ -1691,6 +1745,49 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
   If the PR derives any content from it, name the source repository, commit, and license in the PR
   body, and do not migrate material whose license does not permit it.
 """
+    # The author publication (design §6): push → pr_create → marker_check, recorded by the scripts the
+    # agent runs against this id. The branch is the agent's to name; git-safe-push records it.
+    pub_id = pub_mod.create_for_round(pub_mod.KIND_AUTHOR, branch="", head_sha="", remote=f"https://github.com/{fork}")
+    try:
+        return _do_roadmap_agent(
+            w,
+            opts,
+            bubble,
+            refs,
+            bundle,
+            source_dir,
+            only,
+            skip_str,
+            assigned_str,
+            targets_str,
+            claimed_str,
+            fork,
+            source_guidance,
+        )
+    finally:
+        if pub_id:
+            os.environ.pop(pub_mod.ID_ENV, None)
+            outcome = pub_mod.round_summary(pub_id)
+            if outcome:
+                log(f"  publication: {outcome}")
+
+
+def _do_roadmap_agent(
+    w,
+    opts,
+    bubble,
+    refs,
+    bundle,
+    source_dir,
+    only,
+    skip_str,
+    assigned_str,
+    targets_str,
+    claimed_str,
+    fork,
+    source_guidance,
+) -> int:
+    fork_owner = fork.split("/", 1)[0]
     if bubble:
         mounts = [f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"]
         if bundle is not None:

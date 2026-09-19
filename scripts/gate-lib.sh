@@ -12,6 +12,12 @@
 #   gate_record STATUS [F]  record the outcome of an admission this process made (STATUS is an HTTP
 #                           status, ok, fail or rc:<n>; F a file holding the detail text)
 #   gate_spawn ARGV...      note a real `gh` spawn in TAUCETI_GATE_DIR/spawns.log for `report`
+#   pub_begin STEP [ARGS]   the publication ledger (docs/gate.md, design §6): mark STEP of the round's
+#                           publication (TAUCETI_PUBLICATION_ID) sent, after the ledger revalidated it.
+#                           0 proceed; 75 refused (never resend: "publication: refused (<reason>)" is
+#                           on stderr); 3 the reply is a duplicate — skip it, nothing to send. A no-op
+#                           (0) with no publication id or no gate.
+#   pub_end STEP ok|fail [--remote-id X] [--detail-file F]   record the outcome (done / uncertain / pending)
 #
 # The CLI is the sibling tauceti-gate (TAUCETI_GATE_CLI overrides, for tests).
 GATE_CLI="${TAUCETI_GATE_CLI:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tauceti-gate}"
@@ -53,4 +59,17 @@ gate_spawn() {
     argv=$(printf '%q ' "$@")
     printf '{"ts":"%s","op_id":"%s","argv":"%s"}\n' "$ts" "${GATE_TOKEN:-${TAUCETI_GATE_TOKEN:-}}" "${argv//\"/\\\"}" \
         >> "$TAUCETI_GATE_DIR/spawns.log" 2>/dev/null || true
+}
+
+pub_enabled() { [[ -n "${TAUCETI_PUBLICATION_ID:-}" ]] && gate_enabled; }
+
+pub_begin() {
+    pub_enabled || return 0
+    "$GATE_CLI" publication begin "$TAUCETI_PUBLICATION_ID" "$@"
+}
+
+pub_end() {
+    pub_enabled || return 0
+    "$GATE_CLI" publication end "$TAUCETI_PUBLICATION_ID" "$@" >/dev/null
+    return 0
 }

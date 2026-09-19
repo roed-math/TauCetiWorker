@@ -33,6 +33,7 @@ missing directory there is a hard error rather than a silent bypass.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fcntl
 import json
@@ -89,6 +90,9 @@ EVENTS = "events.log"
 HALT = "halt.json"
 DISABLED = "disabled"
 SPAWNS = "spawns.log"  # one line per real `gh` the shim spawned; `report` matches them against events
+CACHE = "cache"  # the fleet-shared read cache (design §5); review_state/ sidecars and inflight/ markers
+INFLIGHT = "inflight"
+READ_INFLIGHT_TTL = 20  # seconds a miss marker is honoured: a reader waits at most this long for a peer's fetch
 
 # Ops that may draw on the reads reserve (publication preflight and reconciliation).
 RESERVED_OPS = frozenset({"preflight", "reconcile", "rate_limit"})
@@ -904,6 +908,78 @@ class Gate:
             self._event(decision="transition", kind="-", op="-", target="-", reason="disable" if on else "enable")
         finally:
             self._release()
+
+    # ---- the lock, for the ledgers that share it ------------------------------------------------
+
+    @contextlib.contextmanager
+    def locked(self):
+        """The store lock, for the publication ledger and the read-cache markers, which live beside the
+        store and take the same lock so one writer at a time touches any of them."""
+        self._acquire()
+        try:
+            yield
+        finally:
+            self._release()
+
+    @property
+    def cache_dir(self) -> Path:
+        """The fleet-shared read cache (design §5): `review_state/` sidecars and `inflight/` markers."""
+        return self._path(CACHE)
+
+    # ---- shared read cache: miss coalescing (design §5) ------------------------------------------
+
+    def claim_read(self, key: str) -> dict | None:
+        """Claim the miss for `key` (a PR number): None when this process now owns the fetch, else the
+        live marker of the reader that does (pid alive, younger than READ_INFLIGHT_TTL), for the caller
+        to wait on. A dead or aged marker is taken over. Never raises: a store failure means no
+        coalescing, which is a duplicate read, not a wrong one."""
+        try:
+            with self.locked():
+                p = self.cache_dir / INFLIGHT / f"{key}.json"
+                other = self._read_marker(p)
+                if other is not None:
+                    return other
+                p.parent.mkdir(parents=True, exist_ok=True)
+                self._write(p.relative_to(self.dir).as_posix(), {"pid": os.getpid(), "at": self.now()})
+                return None
+        except (StoreError, OSError, ValueError):
+            return None
+
+    def read_claim_live(self, key: str) -> bool:
+        """Whether someone else's marker for `key` is still live (the waiter's poll)."""
+        try:
+            with self.locked():
+                return self._read_marker(self.cache_dir / INFLIGHT / f"{key}.json") is not None
+        except (StoreError, OSError, ValueError):
+            return False
+
+    def release_read(self, key: str) -> None:
+        try:
+            with self.locked():
+                p = self.cache_dir / INFLIGHT / f"{key}.json"
+                try:
+                    m = json.loads(p.read_text())
+                except (OSError, ValueError):
+                    return
+                if m.get("pid") == os.getpid():
+                    p.unlink(missing_ok=True)
+        except (StoreError, OSError):
+            pass
+
+    def _read_marker(self, p: Path) -> dict | None:
+        try:
+            m = json.loads(p.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return None
+        pid = m.get("pid")
+        at = m.get("at")
+        if not isinstance(pid, int) or not isinstance(at, (int, float)):
+            return None
+        if pid == os.getpid() or not _pid_alive(pid) or self.now() - at >= READ_INFLIGHT_TTL:
+            return None
+        return m
 
     def probe(self) -> dict:
         """The verdict an admit would reach on the global state alone (halt, cooldown, disabled), with no

@@ -9,6 +9,11 @@ agent's gh/git shims, git's credential helper, and the operator.
     tauceti-gate enable / disable                          the disabled marker refuses every admit (offline)
     tauceti-gate revalidate <op> <target>                  lift one quarantine after fixing what caused it
     tauceti-gate credential get                            a git credential helper (design §4)
+    tauceti-gate publication create --kind K --branch B --head-sha S [--pr N] [--repo R] [--remote URL]
+    tauceti-gate publication begin <id> <step> [--sha S] [--body-file F]   exit 75 refused, 3 duplicate (skip)
+    tauceti-gate publication end <id> <step> <ok|fail> [--remote-id X] [--detail-file F]
+    tauceti-gate publication show <id> / list               the ledger (design §6)
+    tauceti-gate reconcile [<id> | --all]                   resolve uncertain steps with one read each
 
 `<status>` for record is an HTTP status code, `ok`, `fail`, or `rc:<n>` (a process exit status, in
 which case the detail text is what gets classified). `python -m tauceti_worker gate …` is the same
@@ -27,6 +32,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from . import gate as gate_mod
+from . import publications as pub_mod
 from .config import Die
 from .gate import Gate, GateRefused, Outcome
 
@@ -168,6 +174,11 @@ def _summary(v: dict) -> str:
         bits.append("quarantined: " + ", ".join(sorted(v["quarantine"])))
     if v.get("login"):
         bits.append(f"login {v['login']}")
+    q = v.get("publications") or {}
+    if q:
+        bits.append(f"publications: {q.get('queue_depth', 0)} in progress, {len(q.get('parked') or [])} parked")
+        for line in q.get("parked") or []:
+            bits.append(f"  parked: {line}")
     return "; ".join(bits)
 
 
@@ -176,6 +187,8 @@ def cmd_status(args) -> int:
         v = _gate().status()
     except Die as e:  # REQUIRED without a dir
         v = {"enabled": False, "error": str(e), "state": "STORE-ERROR"}
+    if v.get("enabled") and not v.get("error"):
+        v["publications"] = pub_mod.queue_summary()  # local files only: the fleet view makes no remote call
     if args.json:
         print(json.dumps(v, indent=2, sort_keys=True, default=str))
     else:
@@ -276,6 +289,15 @@ def cmd_report(args) -> int:
             print(f"  {e.get('ts')} {e.get('op')}:{e.get('target')} {e.get('reason')}")
     uncertain = [e for e in ev if e.get("decision") == "uncertain"]
     print(f"uncertain writes (in flight at a halt): {len(uncertain)}")
+    q = pub_mod.queue_summary()
+    print(
+        f"publications: queue depth {q['queue_depth']}, {len(q['parked'])} parked, "
+        f"{q['uncertain_steps']} uncertain step(s), {q['complete']} complete"
+    )
+    for line in q["open"]:
+        print(f"  in progress: {line}")
+    for line in q["parked"]:
+        print(f"  parked:      {line}")
     # UNINSTRUMENTED: a real gh the shim spawned with no admission behind it.
     spawns = []
     try:
@@ -388,6 +410,102 @@ def cmd_credential(args) -> int:
     return 0
 
 
+DUPLICATE_RC = 3  # `publication begin comment`: the same reply is already posted — skip, nothing to send
+
+
+def cmd_publication(args) -> int:
+    g = _gate()
+    if not g.enabled:
+        if args.action in ("create", "begin", "end"):
+            print("disabled")  # no ledger without a gate: the scripts run unrecorded, as before
+            return 0
+        print("gate: disabled — no publication ledger", file=sys.stderr)
+        return 0
+    if args.action == "create":
+        pub = pub_mod.Publication.create(
+            args.kind,
+            branch=args.branch or "",
+            head_sha=args.head_sha or "",
+            pr=args.pr,
+            repo=args.repo or pub_mod.TAUCETI,
+            remote=args.remote or "",
+        )
+        print(pub.id)
+        return 0
+    if args.action == "list":
+        for pub in pub_mod.list_all():
+            print(pub.summary())
+        return 0
+    pub = pub_mod.Publication.load(args.id)
+    if args.action == "show":
+        print(json.dumps(dataclasses_asdict(pub), indent=2, sort_keys=True))
+        return 0
+    if args.action == "begin":
+        body = None
+        if args.body_file:
+            try:
+                body = Path(args.body_file).read_text(errors="replace")
+            except OSError as e:
+                raise Die(f"publication begin: --body-file {args.body_file}: {e}") from None
+        try:
+            # The wrapper script that will hold the write in flight is this CLI's parent.
+            pub.begin(args.step, sha=args.sha or "", body=body, sender_pid=os.getppid(), branch=args.branch or "")
+        except pub_mod.StepRefused as e:
+            print(e.message() + (f" — {e.detail}" if e.detail else ""), file=sys.stderr)
+            return DUPLICATE_RC if e.reason == pub_mod.R_DUPLICATE else gate_mod.REFUSED_RC
+        return 0
+    if args.action == "end":
+        text = args.detail or ""
+        if args.detail_file:
+            try:
+                text = (text + "\n" + Path(args.detail_file).read_text(errors="replace")).strip()
+            except OSError:
+                pass
+        try:
+            state = pub.end(args.step, args.status == "ok", remote_id=args.remote_id or "", detail=text)
+        except pub_mod.StepRefused as e:
+            print(e.message(), file=sys.stderr)
+            return gate_mod.REFUSED_RC
+        print(state)
+        return 0
+    raise Die(f"publication: unknown action {args.action}")
+
+
+def dataclasses_asdict(pub) -> dict:
+    import dataclasses
+
+    return dataclasses.asdict(pub)
+
+
+def cmd_reconcile(args) -> int:
+    g = _gate()
+    if not g.enabled:
+        print("gate: disabled — no publication ledger", file=sys.stderr)
+        return 0
+    if args.id and args.id != "--all":
+        pub = pub_mod.Publication.load(args.id)
+        with g.locked():
+            if pub.mark_stale_sent():
+                pub.save()
+        verdicts = pub.reconcile() if pub.has_uncertain else {}
+        pub = pub_mod.Publication.load(args.id)
+        print(pub.summary() + ("  " + " ".join(f"{k}={v}" for k, v in verdicts.items()) if verdicts else ""))
+        return 0 if not pub.has_uncertain else 1
+    everything = args.all or args.id == "--all"
+    results = pub_mod.reconcile_stale(
+        None if everything else os.environ.get("TAUCETI_WORKER_ID"), everything=everything
+    )
+    if not results:
+        print("nothing to reconcile")
+        return 0
+    rc = 0
+    for pub_id, verdicts in results:
+        pub = pub_mod.Publication.load(pub_id)
+        print(pub.summary() + "  " + " ".join(f"{k}={v}" for k, v in verdicts.items()))
+        rc = rc or (1 if pub.has_uncertain else 0)
+    return rc
+
+
 def _token_in_flight(g: Gate, token: str) -> bool:
     if not token:
         return False
@@ -442,7 +560,40 @@ def build_parser(prog: str = "tauceti-gate") -> argparse.ArgumentParser:
     c = sub.add_parser("credential")
     c.add_argument("action", choices=["get", "store", "erase"])
     c.set_defaults(fn=cmd_credential)
+    pb = sub.add_parser("publication", help="the publication ledger (design §6)")
+    pb.add_argument("action", choices=["create", "begin", "end", "show", "list"])
+    pb.add_argument("id", nargs="?", default=None)
+    pb.add_argument("step", nargs="?", default=None)
+    pb.add_argument("status", nargs="?", default=None, choices=[None, "ok", "fail"])
+    pb.add_argument("--kind", choices=pub_mod.KINDS, default=None)
+    pb.add_argument("--branch", default=None)
+    pb.add_argument("--head-sha", default=None)
+    pb.add_argument("--pr", type=int, default=None)
+    pb.add_argument("--repo", default=None)
+    pb.add_argument("--remote", default=None)
+    pb.add_argument("--sha", default=None)
+    pb.add_argument("--body-file", default=None)
+    pb.add_argument("--remote-id", default=None)
+    pb.add_argument("--detail", default="")
+    pb.add_argument("--detail-file", default=None)
+    pb.set_defaults(fn=cmd_publication_checked)
+    rc = sub.add_parser("reconcile", help="resolve uncertain publication steps with one read each")
+    rc.add_argument("id", nargs="?", default=None)
+    rc.add_argument("--all", action="store_true")
+    rc.set_defaults(fn=cmd_reconcile)
     return p
+
+
+def cmd_publication_checked(args) -> int:
+    # An author publication may be created with no branch and no head yet: the agent names the branch
+    # and git-safe-push records it (`begin --branch`); the pushed tip is the push step's `sha`.
+    need = {"create": ("kind",), "begin": ("id", "step"), "end": ("id", "step", "status"), "show": ("id",)}
+    for field in need.get(args.action, ()):
+        if getattr(args, field) in (None, ""):
+            raise Die(f"publication {args.action}: {field.replace('_', '-')} is required")
+    if args.action == "create" and args.kind != pub_mod.KIND_AUTHOR and not (args.branch and args.head_sha and args.pr):
+        raise Die(f"publication create --kind {args.kind}: --branch, --head-sha and --pr are required")
+    return cmd_publication(args)
 
 
 def main(argv: list[str] | None = None, prog: str = "tauceti-gate") -> int:

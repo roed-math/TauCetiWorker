@@ -73,12 +73,52 @@ if [[ "$sub" != api ]]; then
         prev="$a"
     done
 fi
-gate_admit "$kind" "$op" "$target" || exit 75
-OUT=$(mktemp)
+# The reply is the round's publication `comment` step (docs/gate.md, design §6): the publication's
+# hidden marker is appended to the body so a lost response can be reconciled by it; a reply whose
+# digest was already posted on this head is skipped (nothing sent, exit 0); a step already sent, a
+# moved PR head or a publication that needs reconciliation is refused (exit 75) and nothing is sent.
+BODY_FILE=""
+if [[ "${allowed_write:-}" == reply ]] && pub_enabled; then
+    PUB_MARKER="<!--tauceti-publication:v1 {\"id\":\"$TAUCETI_PUBLICATION_ID\"}-->"
+    args=(); prev=""; body=""; found=0
+    for a in "$@"; do
+        case "$prev" in
+            -f|-F|--field|--raw-field)
+                case "$a" in
+                    body=*) body="${a#body=}"; a="body=$body"$'\n\n'"$PUB_MARKER"; found=1;;
+                esac;;
+        esac
+        args+=("$a"); prev="$a"
+    done
+    [[ "$found" == 1 ]] || refuse "gh api POST …/replies without a -f body=… field"
+    set -- "${args[@]}"
+    BODY_FILE=$(mktemp); printf '%s' "$body" > "$BODY_FILE"
+fi
+gate_admit "$kind" "$op" "$target" || { rm -f "$BODY_FILE"; exit 75; }
+if [[ -n "$BODY_FILE" ]]; then
+    pub_begin comment --body-file "$BODY_FILE"; prc=$?
+    if [[ "$prc" -eq 3 ]]; then
+        gate_record fail
+        echo "gh shim: this reply is already posted on this head (same content) — not posting it again" >&2
+        rm -f "$BODY_FILE"; exit 0
+    elif [[ "$prc" -ne 0 ]]; then
+        gate_record fail
+        echo "gh shim: the publication ledger refused this reply — nothing was posted" >&2
+        rm -f "$BODY_FILE"; exit 75
+    fi
+fi
+OUT=$(mktemp); STDOUT=$(mktemp)
 gate_spawn "$REAL_GH" "$@"
-"$REAL_GH" "$@" 2> >(tee "$OUT" >&2)
-rc=$?
+"$REAL_GH" "$@" 2> >(tee "$OUT" >&2) | tee "$STDOUT"
+rc=${PIPESTATUS[0]}
 wait
 if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
-rm -f "$OUT"
+if [[ -n "$BODY_FILE" ]]; then
+    CID=$(grep -oE '"id"[[:space:]]*:[[:space:]]*[0-9]+' "$STDOUT" | head -1 | grep -oE '[0-9]+$' || true)
+    if [[ "$rc" -eq 0 && -n "$CID" ]]; then pub_end comment ok --remote-id "$CID" --detail-file "$OUT"
+    elif [[ "$rc" -eq 0 ]]; then pub_end comment ok --detail-file "$OUT"
+    else pub_end comment fail --detail-file "$OUT"; fi
+    rm -f "$BODY_FILE"
+fi
+rm -f "$OUT" "$STDOUT"
 exit "$rc"

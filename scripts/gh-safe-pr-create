@@ -13,7 +13,12 @@
 #   TAUCETI_GATE_DIR / TAUCETI_GATE_REQUIRED   the fleet GitHub gate (docs/gate.md): the create is admitted
 #                              as one api_mutation (op pr_create) against --repo before gh runs
 #   TAUCETI_REAL_GH            the gh to run (the agent's PATH leads with a shim of it)
-# All `gh pr create` flags pass through unchanged.
+#   TAUCETI_PUBLICATION_ID     the round's publication (docs/gate.md, design §6): the create is its
+#                              `pr_create` step. The publication's hidden marker is appended to the body
+#                              (so a lost response can be reconciled by it), the step is marked sent before
+#                              gh runs and done with the PR number after; a step already sent/uncertain/done
+#                              is refused (exit 75) and NOTHING is created.
+# All `gh pr create` flags pass through unchanged (the body file is rewritten to carry the marker).
 set -uo pipefail
 # shellcheck source=gate-lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-lib.sh"
@@ -69,14 +74,47 @@ for a in "$@"; do
     case "$a" in --repo=*) TARGET="${a#--repo=}";; esac
     prev="$a"
 done
+# 3b) The publication ledger: embed the publication's marker in the body so the PR can be found by it
+#     if the response is lost, then mark the `pr_create` step sent. A refused step creates nothing.
+if pub_enabled; then
+    PUB_MARKER="<!--tauceti-publication:v1 {\"id\":\"$TAUCETI_PUBLICATION_ID\"}-->"
+    args=(); prev=""; injected=0
+    for a in "$@"; do
+        case "$prev" in
+            --body|-b) a="$a"$'\n\n'"$PUB_MARKER"; injected=1;;
+            --body-file|-F)
+                if [[ -f "$a" ]] && ! grep -qF "$PUB_MARKER" "$a"; then printf '\n\n%s\n' "$PUB_MARKER" >> "$a"; fi
+                injected=1;;
+        esac
+        args+=("$a"); prev="$a"
+    done
+    [[ "$injected" == 1 ]] || args+=(--body "$PUB_MARKER")
+    set -- "${args[@]}"
+fi
 gate_admit api_mutation pr_create "$TARGET" || die "the fleet gate refused this PR creation — nothing was created"
+if ! pub_begin pr_create; then
+    gate_record fail
+    echo "gh-safe-pr-create: the publication ledger refused this PR creation — nothing was created" >&2
+    exit 75
+fi
 
 echo "gh-safe-pr-create: gh pr create $*" >&2
-OUT=$(mktemp)
+OUT=$(mktemp); STDOUT=$(mktemp)
 gate_spawn "$REAL_GH" pr create "$@"
-"$REAL_GH" pr create "$@" 2> >(tee "$OUT" >&2)
-rc=$?
+"$REAL_GH" pr create "$@" 2> >(tee "$OUT" >&2) | tee "$STDOUT"
+rc=${PIPESTATUS[0]}
 wait
 if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
-rm -f "$OUT"
+# `done` only when the response named the PR: a success whose number cannot be parsed is `uncertain`,
+# for `tauceti-gate reconcile` to find by the marker (never re-created here).
+PRNUM=$(grep -oE '/pull/[0-9]+' "$STDOUT" | head -1 | grep -oE '[0-9]+' || true)
+if [[ "$rc" -eq 0 && -n "$PRNUM" ]]; then
+    pub_end pr_create ok --remote-id "$PRNUM" --detail-file "$OUT"
+    pub_end marker_check ok --remote-id "$PRNUM" --detail "verified locally before the create"
+elif [[ "$rc" -eq 0 ]]; then
+    pub_end pr_create ok --detail-file "$OUT"
+else
+    pub_end pr_create fail --detail-file "$OUT"
+fi
+rm -f "$OUT" "$STDOUT"
 exit "$rc"
