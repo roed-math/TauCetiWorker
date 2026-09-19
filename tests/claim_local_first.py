@@ -2,8 +2,8 @@
 """Claims are taken local-first: the host-local lock decides same-host contention before any GitHub
 call, and the agent's own re-claim of a key the round holds is answered by claim.sh without git.
 
-Drives Claims.begin_target_work / begin_branch_work with a stubbed claim.sh (recording every call) and
-a real local lock in a scratch directory:
+Drives Claims.begin_target_work / begin_branch_work / begin_global_work with a stubbed claim.sh
+(recording every call) and a real local lock in a scratch directory:
   - a sibling on this host holds the key -> rc 1 / False, and claim.sh is never run
   - the key is locally free -> exactly one `acquire`
   - rc 0 exports TAUCETI_CLAIM_KEY and TAUCETI_CLAIM_HELD; rc 2 keeps the local lock and exports
@@ -170,6 +170,78 @@ check(
     "branch release -> one GitHub release, local lock freed",
     ST["calls"][-1] == ("release-run", ["release", "branch/7"]) and locally_free("branch/7"),
 )
+
+# ---- 5b. the global flavour (the `progress` key): same layers, no push-arbiter env --------------------
+for var in ("TAUCETI_PUSH_REF", "TAUCETI_PUSH_EXPECT", "TAUCETI_PUSH_REMOTE"):
+    os.environ.pop(var, None)  # section 5's branch claim set these; release() leaves them (by design)
+sibling = lc.LocalLease.acquire("progress", "worker-B")
+claims = reset([])
+check("global held by a sibling -> rc 1", claims.begin_global_work("progress") == 1)
+check("global held by a sibling -> claim.sh never run", ST["calls"] == [])
+check("global held by a sibling -> nothing exported", "TAUCETI_CLAIM_HELD" not in os.environ)
+sibling.release()
+claims = reset([0])
+check("global free + rc 0 -> rc 0", claims.begin_global_work("progress") == 0)
+check("global -> one acquire", ST["calls"] == [(("acquire", "progress", str(tc.CLAIM_TTL_S)), "alice/tauceti-claims")])
+check("global -> heartbeat started", ST["heartbeat"] == [("progress", "alice/tauceti-claims")])
+check("global -> HELD + KEY", os.environ.get("TAUCETI_CLAIM_HELD") == "progress" == os.environ.get("TAUCETI_CLAIM_KEY"))
+check("global -> no push-arbiter env", "TAUCETI_PUSH_REF" not in os.environ and "TAUCETI_PUSH_REMOTE" not in os.environ)
+check("global -> a sibling is now refused locally", not locally_free("progress"))
+release(claims)
+check(
+    "global release -> GitHub lease released, local lock freed",
+    ST["calls"][-1] == ("release-run", ["release", "progress"]) and locally_free("progress"),
+)
+claims = reset([2])
+check(
+    "global free + rc 2 -> rc 2, local lock kept, HELD exported",
+    claims.begin_global_work("progress") == 2
+    and not locally_free("progress")
+    and os.environ.get("TAUCETI_CLAIM_HELD") == "progress",
+)
+release(claims)
+check(
+    "global rc 2 release -> no GitHub release (nothing was registered), lock freed",
+    not any(c[0] == "release-run" for c in ST["calls"]) and locally_free("progress"),
+)
+
+# ---- 5c. do_progress goes through Claims: a sibling's local lock means no claim.sh, no report ---------
+from tauceti_worker import work_units as wu  # noqa: E402
+
+sibling = lc.LocalLease.acquire("progress", "worker-B")
+claims = reset([])
+ran_inner = []
+saved_inner, saved_log = wu._do_progress_inner, wu.log
+wu._do_progress_inner = lambda w, opts: ran_inner.append(1) or 0
+wu.log = lambda msg: ST["log"].append(msg)
+try:
+    verdict = wu.do_progress(types.SimpleNamespace(claims=claims), None, None, None, False)
+finally:
+    wu._do_progress_inner, wu.log = saved_inner, saved_log
+check("do_progress with a sibling's lock -> None (skipped)", verdict is None)
+check("do_progress with a sibling's lock -> claim.sh never run", ST["calls"] == [])
+check("do_progress with a sibling's lock -> the report is not written", ran_inner == [])
+check(
+    "do_progress with a sibling's lock -> says so",
+    any("another worker holds the progress claim" in m for m in ST["log"]),
+)
+sibling.release()
+# ...and when it is ours, the report runs and the claim is given back afterwards.
+claims = reset([0])
+wu._do_progress_inner = lambda w, opts: ran_inner.append(1) or 0
+real_run = subprocess.run
+subprocess.run = lambda *a, **k: ST["calls"].append(("release-run", a[0][1:])) or types.SimpleNamespace(returncode=0)
+try:
+    verdict = wu.do_progress(types.SimpleNamespace(claims=claims), None, None, None, False)
+finally:
+    wu._do_progress_inner = saved_inner
+    subprocess.run = real_run
+check("do_progress when free -> the report runs, rc 0", verdict == 0 and ran_inner == [1])
+check(
+    "do_progress when free -> one acquire then one release",
+    [c[0] if c[0] == "release-run" else c[0][0] for c in ST["calls"]] == ["acquire", "release-run"],
+)
+check("do_progress when free -> local lock freed afterwards", locally_free("progress"))
 
 # ---- 6. claim.sh: the held key short-circuits before any git; other keys and renew still reach git --
 bindir = TMP / "bin"

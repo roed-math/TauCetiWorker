@@ -51,7 +51,6 @@ from .config import (
 from .constants import (
     AGENT_NAMES,
     AUTO_STAGES,
-    CLAIM_TTL_S,
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
     MAX_INFRA_REFUNDS,
@@ -71,7 +70,7 @@ from .constants import (
 )
 from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
 from .intentions import administrative_hold_avoid_list, claimed_avoid_list
-from .paths import CLAIM_SH, HERE
+from .paths import HERE
 from .quota import Quota, _unavail_reason, mirror_creds
 from .review_diagnostics import (
     clear_review_failure,
@@ -1166,33 +1165,24 @@ def do_progress(w, sv, c, opts, bubble) -> int | None:
     two markdown files in one directory.
     """
     # ONE global claim, not one per area: the decision itself (which roadmap is busiest) is global, so
-    # two workers must not be choosing at the same moment. `claim.sh` takes arbitrary keys, so this uses
-    # a bare `progress` key rather than Claims.begin_branch_work, which is branch-shaped and also sets
-    # push-arbiter env this kind has no use for.
+    # two workers must not be choosing at the same moment. It goes through Claims like every other
+    # claim — the host-local lock first (a sibling on this host costs no network call), then the GitHub
+    # lease with its heartbeat, released on the round's cleanup — on the bare `progress` key rather
+    # than a branch-shaped one, which would also set push-arbiter env this kind has no use for.
     #
     # This is [COOP] dedup only, and deliberately so: the guarantees that actually hold are GitHub-side
     # — `plan` refuses an area with an open progress PR, and the branch name is a pure function of the
     # window so `apply` reconciles with whatever already exists. The claim just stops two workers paying
-    # a model for the same report in the same minute, so a claim error proceeds rather than aborting.
-    claim_env = {**os.environ, "CLAIM_REPO": claims_repo()}
-    rc_claim = subprocess.run(
-        [CLAIM_SH, "acquire", "progress", str(CLAIM_TTL_S)], capture_output=True, env=claim_env
-    ).returncode
+    # a model for the same report in the same minute, so a claim error (rc 2, logged by Claims with the
+    # CLAIM_REPO hint) proceeds rather than aborting.
+    rc_claim = w.claims.begin_global_work("progress")
     if rc_claim == 1:
         log("progress: another worker holds the progress claim — skipping (COOP dedup)")
         return None
-    claimed = rc_claim == 0
-    if not claimed:
-        log(
-            f"progress: claim acquire errored (rc={rc_claim}) against {claim_env['CLAIM_REPO']} — proceeding "
-            f"unclaimed. If this repeats, this account cannot push there; set CLAIM_REPO=<a repo your whole "
-            f"fleet can push to> to pick the namespace yourself."
-        )
     try:
         return _do_progress_inner(w, opts)
     finally:
-        if claimed:
-            subprocess.run([CLAIM_SH, "release", "progress"], capture_output=True, env=claim_env)
+        w.claims.release()
 
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")

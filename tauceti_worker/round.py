@@ -179,7 +179,8 @@ def run_claim_sh(args: list[str], claim_repo: str) -> int:
 
 class Claims:
     """[COOP] branch claims + the [HARD] push-arbiter env. Mutating tasks take a branch/<pr> claim and
-    heartbeat it (dedup only; git-safe-push's branch CAS is the real guarantee). The heartbeat is a
+    heartbeat it (dedup only; git-safe-push's branch CAS is the real guarantee); roadmap rounds take an
+    author/<area>/<slug> claim and progress rounds the bare `progress` key, through the same layers. The heartbeat is a
     detached child that dies with the parent via an inherited pipe (EOF when the parent goes, even on
     SIGKILL), never runs the round's cleanup, and never holds the round.lock fd (pass_fds keeps only
     the pipe; the lock fd is non-inheritable + closed by close_fds).
@@ -278,15 +279,27 @@ class Claims:
         TAUCETI_CLAIM_HELD on both 0 and 2, since the worker chose the target either way.
 
         A key a sibling worker on this host already holds is reported as 1 without any network call."""
-        key = f"author/{area}/{slug}"
-        if not self._take_local(key, f"target {area}/{slug}"):
+        return self._begin(f"author/{area}/{slug}", f"target {area}/{slug}")
+
+    def begin_global_work(self, key: str) -> int:
+        """Take a claim on a bare key that is not a branch or a target — `progress`, whose decision
+        (which roadmap is busiest) is global, so two workers must not be choosing at the same moment.
+        Same two layers and the same verdicts as begin_target_work: 0 = ours (local lock, GitHub lease,
+        heartbeat, released on cleanup, TAUCETI_CLAIM_HELD exported), 1 = held elsewhere (a sibling on
+        this host costs no network call), 2 = could not be registered (local lock kept, proceed
+        unclaimed). It sets none of the push-arbiter env: there is no branch for git-safe-push to
+        arbitrate."""
+        return self._begin(key, key)
+
+    def _begin(self, key: str, what: str) -> int:
+        if not self._take_local(key, what):
             return 1
         claim_repo = claims_repo()
         rc = run_claim_sh(["acquire", key, str(CLAIM_TTL_S)], claim_repo)
         if rc == 1:
             self._drop_local()
             return 1
-        self._keep(key, claim_repo, rc, key)
+        self._keep(key, claim_repo, rc, what)
         return rc
 
     def start_heartbeat(self, key: str, claim_repo: str) -> None:
