@@ -116,11 +116,21 @@ the same PR. They avoid it by taking a lease before they start: a custom git ref
 with an atomic compare-and-swap (see `scripts/claim.sh`). Which repository that
 is decides how far de-duplication reaches, and the worker picks it like this:
 
-1. `$CLAIM_REPO`, verbatim, if you set it.
+1. `$CLAIM_REPO`, verbatim, if you set it — unless it names the canonical
+   `TauCetiProject/TauCeti` (in any spelling: case, a `.git` suffix, a full
+   URL), which is logged once and ignored as if it were unset. Claims never go
+   to the repository the work is for.
 2. `TauCetiProject/tauceti-claims`, the shared namespace, if your account can
    push there. Then you de-duplicate against every other operator.
 3. Otherwise your own fork, which you can always push to. Then you de-duplicate
    across your own workers, and only those.
+
+Whatever the answer, the worker exports it as `CLAIM_REPO` to every
+`scripts/claim.sh` it runs and to the agent's environment. `claim.sh` itself has
+no default: run with `CLAIM_REPO` unset or empty, or naming canonical, every
+subcommand that would touch the network exits 2 with a one-line message before
+any `git` runs. (It used to default to canonical, so a stray `claim.sh acquire`
+from a shell without the export pushed lease refs at TauCeti.)
 
 Push access to the shared namespace is granted automatically once you have had a
 pull request merged into TauCeti, and the worker accepts the invitation itself
@@ -301,7 +311,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
 | `TAUCETI_LOCAL_CLAIMS_DIR` | `~/.cache/tauceti-claims/local` | Where the host-local claim locks live (login home, shared by every worker on the host). |
-| `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
+| `CLAIM_REPO` | automatic (worker); required (`claim.sh`) | The repository holding this worker's cooperative claim leases. Without an override the worker picks the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then, and exports the answer to every `claim.sh` it runs. A value naming canonical `TauCetiProject/TauCeti` is ignored by the worker and refused (exit 2, no network) by `claim.sh`, which also refuses to run with it unset. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `3600` / `1200` | Claim lease TTL and heartbeat interval (seconds); each renewal is a push. Keep the TTL above twice the heartbeat. |
 
 Worker configuration paths (`TAUCETI_WORKERS_CONFIG`, `TAUCETI_CONFIG_HOME`,

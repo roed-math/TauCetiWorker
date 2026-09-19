@@ -23,7 +23,11 @@
 #   claim.sh list    [--full]              # list live claim refs (--full fetches each lease)
 #   claim.sh gc                            # CAS-delete expired claims
 #
-# Env: CLAIM_REPO (default TauCetiProject/TauCeti), TAUCETI_WORKER_ID (default host-pid),
+# Env: CLAIM_REPO (REQUIRED: the <owner>/<repo> holding the leases; the worker exports it. There is
+#      no default, and the canonical TauCetiProject/TauCeti is refused outright — every subcommand
+#      that would touch the network exits 2 before any git runs when it is unset or names canonical.
+#      Claims are cooperative leases, never a write to the repository the work is for),
+#      TAUCETI_WORKER_ID (default host-pid),
 #      CLAIM_TTL (default 3600), CLAIM_GITDIR_BASE (per-repo scratch parent),
 #      CLAIM_GITDIR (explicit scratch object store override),
 #      TAUCETI_CLAIM_HELD (a key the worker's round already holds and heartbeats: `acquire` of that
@@ -31,7 +35,7 @@
 #      worker chose for it is otherwise a second push of a lease that is already ours).
 set -uo pipefail
 
-REPO="${CLAIM_REPO:-TauCetiProject/TauCeti}"
+REPO="${CLAIM_REPO:-}"
 URL="https://github.com/$REPO"
 WID="${TAUCETI_WORKER_ID:-$(hostname)-$$}"
 DEFAULT_TTL="${CLAIM_TTL:-3600}"
@@ -42,6 +46,25 @@ export GIT_COMMITTER_NAME="tauceti-claim" GIT_COMMITTER_EMAIL="claim@tauceti.inv
 
 now() { date +%s; }
 ref_of() { printf '%s/%s' "$NS" "$1"; }
+
+# require_repo — the one gate every network-touching subcommand passes BEFORE ensure_repo. An unset
+# CLAIM_REPO used to default to canonical, so a claim.sh run from any shell without the worker's
+# export pushed lease refs at the repository the work is for. Now there is no default, and canonical
+# is refused however it is spelled (case, a `.git` suffix, a full https://github.com/ URL).
+require_repo() {
+    local r
+    if [[ -z "$REPO" ]]; then
+        echo "claim: CLAIM_REPO is not set — refusing (export CLAIM_REPO=<owner>/<repo>, a claim namespace this account can push to)" >&2
+        exit 2
+    fi
+    r=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+    r="${r#https://github.com/}"; r="${r#http://github.com/}"; r="${r#git@github.com:}"
+    r="${r%/}"; r="${r%.git}"; r="${r%/}"
+    if [[ "$r" == "taucetiproject/tauceti" ]]; then
+        echo "claim: CLAIM_REPO=$REPO names the canonical repository — refusing (claims never go there; set CLAIM_REPO=<owner>/<repo> to a namespace this account can push to)" >&2
+        exit 2
+    fi
+}
 
 # A private scratch repo just for building + pushing claim objects (no work-repo checkout needed).
 ensure_repo() {
@@ -96,6 +119,7 @@ cmd_acquire() {
         echo "claim: $key is already held by this worker's round (its heartbeat renews it) — nothing to push" >&2
         return 0
     fi
+    require_repo
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref")
     if [[ -n "$cur" ]]; then
@@ -114,6 +138,7 @@ cmd_acquire() {
 
 cmd_renew() {
     local key="$1" ttl="${2:-$DEFAULT_TTL}" ref cur js owner n
+    require_repo
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 1
     js=$(lease_json "$cur" "$ref"); owner=$(jq -r '.owner // ""' <<<"$js" 2>/dev/null)
@@ -124,6 +149,7 @@ cmd_renew() {
 
 cmd_release() {
     local key="$1" ref cur js owner
+    require_repo
     ref=$(ref_of "$key"); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 0
     js=$(lease_json "$cur" "$ref"); owner=$(jq -r '.owner // ""' <<<"$js" 2>/dev/null)
@@ -133,6 +159,7 @@ cmd_release() {
 
 cmd_holds() {
     local key="$1" ref cur js owner exp n
+    require_repo
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 1
     js=$(lease_json "$cur" "$ref"); owner=$(jq -r '.owner // ""' <<<"$js" 2>/dev/null)
@@ -141,13 +168,13 @@ cmd_holds() {
 }
 
 cmd_read() {
-    local ref cur; ref=$(ref_of "$1"); ensure_repo
+    local ref cur; require_repo; ref=$(ref_of "$1"); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 0
     lease_json "$cur" "$ref"
 }
 
 cmd_list() {
-    ensure_repo
+    require_repo; ensure_repo
     g ls-remote origin "$NS/*" 2>/dev/null | while read -r oid ref; do
         local key="${ref#"$NS"/}"
         if [[ "${1:-}" == "--full" ]]; then
@@ -159,7 +186,7 @@ cmd_list() {
 }
 
 cmd_gc() {
-    local n; n=$(now); ensure_repo
+    local n; require_repo; n=$(now); ensure_repo
     g ls-remote origin "$NS/*" 2>/dev/null | while read -r oid ref; do
         local js exp; js=$(lease_json "$oid" "$ref"); exp=$(jq -r '.expires_at // 0' <<<"$js" 2>/dev/null)
         if [[ "$exp" =~ ^[0-9]+$ && "$exp" -le "$n" ]]; then

@@ -11,7 +11,9 @@ a real local lock in a scratch directory:
   - release gives the local lock back
 Then the shell side: with TAUCETI_CLAIM_HELD=<key>, `claim.sh acquire <key>` exits 0 without running
 git at all (a fake `git` first on PATH exits 99 and leaves a marker), while any other key, and `renew`
-of the held key, still reach git.
+of the held key, still reach git. And the namespace gate: with CLAIM_REPO unset, or naming canonical
+in any spelling, every network subcommand exits 2 before git runs; a held key still short-circuits to
+0 ahead of that gate; any other repository proceeds to git.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -203,6 +205,53 @@ check("claim.sh renew <held key> -> unchanged, reaches git", ran_git and rc != 0
 env.pop("TAUCETI_CLAIM_HELD")
 rc, ran_git, _ = run("acquire", "author/Alpha/x")
 check("claim.sh acquire without TAUCETI_CLAIM_HELD -> reaches git", ran_git and rc != 0)
+
+# ---- 7. claim.sh: no default namespace, and canonical is refused before any git runs ----------------
+env.pop("CLAIM_REPO")
+for sub in ("acquire", "renew", "release", "holds", "read", "list", "gc"):
+    rc, ran_git, err = run(sub, "author/Alpha/x")
+    check(f"claim.sh {sub} with CLAIM_REPO unset -> exit 2", rc == 2)
+    check(f"claim.sh {sub} with CLAIM_REPO unset -> git never ran", not ran_git)
+    check(f"claim.sh {sub} with CLAIM_REPO unset -> names the variable", "CLAIM_REPO" in err)
+env["CLAIM_REPO"] = ""
+rc, ran_git, err = run("acquire", "author/Alpha/x")
+check("claim.sh acquire with CLAIM_REPO empty -> exit 2, no git", rc == 2 and not ran_git and "CLAIM_REPO" in err)
+for spelling in (
+    "TauCetiProject/TauCeti",
+    "taucetiproject/tauceti",
+    "TAUCETIPROJECT/TAUCETI.git",
+    "https://github.com/TauCetiProject/TauCeti",
+    "https://github.com/TauCetiProject/TauCeti.git",
+    "https://github.com/tauCetiProject/TauCeti/",
+    "git@github.com:TauCetiProject/TauCeti.git",
+):
+    env["CLAIM_REPO"] = spelling
+    rc, ran_git, err = run("acquire", "author/Alpha/x")
+    check(f"claim.sh acquire with CLAIM_REPO={spelling} -> exit 2", rc == 2)
+    check(f"claim.sh acquire with CLAIM_REPO={spelling} -> git never ran", not ran_git)
+    check(
+        f"claim.sh acquire with CLAIM_REPO={spelling} -> says canonical, names the variable",
+        "canonical" in err and "CLAIM_REPO" in err,
+    )
+env["CLAIM_REPO"] = "TauCetiProject/TauCeti"
+rc, ran_git, _ = run("release", "author/Alpha/x")
+check("claim.sh release against canonical -> exit 2, no git", rc == 2 and not ran_git)
+# The held-key short-circuit stays AHEAD of the gate: the round already holds it, so no verdict on
+# the namespace is needed to answer the agent.
+env["TAUCETI_CLAIM_HELD"] = "author/Alpha/x"
+rc, ran_git, _ = run("acquire", "author/Alpha/x")
+check("claim.sh acquire <held key> against canonical -> still exit 0, no git", rc == 0 and not ran_git)
+env.pop("TAUCETI_CLAIM_HELD")
+# Any other repository — the fork, the shared namespace, a full URL of either — goes on to git. (The
+# fake git fails every push, so the verdict is claim.sh's own 2 for an unexpected push error; the
+# marker, and the absence of the gate's message, are what show the gate let it through.)
+for ok_repo in ("x/y", "TauCetiProject/tauceti-claims", "https://github.com/x/TauCeti.git"):
+    env["CLAIM_REPO"] = ok_repo
+    rc, ran_git, err = run("acquire", "author/Alpha/x")
+    check(
+        f"claim.sh acquire with CLAIM_REPO={ok_repo} -> proceeds to git",
+        ran_git and rc != 0 and "CLAIM_REPO" not in err,
+    )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)

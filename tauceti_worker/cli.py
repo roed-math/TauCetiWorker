@@ -65,7 +65,7 @@ from .constants import (
     TAUCETI,
     WORK_TASKS,
 )
-from .github import GitHub, shared_claims_granted
+from .github import GitHub, is_canonical_repo, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
@@ -1001,7 +1001,9 @@ def cmd_doctor(args) -> int:
     # Deliberately does not resolve the fork, so `doctor` never creates one as a side effect.
     if gh_auth:
         override = os.environ.get("CLAIM_REPO", "").strip()
-        if override:
+        if override and is_canonical_repo(override):
+            note = f"$CLAIM_REPO={override} is canonical and is IGNORED (claims never go there); the ladder decides"
+        elif override:
             note = f"$CLAIM_REPO={override} (operator override; every worker pointed here coordinates)"
         elif shared_claims_granted():
             note = f"{CLAIMS} — shared, so you de-duplicate against every operator"

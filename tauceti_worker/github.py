@@ -51,14 +51,43 @@ def can_push(repo: str) -> bool | None:
     return True if out == "true" else False if out == "false" else None
 
 
+def is_canonical_repo(name: str) -> bool:
+    """Does `name` spell the canonical TauCeti repository? Case-insensitive, and tolerant of the forms
+    a shell or a config file produces: a `.git` suffix, a trailing slash, a full `https://github.com/`
+    or `git@github.com:` URL. Claims must never go there (nobody outside the org can push, and a lease
+    ref on the repository the work is for is a write to it), so both claim.sh's own gate and
+    `claims_repo` refuse anything this matches."""
+    r = name.strip().lower()
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:"):
+        r = r.removeprefix(prefix)
+    r = r.rstrip("/").removesuffix(".git").rstrip("/")
+    return r == TAUCETI.lower()
+
+
+@functools.cache
+def _log_canonical_override_ignored(override: str) -> None:
+    log(
+        f"claims: $CLAIM_REPO={override} names the canonical repository, which never holds claims — "
+        f"ignoring it and choosing the namespace as if it were unset (set CLAIM_REPO=<owner>/<repo> "
+        f"to a repository your whole fleet can push to)"
+    )
+
+
 def claims_repo() -> str:
     """Where this worker publishes its cooperative claim leases (`refs/tauceti-claims/<key>`).
 
-    `$CLAIM_REPO` overrides everything, verbatim: that is how a fleet pins one namespace of its own
+    `$CLAIM_REPO` overrides everything: that is how a fleet pins one namespace of its own
     (`CLAIM_REPO=<you>/TauCeti` in every container) without asking anyone for access. It is read on
-    every call rather than cached, so a worker can be repointed without a restart. Everything else is
-    resolved once per process (two API calls at most) by `_resolve_claims_repo`."""
-    return os.environ.get("CLAIM_REPO", "").strip() or _resolve_claims_repo()
+    every call rather than cached, so a worker can be repointed without a restart. The one value it
+    cannot name is canonical (`is_canonical_repo`): that is logged once and treated as unset, so the
+    ladder below decides instead of a lease landing on the repository the work is for. Everything else
+    is resolved once per process (two API calls at most) by `_resolve_claims_repo`."""
+    override = os.environ.get("CLAIM_REPO", "").strip()
+    if override:
+        if not is_canonical_repo(override):
+            return override
+        _log_canonical_override_ignored(override)
+    return _resolve_claims_repo()
 
 
 @functools.lru_cache(maxsize=1)

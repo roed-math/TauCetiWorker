@@ -3,8 +3,9 @@
 
 The ladder is: `$CLAIM_REPO` verbatim, else the shared namespace once this account can push to it,
 else the contributor's own fork. Canonical is never chosen — nobody outside the org can push there,
-so naming it means every acquire errors and a whole fleet works unclaimed. Everything here stubs
-`gh_run`, so no test touches GitHub.
+so naming it means every acquire errors and a whole fleet works unclaimed — and it is not honoured
+as an override either: a `$CLAIM_REPO` that spells canonical is logged once and the ladder runs as
+if it were unset. Everything here stubs `gh_run`, so no test touches GitHub.
 """
 
 import sys
@@ -95,6 +96,67 @@ def override_wins_without_asking_github():
             os.environ["CLAIM_REPO"] = saved
 
 
+def _with_override(value, body):
+    import os
+
+    saved = os.environ.get("CLAIM_REPO")
+    os.environ["CLAIM_REPO"] = value
+    try:
+        body()
+    finally:
+        if saved is None:
+            os.environ.pop("CLAIM_REPO", None)
+        else:
+            os.environ["CLAIM_REPO"] = saved
+
+
+def canonical_override_is_not_honoured():
+    logged = []
+    saved_log = gh_mod.log
+    gh_mod.log = logged.append
+    gh_mod._log_canonical_override_ignored.cache_clear()
+    try:
+        for spelling in (TAUCETI, TAUCETI.lower(), f"https://github.com/{TAUCETI}.git", f"{TAUCETI.upper()}/"):
+
+            def body(spelling=spelling):
+                with Stub(push="true") as s:
+                    assert gh_mod.claims_repo() == CLAIMS, f"{spelling} must fall through to the ladder"
+                    assert s.calls, "the ladder must actually run (an API call), not return canonical verbatim"
+                    assert not any(c[2] == f"repos/{TAUCETI}" for c in s.calls), "canonical is never probed"
+                    assert (
+                        gh_mod.claims_repo() == CLAIMS
+                    )  # a second call: the ladder is cached, the log is not repeated
+
+            _with_override(spelling, body)
+            assert sum(f"$CLAIM_REPO={spelling} names the canonical repository" in m for m in logged) == 1, logged
+        # ...and the fork branch of the ladder is reachable the same way.
+        _with_override(TAUCETI, lambda: _assert_fork())
+    finally:
+        gh_mod.log = saved_log
+        gh_mod._log_canonical_override_ignored.cache_clear()
+
+
+def _assert_fork():
+    with Stub(push="false"):
+        assert gh_mod.claims_repo() == "alice/TauCeti"
+
+
+def is_canonical_repo_spellings():
+    yes = (
+        TAUCETI,
+        "taucetiproject/tauceti",
+        f"{TAUCETI}.git",
+        f"https://github.com/{TAUCETI}",
+        f"git@github.com:{TAUCETI}.git",
+        f" {TAUCETI}/ ",
+    )
+    no = (CLAIMS, "alice/TauCeti", f"{TAUCETI}Roadmap", "TauCetiProject/TauCeti2", "", "https://github.com/x/TauCeti")
+    for v in yes:
+        assert gh_mod.is_canonical_repo(v), v
+    for v in no:
+        assert not gh_mod.is_canonical_repo(v), v
+
+
 def shared_when_granted():
     with Stub(push="true"):
         assert gh_mod.claims_repo() == CLAIMS
@@ -158,6 +220,8 @@ fails = sum(
     check(name, case)
     for name, case in (
         ("$CLAIM_REPO wins verbatim, with no API call", override_wins_without_asking_github),
+        ("a canonical $CLAIM_REPO is ignored and the ladder decides", canonical_override_is_not_honoured),
+        ("is_canonical_repo recognises every spelling of canonical and nothing else", is_canonical_repo_spellings),
         ("the shared namespace is used once push access is granted", shared_when_granted),
         ("an ungranted account falls back to its own fork", fork_when_not_granted),
         ("an unknown access answer falls back to the fork", fork_when_access_is_unknown),
