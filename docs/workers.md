@@ -58,6 +58,9 @@ enabled = true
 agent = "codex"
 only = ["rebase", "review"]
 ignore_quota = true
+
+[workers.env]
+TAUCETI_EXPECT_LOGIN = "your-github-login"
 ```
 
 You can edit `workers.toml` while the manager is running. It reloads the file
@@ -127,6 +130,15 @@ difference has no flag: an A/B of a build setting, for instance. It is part of
 the fingerprint, so editing it restarts that worker and leaves the others alone,
 and both `workers status` and the dashboard name the variables it sets, so the
 odd worker out is visible rather than mysterious.
+
+One variable is recommended for every unattended worker rather than the odd one
+out: `TAUCETI_EXPECT_LOGIN`, the GitHub login the worker must act as. The
+worker checks it against `gh api user` before each loop and each round and halts
+(exit 77, `state/<id>/halt.json`, which the manager's `on-failure`/`always`
+restart will not get past until you run `tauceti work --worker-id <id>
+--clear-halt`) if the token in front of `gh` belongs to anyone else. Without
+it the worker still stops on a rejected or suspended credential, but acts as
+whichever account it finds. See [the identity gate](reference.md#the-identity-gate).
 
 Put no secrets in it. The values are stored in plain `workers.toml`, and the
 whole worker definition is handed to its runner on a command line, where any

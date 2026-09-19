@@ -135,6 +135,7 @@ ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min h
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
+EX_HALTED = 77  # sysexits EX_NOPERM: the identity gate halted the worker (halt.json written; no retry, no back-off)
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 

@@ -59,6 +59,7 @@ from .constants import (
     AGENTS,
     ALLOWED_TASKS,
     CLAIMS,
+    EX_HALTED,
     EX_NOPROGRESS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -66,6 +67,8 @@ from .constants import (
     WORK_TASKS,
 )
 from .github import GitHub, is_canonical_repo, shared_claims_granted
+from .identity import Halted, clear_halt, halt_path, refuse_if_halted
+from .identity import gate as identity_gate
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
@@ -373,6 +376,15 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--dry-run", dest="dry_run", action="store_true", help="survey + print the picker's decision; act on nothing"
+    )
+    p.add_argument(
+        "--clear-halt",
+        dest="clear_halt",
+        action="store_true",
+        help="print and delete this worker's identity halt file (state/<id>/halt.json), then exit. A loop "
+        "refuses to start while the file exists: the last one stopped on a rejected credential, a "
+        "suspended account, or a login other than $TAUCETI_EXPECT_LOGIN, and nothing in the worker "
+        "retries that",
     )
 
 
@@ -887,11 +899,19 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # still leaves an on-disk record to monitor. The loop driver picks one session file and exports its
     # path; the _round children it spawns inherit TAUCETI_LOG_FILE and append to the SAME file.
     set_log_file(cfg.logdir)
+    if getattr(args, "clear_halt", False):
+        clear_halt(halt_path(cfg.state))
+        return 0
     if getattr(args, "loop", False) and not one_round:
         # The loop driver never builds a RoundOpts, so the round-level check below is not on this path;
         # its children get theirs. Check here too, so a wrong --account costs one command rather than a
         # full survey, and so the operator sees the message before the loop's own output buries it.
         raise_on_account_mismatch(cfg, getattr(args, "account", None), agent, "account")
+        # The identity gate, once, before the first round: a halt file from the last loop refuses the
+        # start outright, and a rejected credential or the wrong login writes one and exits EX_HALTED
+        # rather than letting the loop pace, survey, and back off on an account it must not act as.
+        refuse_if_halted(cfg.state, cfg.wid)
+        identity_gate(cfg.state, cfg.wid, where="loop start")
         return cmd_loop(args, cfg, only=only, agent=agent, prs=prs)
     dry = getattr(args, "dry_run", False)
     ignore_quota = getattr(args, "ignore_quota", False)
@@ -915,6 +935,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             log(f"[test] holding the lock and sleeping {slp}s")
             time.sleep(int(slp))
             return 0
+
+        # The identity gate, once per round, before anything reads or writes GitHub: one `gh api user`,
+        # cached in TAUCETI_IDENTITY_OK for me() and every write after it. A halt here exits EX_HALTED,
+        # which the loop parent stops on.
+        identity_gate(cfg.state, cfg.wid, where="round start")
 
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
@@ -1161,6 +1186,10 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=EX_NOPROGRESS)
         return EX_NOPROGRESS
+    except Halted as e:
+        log(str(e))
+        report_failure(str(e), code=EX_HALTED)
+        return EX_HALTED
     except WorkersError as e:
         print(f"tauceti workers: {e}", file=sys.stderr)
         return 2

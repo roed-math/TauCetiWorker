@@ -25,6 +25,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
+| `--clear-halt` | Print and delete this worker's identity halt file (`state/<id>/halt.json`), then exit. A loop refuses to start while it exists. See [the identity gate](#the-identity-gate). |
 | `--auto-refresh` | Renew this worker's Claude and Codex access tokens when they expire, instead of reporting the provider unavailable until a human runs `claude` or `codex` again. Off by default, and only safe when nothing else uses the same credential file — the refresh token is single-use, so the rotation logs out an interactive `claude`/`codex`, a second refresher, or a copy of the credential elsewhere. The Claude half does nothing on macOS (see `TAUCETI_CLAUDE_WARM`). See [quota and pacing](quota.md). |
 | `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; unreadable usage and provider hard limits still stop the round. Kiro and OpenRouter agents do not use the subscription pacer. |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
@@ -160,6 +161,38 @@ by the open file descriptor, so a crashed round releases it with no TTL to wait
 out, and it is kept even when the GitHub lease could not be registered, so
 same-host de-duplication works with no writable claim repository at all.
 
+## The identity gate
+
+Every write the worker makes is signed by whatever account `gh` is holding a
+token for, and a token can be revoked, replaced by the wrong one (`GH_TOKEN` in
+a service environment beats the stored sign-in), or belong to an account GitHub
+has since suspended. So before a loop starts, and again at the start of every
+round, the worker runs one `gh api user` and decides:
+
+| Answer | Verdict | What happens |
+| --- | --- | --- |
+| a login, and it equals `TAUCETI_EXPECT_LOGIN` (or no expectation is set) | ok | the login is logged with the credential source (`GH_TOKEN`, `GITHUB_TOKEN`, or `stored`) and cached in `TAUCETI_IDENTITY_OK` so no write repeats the call |
+| a login other than `TAUCETI_EXPECT_LOGIN` | `identity-mismatch` | halt |
+| HTTP 401, "Bad credentials", or no credential at all | `invalid-credentials` | halt |
+| HTTP 403 saying suspended, locked, or too many | `account-halt` | halt |
+| anything else (network, 5xx, a rate limit) | `unknown` | logged; the round proceeds and its own error handling reports what is wrong |
+
+A halt writes `state/<id>/halt.json` — `{reason, detail, at, login,
+login_expected, source}`, with `detail` the sanitized first line of what `gh`
+said — and exits with status **77** (`EX_HALTED`, distinct from 1 for an error
+and 75 for no progress). A loop whose round exits 77 stops at once: no retry, no
+escalating back-off, and nothing in the worker ever runs `gh auth login`,
+`refresh`, or `setup-git` on its own. A loop also refuses to start while the
+file exists. Read it, fix the credential by hand, then
+
+```bash
+tauceti work --worker-id <id> --clear-halt   # prints the record, deletes the file
+```
+
+Set `TAUCETI_EXPECT_LOGIN` on every worker you run unattended. Without it the
+gate still fails closed on a rejected credential but will happily act as
+whichever account the token in front of `gh` belongs to.
+
 ## Background GitHub traffic from claims
 
 Claims cost pushes: one to acquire, one per heartbeat renewal (every
@@ -264,6 +297,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_ACCOUNT` | _(unset)_ | Default for `--account`. |
 | `CODEX_HOME` | `~/.codex` | Codex config/credential source. Point it at a private directory to give TauCeti its own Codex account without disturbing the one your interactive `codex` uses. |
 | `TAUCETI_WORKER_ID` | _(unset)_ | Pin the id; when unset, `work` takes the lowest free `workerN`. |
+| `TAUCETI_EXPECT_LOGIN` | _(unset)_ | The GitHub login this worker must be acting as. Checked once per loop start and per round with `gh api user`; a different login halts the worker (exit 77, `state/<id>/halt.json`). Unset, the effective login is logged and accepted. See [the identity gate](#the-identity-gate). |
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |

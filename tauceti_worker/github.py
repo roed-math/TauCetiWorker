@@ -33,7 +33,12 @@ from .review_diagnostics import public_diagnostic_quality
 @functools.lru_cache(maxsize=1)
 def me() -> str:
     """The GitHub login the worker is authenticated as (gh). Its PRs are the ones the worker tends
-    (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as."""
+    (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as. The
+    identity gate (identity.gate) validated this once at round entry and left it in TAUCETI_IDENTITY_OK,
+    so in a gated process this is a lookup, not a second call."""
+    cached = os.environ.get("TAUCETI_IDENTITY_OK", "").strip()
+    if cached:
+        return cached
     r = gh_run(["gh", "api", "user", "--jq", ".login"])  # waits out a rate limit rather than failing setup
     login = (r.stdout or "").strip()
     if not login:

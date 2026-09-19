@@ -10,7 +10,16 @@ import time
 
 from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
-from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
+from .constants import (
+    BACKOFF_BASE,
+    BACKOFF_MAX,
+    EX_HALTED,
+    EX_NOPROGRESS,
+    GH_MIN_BUDGET,
+    INTERROUND,
+    OPENROUTER_MODELS,
+    POLL,
+)
 from .github import github_budget
 from .quota import Provider, Quota, _glyph, _hours, _pace_reason, _unavail_reason, quota_line
 from .round import run_round_subprocess
@@ -222,7 +231,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
             rc = run_round_subprocess(tail)
 
-            # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
+            # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off. A
+            # HALT is neither: the round's identity gate found a credential no retry fixes (or the wrong
+            # account) and wrote state/<wid>/halt.json. Stop here, at once, with its exit code — backing
+            # off and coming back would just re-run the same rejected credential on a schedule.
+            if rc == EX_HALTED:
+                failed = runtime_snapshot()
+                reason = str(failed.get("failure_reason") or "the round halted on its identity check")
+                log(f"round halted ({reason}) — stopping the loop; clear the halt file to run again")
+                report_runtime("halted", detail=reason, phase=None, target=None, next_action_at=None)
+                return EX_HALTED
             if rc == 0:
                 streak = 0
                 report_runtime(
