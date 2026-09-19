@@ -10,6 +10,9 @@
 # Legacy local Screen assignments; `tauceti workers import workers.conf` migrates these.
 /workers.conf
 
+# The offline harness's per-scenario consumption sidecar (tests/fakes/_fake.py).
+tests/fakes/*.consumed
+
 # Python bytecode (tauceti is a single-file script; tests import it).
 __pycache__/
 *.pyc

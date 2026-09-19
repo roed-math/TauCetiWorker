@@ -1,0 +1,15 @@
+{
+  "gh": [
+    {"match": ["api", "user", "--jq", ".login"], "rc": 0, "stdout": "fake-login\n"},
+    {"match": ["api", "rate_limit"], "rc": 0, "stdout": "{\"core\":[4990,1900000000],\"graphql\":[4990,1900000000]}\n"},
+    {"match": ["api", "repos/TauCetiProject/tauceti-claims", "--jq", ".permissions.push"], "rc": 0, "stdout": "true\n"},
+    {"match": ["api", "repos/TauCetiProject/TauCetiData", "--jq", ".permissions.push"], "rc": 0, "stdout": "false\n"},
+    {"match": ["repo", "list"], "rc": 0, "stdout": "[{\"nameWithOwner\":\"fake-login/TauCeti\",\"parent\":{\"owner\":{\"login\":\"TauCetiProject\"},\"name\":\"TauCeti\"}}]\n"},
+    {"match": ["api", "graphql"], "rc": 0, "stdout": "{\"data\":{\"repository\":{\"pullRequests\":{\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null},\"nodes\":[]}}}}\n"},
+    {"match": ["pr", "list"], "rc": 0, "stdout": "[]\n"},
+    {"match": ["issue", "list"], "rc": 0, "stdout": "[]\n"},
+    {"contains": "--jq .permissions.push", "rc": 0, "stdout": "true\n"}
+  ],
+  "git": [],
+  "bare_repos": {}
+}
