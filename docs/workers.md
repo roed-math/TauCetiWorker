@@ -140,6 +140,24 @@ restart will not get past until you run `tauceti work --worker-id <id>
 it the worker still stops on a rejected or suspended credential, but acts as
 whichever account it finds. See [the identity gate](reference.md#the-identity-gate).
 
+Four more belong in every fleet's `env` (the fleet wrapper sets them; a
+hand-written `workers.toml` must too): `TAUCETI_GATE_DIR`, the shared GitHub-gate
+store every worker of the account admits its GitHub traffic through (one directory
+per account, e.g. `~/claude/gq2-fleet/gate`); `TAUCETI_GATE_REQUIRED = "1"`, so a
+worker that somehow starts without the directory stops rather than running
+ungated; and the two per-hour budgets, `TAUCETI_GATE_MUTATIONS_PER_HOUR` and
+`TAUCETI_GATE_READS_PER_HOUR`, which have no default — unset, every API mutation
+and read is refused as `unconfigured`. The values are the owner's decision; the
+design proposes 40 and 600 for the pilot. See [the GitHub gate](gate.md).
+
+```toml
+[workers.env]
+TAUCETI_GATE_DIR = "/Users/you/claude/gq2-fleet/gate"
+TAUCETI_GATE_REQUIRED = "1"
+TAUCETI_GATE_MUTATIONS_PER_HOUR = "40"
+TAUCETI_GATE_READS_PER_HOUR = "600"
+```
+
 Put no secrets in it. The values are stored in plain `workers.toml`, and the
 whole worker definition is handed to its runner on a command line, where any
 process running as you can read it. Credentials belong in the provider

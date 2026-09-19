@@ -193,6 +193,22 @@ Set `TAUCETI_EXPECT_LOGIN` on every worker you run unattended. Without it the
 gate still fails closed on a rejected credential but will happily act as
 whichever account the token in front of `gh` belongs to.
 
+## The GitHub gate
+
+Every GitHub operation of the fleet — the worker's `gh` calls, its git fetches and
+pushes, the claim leases, the review engine, the progress tool, and what an agent
+does with `gh`/`git` on its PATH — is admitted by one shared, flocked store
+(`TAUCETI_GATE_DIR`) before it is dispatched and recorded after. The store holds
+the fleet state (`RUNNING`, `COOLDOWN`, `HALTED_MANUAL`), rolling budgets per kind
+and per push repository, an in-flight registry, and a quarantine of (op, target)
+pairs. A 401 or a suspension seen by any worker halts every worker; a rate limit
+puts them all in one cooldown; a permission denial quarantines that one operation.
+`tauceti work --clear-halt` clears the fleet halt together with the per-worker one.
+`tauceti gate status` and `tauceti gate report` read the store locally, with no
+network. The full reference — admission order, refusal codes, transitions, the
+agent's credential boundary and its remaining bypasses, the offline harness and
+the acceptance tests — is [gate.md](gate.md).
+
 ## Background GitHub traffic from claims
 
 Claims cost pushes: one to acquire, one per heartbeat renewal (every
@@ -341,6 +357,13 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |
+| `TAUCETI_GATE_DIR` | _(unset = no gate)_ | The fleet GitHub gate's store directory (one per account; the fleet wrapper sets it). Every `gh` call, git fetch/push, claim, review and progress run is admitted there first and recorded after. See [the GitHub gate](gate.md). |
+| `TAUCETI_GATE_REQUIRED` | _(unset)_ | `1` makes a missing `TAUCETI_GATE_DIR` a hard error instead of the no-op gate. Set it wherever the gate is meant to be in force. |
+| `TAUCETI_GATE_MUTATIONS_PER_HOUR` / `TAUCETI_GATE_READS_PER_HOUR` | **none** | Rolling hourly caps on API mutations and reads. They have no default on purpose: unset, the gate refuses every mutation/read as `unconfigured`. The design proposes 40 / 600 for the pilot, pending the owner's decision. |
+| `TAUCETI_GATE_MUTATIONS_PER_MINUTE` / `TAUCETI_GATE_MUTATION_SPACING` | `20` / `5` | Per-minute mutation cap and the minimum seconds between two mutations. |
+| `TAUCETI_GATE_PUSHES_PER_MINUTE` / `TAUCETI_GATE_PUSHES_PER_HOUR` | `4` / `60` | Git push caps, per repository. |
+| `TAUCETI_GATE_GIT_READS_PER_HOUR` / `TAUCETI_GATE_READS_RESERVE` | `300` / `200` | Hourly git-read cap; the slice of the reads cap only publication preflight may use. |
+| `TAUCETI_GATE_MAX_INFLIGHT_API` / `TAUCETI_GATE_MAX_INFLIGHT_GIT` / `TAUCETI_GATE_ADMIT_WAIT` | `1` / `1` / `30` | In-flight per lane, and how long an admit waits for a slot before refusing `busy`. The full table, including the cooldown and quarantine knobs, is in [gate.md](gate.md#environment). |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |

@@ -4,6 +4,8 @@
 # The tests are standalone scripts (not pytest): each loads the `tauceti` program and exits 0/1.
 # This runner knows how each one wants to be invoked, and which one to skip in a plain CI box:
 #   - most are stdlib-only         -> `uv run python <file>`
+#   - gate_t*.py are the GitHub-gate acceptance tests (docs/gate.md); they use tests/fakes and never
+#     touch the network, and must run with CLAIM_REPO unset (`env -u CLAIM_REPO tests/run-all`)
 #   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
 #   - dashboard has a PEP 723 header (rich/textual)      -> `uv run --script`
 #   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
@@ -39,6 +41,16 @@ RUN_STDLIB=(
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
+  gate_t01_shared_allowance.py
+  gate_t02_credential_halt.py
+  gate_t03_canonical_claim.py
+  gate_t04_403_classes.py
+  gate_t05_rate_limits.py
+  gate_t06_restart_cooldown.py
+  gate_t11_partial_data.py
+  gate_t13_identity_override.py
+  gate_t15_offline_escape.py
+  gate_t16_store_unavailable.py
   github_failure_reason.py
   github_ratelimit.py
   host_agent_preflight.py
