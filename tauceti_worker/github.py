@@ -28,6 +28,14 @@ from .constants import (
     OPEN_PR_PAGE,
     TAUCETI,
 )
+from .interaction import (
+    local_reaction_add,
+    local_reaction_age,
+    local_reaction_remove,
+    reactions_enabled,
+    record_incident,
+    stuck_issues_enabled,
+)
 from .review_diagnostics import public_diagnostic_quality
 
 
@@ -626,6 +634,12 @@ class GitHub:
         diagnostic. Deduped by an exact title: one open issue per stuck PR across the whole fleet.
         Best-effort — a GitHub failure is non-fatal (the per-round warning still fires); never raises."""
         title = f"Review stuck: PR #{pr}"
+        if not stuck_issues_enabled():
+            # Brief §8.1: automatic issue escalation stays off until its dedup and incident rules are
+            # tested. The record is local (one file per PR, refreshed in place), and GitHub is not called.
+            record_incident("review-stuck", str(pr), pr=pr, title=title, reason=reason, diagnostic=diagnostic)
+            log(f"  #{pr}: stuck-review issues are off (TAUCETI_STUCK_ISSUES=0) — recorded locally, GitHub not called")
+            return
         try:
             p = self._gh(
                 [
@@ -781,6 +795,8 @@ class GitHub:
         """Seconds since the newest `emoji` reaction on this comment, or None if there is none (or the
         fetch failed — fail OPEN: a transient API error must not let a stale claim block work forever,
         and the worst case of a missed claim is a rare double-review, which we've accepted)."""
+        if not reactions_enabled():
+            return local_reaction_age(comment_id, emoji)
         rs = self.reactions(comment_id)
         if not rs:
             return None
@@ -797,7 +813,11 @@ class GitHub:
 
     def add_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
         """Add `emoji` to a review comment (idempotent per (login, content)). False on failure — a
-        claim we couldn't post just means a peer may double up, which is acceptable."""
+        claim we couldn't post just means a peer may double up, which is acceptable. With reactions
+        off (TAUCETI_REACTIONS=0, brief §8.1) the claim is a marker file under the fleet store instead,
+        so the contest path's bookkeeping still works and GitHub is not called."""
+        if not reactions_enabled():
+            return local_reaction_add(comment_id, emoji, os.environ.get("TAUCETI_IDENTITY_OK", "") or "-")
         p = self._gh(
             ["api", "-X", "POST", f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions", "-f", f"content={emoji}"]
         )
@@ -806,6 +826,8 @@ class GitHub:
     def remove_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
         """Remove our own `emoji` reaction from a review comment (releases the claim). Looks up the
         reaction id for THIS login, then deletes it; a no-op (True) if we hold none."""
+        if not reactions_enabled():
+            return local_reaction_remove(comment_id, emoji, os.environ.get("TAUCETI_IDENTITY_OK", "") or "-")
         rs = self.reactions(comment_id)
         if rs is None:
             return False

@@ -43,6 +43,7 @@ from .constants import (
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
+from .interaction import contest_max_exchanges
 from .review_state import Meta, ReviewState
 
 # ============================================================================
@@ -748,6 +749,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         if (
             counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
             or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
+            or counters.read(f"review-contest-{p.number}-head-{p.head_oid[:12]}") >= contest_max_exchanges()
             or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
         ):
             sv.reviewable.suppressed.append(c)
