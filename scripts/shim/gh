@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# gh shim — first on the agent's PATH (design §4). Reads pass through the fleet gate as api_read and
+# run the real gh (TAUCETI_REAL_GH); `pr create` is routed to gh-safe-pr-create; everything that
+# signs in or writes is refused (exit 75) with the sanctioned way named. See docs/gate.md.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../gate-lib.sh
+. "$HERE/gate-lib.sh"
+REAL_GH="${TAUCETI_REAL_GH:-}"
+[[ -n "$REAL_GH" ]] || { echo "gh shim: TAUCETI_REAL_GH is not set (the worker sets it); refusing" >&2; exit 75; }
+
+refuse() { echo "gh shim: refused: $*" >&2; exit 75; }
+
+sub="${1:-}"; verb="${2:-}"
+case "$sub" in
+    ""|--help|-h|--version|version|help) exec "$REAL_GH" "$@";;
+    auth) refuse "gh auth <anything> — the worker never signs in, refreshes or reads a token unattended; credentials are the operator's (see docs/gate.md)";;
+    repo) refuse "gh repo * — the worker resolves the fork itself; nothing an agent does creates, forks or deletes a repository";;
+    workflow) refuse "gh workflow * — re-trigger CI by pushing through git-safe-push, never by dispatching a workflow";;
+    pr) case "$verb" in
+            create) shift 2; exec "$HERE/gh-safe-pr-create" "$@";;
+            list|view|checks|diff|status) ;;
+            *) refuse "gh pr $verb — only pr list/view/checks/diff/status read; a PR is opened with gh-safe-pr-create and never merged, closed, edited, commented on or reviewed by an agent";;
+        esac;;
+    issue) case "$verb" in
+            list|view) ;;
+            *) refuse "gh issue $verb — agents only read issues";;
+        esac;;
+    run) case "$verb" in
+            view|list) ;;
+            *) refuse "gh run $verb — agents only read runs";;
+        esac;;
+    search) ;;
+    api)
+        shift
+        method=GET; path=""; allowed_write=""
+        prev=""
+        for a in "$@"; do
+            case "$prev" in -X|--method) method="${a^^}";; esac
+            case "$a" in
+                --method=*) method="${a#--method=}"; method="${method^^}";;
+                -f|-F|--field|--raw-field|--input) [[ "$method" == GET ]] && method=POST;;
+                -*) ;;
+                *) [[ -z "$path" && "$prev" != -X && "$prev" != --method && "$prev" != -f && "$prev" != -F && "$prev" != --field && "$prev" != --raw-field && "$prev" != --input && "$prev" != --jq && "$prev" != -q && "$prev" != -H && "$prev" != --header ]] && path="$a";;
+            esac
+            prev="$a"
+        done
+        path="${path#/}"
+        [[ "$path" == graphql ]] && refuse "gh api graphql — agents use the REST reads the prompts name"
+        if [[ "$method" != GET ]]; then
+            # The one write an agent prompt asks for: a reply on a review thread of a canonical PR.
+            if [[ "$method" == POST && "$path" =~ ^repos/TauCetiProject/TauCeti/pulls/[0-9]+/comments/[0-9]+/replies$ ]]; then
+                allowed_write=reply
+            else
+                refuse "gh api $method $path — agents do not write through gh api; a PR is opened with gh-safe-pr-create, a branch pushed with git-safe-push"
+            fi
+        fi
+        set -- api "$@"
+        target="TauCetiProject/TauCeti"
+        [[ "$path" =~ ^repos/([^/]+)/([^/?]+) ]] && target="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        [[ "$path" =~ ^(user|rate_limit|notifications) ]] && target="-"
+        if [[ -n "$allowed_write" ]]; then kind=api_mutation; op=$allowed_write; else kind=api_read; op=api; fi
+        ;;
+    *) refuse "gh $sub — not a read the worker's prompts use";;
+esac
+# A read (or the one allowlisted write above): admit, run, record.
+if [[ "$sub" != api ]]; then
+    kind=api_read; op="$sub-$verb"
+    target="TauCetiProject/TauCeti"; prev=""
+    for a in "$@"; do
+        case "$prev" in --repo|-R) target="$a";; esac
+        case "$a" in --repo=*) target="${a#--repo=}";; esac
+        prev="$a"
+    done
+fi
+gate_admit "$kind" "$op" "$target" || exit 75
+OUT=$(mktemp)
+gate_spawn "$REAL_GH" "$@"
+"$REAL_GH" "$@" 2> >(tee "$OUT" >&2)
+rc=$?
+wait
+if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
+rm -f "$OUT"
+exit "$rc"

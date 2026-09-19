@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# git shim — first on the agent's PATH (design §4). Everything local passes straight to the real git
+# (TAUCETI_REAL_GIT). `push` has git-safe-push semantics (the round's TAUCETI_PUSH_REF or nothing);
+# `remote add|set-url` only to https://github.com/; `fetch|pull|ls-remote|clone` are admitted by the
+# fleet gate as git_read and recorded. See docs/gate.md.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../gate-lib.sh
+. "$HERE/gate-lib.sh"
+REAL_GIT="${TAUCETI_REAL_GIT:-}"
+[[ -n "$REAL_GIT" ]] || { echo "git shim: TAUCETI_REAL_GIT is not set (the worker sets it); refusing" >&2; exit 75; }
+
+refuse() { echo "git shim: refused: $*" >&2; exit 75; }
+
+# Skip git's own global options (-C <dir>, -c k=v, --git-dir=…) to find the subcommand.
+args=("$@"); i=0; sub=""
+while (( i < ${#args[@]} )); do
+    a="${args[$i]}"
+    case "$a" in
+        -C|-c|--git-dir|--work-tree|--namespace) i=$((i+2)); continue;;
+        -*) i=$((i+1)); continue;;
+        *) sub="$a"; break;;
+    esac
+done
+rest=("${args[@]:$((i+1))}")
+
+case "$sub" in
+    push)
+        [[ -n "${TAUCETI_PUSH_REF:-}" ]] || refuse "git push — this round has no push target (TAUCETI_PUSH_REF unset); a branch is pushed only with git-safe-push"
+        # Only the round's own destination: a refspec naming any other branch is refused rather than
+        # silently redirected.
+        for a in "${rest[@]}"; do
+            case "$a" in
+                -*|origin|fork|"${TAUCETI_PUSH_REMOTE:-origin}"|HEAD|"$TAUCETI_PUSH_REF"|HEAD:"$TAUCETI_PUSH_REF"|*:"$TAUCETI_PUSH_REF") ;;
+                *) refuse "git push $a — this round may only push HEAD to $TAUCETI_PUSH_REF via git-safe-push";;
+            esac
+        done
+        echo "git shim: routing push through git-safe-push (HEAD:$TAUCETI_PUSH_REF)" >&2
+        exec "$HERE/git-safe-push";;
+    remote)
+        case "${rest[0]:-}" in
+            add|set-url)
+                url="${rest[*]: -1}"
+                case "$url" in
+                    https://github.com/*) ;;
+                    *) refuse "git remote ${rest[0]} $url — only https://github.com/ remotes; no ssh, no other host";;
+                esac;;
+        esac
+        exec "$REAL_GIT" "$@";;
+    fetch|pull|ls-remote|clone)
+        target="origin"
+        for a in "${rest[@]}"; do
+            case "$a" in
+                http://*|https://*|git@*|ssh://*) target="$a"; break;;
+            esac
+        done
+        if [[ "$target" == origin || "$target" != *://* && "$target" != git@* ]]; then
+            name="$target"
+            for a in "${rest[@]}"; do case "$a" in -*) ;; *) name="$a"; break;; esac; done
+            resolved=$("$REAL_GIT" "${args[@]:0:$i}" remote get-url "$name" 2>/dev/null) && target="$resolved"
+        fi
+        gate_admit git_read "$sub" "$target" || exit 75
+        OUT=$(mktemp)
+        "$REAL_GIT" "$@" 2> >(tee "$OUT" >&2)
+        rc=$?
+        wait
+        if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
+        rm -f "$OUT"
+        exit "$rc";;
+    *) exec "$REAL_GIT" "$@";;
+esac
