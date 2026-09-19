@@ -921,7 +921,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         # Lifecycle test hooks (no GitHub, no model, no mutation) — exercise lock / fd-leak / timeout.
         hb = os.environ.get("TAUCETI_TEST_HEARTBEAT")
         if hb:
-            Claims(cfg, ctx).start_heartbeat("branch/test", os.environ.get("CLAIM_REPO") or TAUCETI)
+            # A namespace is required (claim.sh refuses to run without one), but this hook must never
+            # touch GitHub: with none given it names a repository that is not canonical and that claim.sh
+            # will fail against harmlessly if the hold outlives CLAIM_HEARTBEAT (the hook never does).
+            Claims(cfg, ctx).start_heartbeat("branch/test", os.environ.get("CLAIM_REPO") or "tauceti-test/none")
             log(f"[test] heartbeat started; holding {hb}s then exiting")
             time.sleep(int(hb))
             return 0
