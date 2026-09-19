@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# tauceti-gate — the fleet GitHub gate's CLI, on the agent PATH and used by claim.sh, git-safe-push,
+# gh-safe-pr-create, the gh/git shims and git's credential helper. It is `python -m tauceti_worker
+# gate "$@"` with the worker's own interpreter (TAUCETI_PYTHON, exported by the worker; the package
+# needs rich/textual importable, which a bare system python may not have). See docs/gate.md.
+set -uo pipefail
+D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$D/../tauceti_worker/__init__.py" ]]; then ROOT="$D/.."          # a source checkout: scripts/ beside the package
+elif [[ -f "$D/../__init__.py" ]]; then ROOT="$D/../.."                     # a wheel: tauceti_worker/scripts/
+else ROOT="$D/.."; fi
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "${TAUCETI_PYTHON:-python3}" -m tauceti_worker gate "$@"

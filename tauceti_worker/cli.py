@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,6 +28,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import gate as gate_mod
 from .agents import (
     BUBBLE_MIN_VERSION,
     BUBBLE_REPO,
@@ -378,6 +380,12 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--dry-run", dest="dry_run", action="store_true", help="survey + print the picker's decision; act on nothing"
     )
     p.add_argument(
+        "--offline",
+        action="store_true",
+        help="the offline harness (docs/gate.md): tests/fakes lead PATH, a temporary TAUCETI_GATE_DIR, "
+        "TAUCETI_GATE_REQUIRED=1; refuses to start unless `gh` on PATH is the fake and no GH_TOKEN/GITHUB_TOKEN is set",
+    )
+    p.add_argument(
         "--clear-halt",
         dest="clear_halt",
         action="store_true",
@@ -608,6 +616,9 @@ def build_parser() -> argparse.ArgumentParser:
     mr.add_argument("--spec", required=True)
     mr.add_argument("--state-dir", required=True)
     mr.add_argument("--runtime-dir", required=True)
+    # `tauceti gate …` is the `tauceti-gate` CLI (tauceti_worker.gate_cli); its own parser reads the rest.
+    g = sub.add_parser("gate", help="the fleet GitHub gate: admit/record/status/report/halt/resume (see docs/gate.md)")
+    g.add_argument("gate_args", nargs=argparse.REMAINDER)
     return p
 
 
@@ -684,6 +695,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_egress_probe(args)
     if cmd == "_managed-run":
         return cmd_managed_runner(args)
+    if cmd == "gate":
+        from .gate_cli import main as gate_main
+
+        return gate_main(args.gate_args, prog="tauceti gate")
     parser.print_help()
     return 64
 
@@ -784,6 +799,33 @@ def cmd_status(args) -> int:
 
     render_survey(sv, Console(), quota_snap)
     return 1 if sv.github_failed else 0
+
+
+def enter_offline_mode(cfg: Config) -> None:
+    """`tauceti work --offline` (design §8): the fakes lead PATH, the gate is required and points at a
+    scratch store under the worker's state, and the process refuses to start if `gh` on PATH is not the
+    fake or a token variable is set — so a failed fake can never fall back to live GitHub. Loop
+    children inherit the environment, so this runs once in the driver."""
+    fakes = HERE / "tests" / "fakes"
+    if not (fakes / "gh").is_file() or not (fakes / "git").is_file():
+        raise Die(f"--offline: the fake gh/git are not available at {fakes} (a source checkout has them)")
+    if os.environ.get("TAUCETI_OFFLINE") != "1":
+        os.environ["PATH"] = f"{fakes}:{os.environ.get('PATH', '')}"
+        gate_dir = cfg.state / "gate-offline"
+        os.environ["TAUCETI_GATE_DIR"] = str(gate_dir)
+        os.environ["TAUCETI_GATE_REQUIRED"] = "1"
+        os.environ.setdefault("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40")
+        os.environ.setdefault("TAUCETI_GATE_READS_PER_HOUR", "600")
+        os.environ.setdefault("TAUCETI_FAKE_LOG", str(cfg.state / "fake-calls.log"))
+        os.environ.setdefault("TAUCETI_FAKE_SCENARIO", str(fakes / "scenario-empty.json"))
+        os.environ["TAUCETI_OFFLINE"] = "1"
+    for var in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if os.environ.get(var):
+            raise Die(f"--offline: {var} is set; the offline harness must not see a production credential")
+    resolved = shutil.which("gh")
+    if not resolved or Path(resolved).resolve() != (fakes / "gh").resolve():
+        raise Die(f"--offline: `gh` on PATH resolves to {resolved!r}, not the fake at {fakes / 'gh'}")
+    log(f"offline: fakes on PATH from {fakes}; gate store {os.environ['TAUCETI_GATE_DIR']}")
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
@@ -901,7 +943,15 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     set_log_file(cfg.logdir)
     if getattr(args, "clear_halt", False):
         clear_halt(halt_path(cfg.state))
+        # The fleet store halts with the identity gate (and on a 401 any worker sees), so clearing is
+        # one decision for both: print that record too, then return the store to RUNNING.
+        fleet = gate_mod.current()
+        if fleet.enabled:
+            rec = fleet.clear_halt()
+            print(f"fleet gate {fleet.dir}: " + (json.dumps(rec, indent=2) if rec else "no halt record") + "\ncleared")
         return 0
+    if getattr(args, "offline", False):
+        enter_offline_mode(cfg)
     if getattr(args, "loop", False) and not one_round:
         # The loop driver never builds a RoundOpts, so the round-level check below is not on this path;
         # its children get theirs. Check here too, so a wrong --account costs one command rather than a
@@ -1203,7 +1253,7 @@ def cli_main() -> int:
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
     can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create"):
+    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "tauceti-gate", "shim/gh", "shim/git"):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):
