@@ -441,8 +441,6 @@ class Gate:
                 "source": caller_label(),
             }
         )
-        if state != COOLDOWN:
-            s.pop("consecutive_secondary", None)
         self._write(STATE, s)
         self._event(
             decision="transition", kind="-", op="-", target="-", reason=reason, detail=detail, from_=prev, to=state
@@ -699,8 +697,7 @@ class Gate:
         verdict, reason = self._classify(o, status, text, retry_after)
         if verdict == "none":
             b["transient"].pop(a.op, None)
-            if a.kind == API_MUTATION or a.kind == GIT_PUSH:
-                b.pop("consecutive_secondary", None)
+            b.pop("consecutive_secondary", None)  # a success ends the "consecutive" run of secondary hits
         self._write(BUDGET, b)
         self._event(
             decision="record",
@@ -725,7 +722,8 @@ class Gate:
         elif verdict == "quarantine":
             self._quarantine(a.op, a.target, reason, text, until=None)
         elif verdict == "cooldown":
-            secs = self._cooldown_seconds(s, reason, retry_after, rate_remaining, rate_reset, now)
+            secs = self._cooldown_seconds(b, reason, retry_after, rate_remaining, rate_reset, now)
+            self._write(BUDGET, b)
             self._set_state(s, COOLDOWN, reason=reason, detail=text, until=now + secs)
         elif verdict == "transient":
             n = int(b["transient"].get(a.op, 0)) + 1
@@ -759,7 +757,10 @@ class Gate:
             return "transient", "transient"
         return "none", "failed"
 
-    def _cooldown_seconds(self, s, reason, retry_after, rate_remaining, rate_reset, now) -> float:
+    def _cooldown_seconds(self, b, reason, retry_after, rate_remaining, rate_reset, now) -> float:
+        """Design §3: Retry-After, else x-ratelimit-reset when the primary bucket is empty, else 60 s
+        doubling per consecutive secondary hit (the counter lives in budget.json and a success clears
+        it), bounded to cooldown_max; an unclassified 403 is its own fixed pause."""
         cfg = self.config
         if retry_after:
             try:
@@ -773,9 +774,9 @@ class Gate:
                 pass
         if reason == "unclassified-403":
             return float(cfg.unclassified_403_cooldown)
-        n = int(s.get("consecutive_secondary", 0))
-        s["consecutive_secondary"] = n + 1
-        return float(min(cfg.cooldown_base * (1 << n), cfg.cooldown_max))
+        n = int(b.get("consecutive_secondary", 0))
+        b["consecutive_secondary"] = n + 1
+        return float(min(cfg.cooldown_base * (1 << min(n, 20)), cfg.cooldown_max))
 
     def _quarantine(self, op: str, target: str, reason: str, text: str, *, until: float | None) -> None:
         q = self._read(QUARANTINE, {})
@@ -914,6 +915,7 @@ class Gate:
             self._acquire()
             try:
                 s = self._state()
+                self._budget()  # unreadable budget state is a store error too (T16): report it here
                 out = {
                     "enabled": True,
                     "dir": str(self.dir),
@@ -1119,6 +1121,29 @@ _GH_MUTATING_VERBS = {
 }
 
 
+_GH_API_VALUE_OPTS = frozenset(
+    {
+        "-X",
+        "--method",
+        "-f",
+        "-F",
+        "--field",
+        "--raw-field",
+        "--input",
+        "-H",
+        "--header",
+        "--jq",
+        "-q",
+        "-t",
+        "--template",
+        "--cache",
+        "--hostname",
+        "-p",
+        "--preview",
+    }
+)
+
+
 def classify_gh(argv: list[str]) -> tuple[str, str, str]:
     """(kind, op, target) for a `gh` argv: `api -X POST|PATCH|PUT|DELETE`, a field argument, a GraphQL
     mutation document and the write verbs are mutations; everything else reads. The target is the
@@ -1132,7 +1157,16 @@ def classify_gh(argv: list[str]) -> tuple[str, str, str]:
     target = TAUCETI
     if args[0] == "api":
         rest = args[1:]
-        path = next((a for a in rest if not a.startswith("-")), "")
+        path = ""
+        skip = False
+        for a in rest:
+            if skip:
+                skip = False
+            elif a in _GH_API_VALUE_OPTS:
+                skip = True
+            elif not a.startswith("-"):
+                path = a
+                break
         if path == "graphql":
             op = "graphql"
             from .constants import _GQL_MUTATION_RE

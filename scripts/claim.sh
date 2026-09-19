@@ -75,6 +75,16 @@ require_repo() {
     fi
 }
 
+# require_key KEY — a claim key names a ref UNDER refs/tauceti-claims/ and nothing else: no `..`, no
+# leading slash, no `refs/` prefix, nothing but the characters a key is made of. Anything else would
+# let `refs/tauceti-claims/<key>` escape the namespace and touch a real branch.
+require_key() {
+    if [[ -z "$1" || "$1" == *..* || "$1" == /* || "$1" == refs/* || ! "$1" =~ ^[A-Za-z0-9._/-]+$ || "$1" == */ ]]; then
+        echo "claim: key '$1' is not a claim key (letters, digits, . _ - and / only; no .., no leading / or refs/) — refusing" >&2
+        exit 2
+    fi
+}
+
 # A private scratch repo just for building + pushing claim objects (no work-repo checkout needed).
 ensure_repo() {
     if [[ ! -d "$GITDIR" ]]; then
@@ -127,6 +137,11 @@ push_cas() {
     out=$(g push --force-with-lease="$1:$2" origin "$3:$1" 2>&1)
     if [[ $? -eq 0 ]]; then return 0; fi
     LAST_OUT="$out"
+    # A denial is not a lost race: it is an error for the gate to classify (a quarantine of this
+    # namespace), and it must never read as "held by another worker".
+    if grep -qiE 'permission|denied|not granted|protected branch' <<<"$out"; then
+        echo "claim: push denied on $1: $out" >&2; return 2
+    fi
     grep -qiE 'rejected|stale info|failed to push' <<<"$out" && return 1
     echo "claim: unexpected push error on $1: $out" >&2; return 2
 }
@@ -142,7 +157,7 @@ cmd_acquire() {
         echo "claim: $key is already held by this worker's round (its heartbeat renews it) — nothing to push" >&2
         return 0
     fi
-    require_repo
+    require_repo; require_key "$key"
     admit acquire || return 2
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref")
@@ -162,7 +177,7 @@ cmd_acquire() {
 
 cmd_renew() {
     local key="$1" ttl="${2:-$DEFAULT_TTL}" ref cur js owner n
-    require_repo
+    require_repo; require_key "$key"
     admit renew || return 2
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 1
@@ -174,7 +189,7 @@ cmd_renew() {
 
 cmd_release() {
     local key="$1" ref cur js owner
-    require_repo
+    require_repo; require_key "$key"
     admit release || return 2
     ref=$(ref_of "$key"); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 0
@@ -185,7 +200,7 @@ cmd_release() {
 
 cmd_holds() {
     local key="$1" ref cur js owner exp n
-    require_repo
+    require_repo; require_key "$key"
     admit holds || return 2
     ref=$(ref_of "$key"); n=$(now); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 1
@@ -195,7 +210,7 @@ cmd_holds() {
 }
 
 cmd_read() {
-    local ref cur; require_repo; admit read || return 2; ref=$(ref_of "$1"); ensure_repo
+    local ref cur; require_repo; require_key "$1"; admit read || return 2; ref=$(ref_of "$1"); ensure_repo
     cur=$(remote_oid "$ref"); [[ -z "$cur" ]] && return 0
     lease_json "$cur" "$ref"
 }

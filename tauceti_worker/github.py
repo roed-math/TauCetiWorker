@@ -185,6 +185,9 @@ def ensure_fork() -> str:
             f"resolved your fork {fork}, but this `gh` account cannot push to it. Use a `gh auth` that can "
             f"push to your fork (a token scoped only to {TAUCETI} is not enough), or set TAUCETI_FORK."
         )
+    # Pin what was resolved for the rest of this process tree: the gate's push allowlist, the agent's
+    # wrappers and the heartbeat child all read TAUCETI_FORK rather than resolving (and spending) again.
+    os.environ["TAUCETI_FORK"] = fork
     return fork
 
 
