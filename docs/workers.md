@@ -158,6 +158,15 @@ TAUCETI_GATE_MUTATIONS_PER_HOUR = "40"
 TAUCETI_GATE_READS_PER_HOUR = "600"
 ```
 
+Three more are the pilot's interaction contract (brief §8.1), all optional with
+their defaults shown: `TAUCETI_STUCK_ISSUES = "1"` (set `"0"` to keep the
+"Review stuck" issue off GitHub and record it locally instead),
+`TAUCETI_REACTIONS = "1"` (`"0"` keeps the contest claim in the gate store rather
+than as a 👀 on GitHub), and `TAUCETI_CONTEST_MAX_EXCHANGES = "2"` (automated
+contest re-reviews per PR head before a human is asked for). The brief's advice for
+the initial pilot is the first two at `"0"`. See [the interaction
+contract](gate.md#the-interaction-contract-brief-81).
+
 Put no secrets in it. The values are stored in plain `workers.toml`, and the
 whole worker definition is handed to its runner on a command line, where any
 process running as you can read it. Credentials belong in the provider

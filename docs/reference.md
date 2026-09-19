@@ -364,6 +364,9 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GATE_PUSHES_PER_MINUTE` / `TAUCETI_GATE_PUSHES_PER_HOUR` | `4` / `60` | Git push caps, per repository. |
 | `TAUCETI_GATE_GIT_READS_PER_HOUR` / `TAUCETI_GATE_READS_RESERVE` | `300` / `200` | Hourly git-read cap; the slice of the reads cap only publication preflight may use. |
 | `TAUCETI_GATE_MAX_INFLIGHT_API` / `TAUCETI_GATE_MAX_INFLIGHT_GIT` / `TAUCETI_GATE_ADMIT_WAIT` | `1` / `1` / `30` | In-flight per lane, and how long an admit waits for a slot before refusing `busy`. The full table, including the cooldown and quarantine knobs, is in [gate.md](gate.md#environment). |
+| `TAUCETI_STUCK_ISSUES` | `1` | `0` keeps the "Review stuck" tracking issue off GitHub: the escalation becomes an incident file under the gate store's `incidents/` and gh is not called. See [the interaction contract](gate.md#the-interaction-contract-brief-81). |
+| `TAUCETI_REACTIONS` | `1` | `0` keeps the contest claim (the 👀 on a contesting reply) off GitHub; a marker under the gate store carries it for every worker on the host and the contest path's bookkeeping is unchanged. |
+| `TAUCETI_CONTEST_MAX_EXCHANGES` | `2` | Automated contest re-reviews per PR head. At the cap the round posts nothing and writes a `contest-cap` incident: a human is needed. |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
