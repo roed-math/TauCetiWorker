@@ -54,6 +54,7 @@ RUN_STDLIB=(
   loop_sigterm.py
   mirror_creds.py
   mirror_creds_macos.py
+  no_unattended_auth.py
   oauth_refresh_loop.py
   open_pr_pages.py
   pace_curve.py
