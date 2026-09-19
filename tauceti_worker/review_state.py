@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotation only; survey is a higher layer
     from .survey import Counters
 
+from . import gate as gate_mod
 from .config import Config
 from .constants import COMMENTS_MEMO_S, REVIEW_INPROGRESS_RE, SBCACHE_BACKSTOP_S, SBCACHE_TTL
 from .github import GitHub
@@ -27,6 +28,18 @@ from .github import GitHub
 # ============================================================================
 
 META_RE = re.compile(r"<!--tauceti-meta:v1 (.*?)-->", re.S)
+
+COALESCE_POLL_S = 0.5  # a reader waiting on a peer's in-flight fetch polls the marker at this rate
+
+
+def review_state_dir(cfg: Config) -> Path:
+    """Where the sidecars live: fleet-shared under the gate store when there is one (design §5: the
+    files are keyed by PR and `updatedAt`, so any worker's read entitles every worker), else the
+    per-worker directory upstream used."""
+    g = gate_mod.current()
+    if g.enabled and g.dir is not None:
+        return g.cache_dir / "review_state"
+    return cfg.sbcache
 
 
 @dataclass
@@ -47,7 +60,7 @@ class ReviewState:
     def __init__(self, cfg: Config, gh: GitHub):
         self.cfg = cfg
         self.gh = gh
-        self.sbcache = cfg.sbcache
+        self.sbcache = review_state_dir(cfg)
         self._comments: dict[int, tuple[float, list[dict] | None]] = {}
         self._observed: dict[int, str] = {}
 
@@ -123,6 +136,31 @@ class ReviewState:
         except OSError:
             pass  # a cache we cannot write is a slow round, not a wrong one
 
+    def _coalesce(self, pr: int, tag: str, sidecar: Path, force: bool) -> tuple[dict | None, bool]:
+        """Design §5 miss coalescing, across processes. Returns (entitled sidecar a peer's fetch just
+        produced, whether THIS process now owns the in-flight marker and must release it after its own
+        fetch). A second reader finding a live marker waits (READ_INFLIGHT_TTL, polling) and re-reads
+        the sidecar instead of fetching; when the peer's fetch produced nothing usable it fetches itself.
+        A forced read never waits (it must be live) but does claim the marker when free, so peers
+        coalesce onto it. No gate, or no `updatedAt` key to be entitled under: no coalescing."""
+        gate = gate_mod.current()
+        if not gate.enabled or not self._observed.get(pr):
+            return None, False
+        key = f"{pr}.{tag}"
+        other = gate.claim_read(key)
+        if other is None:
+            return None, True
+        if force:
+            return None, False
+        deadline = time.time() + gate_mod.READ_INFLIGHT_TTL
+        while time.time() < deadline and gate.read_claim_live(key):
+            time.sleep(COALESCE_POLL_S)
+        sc = self._sidecar(sidecar, pr)
+        if sc is not None:
+            return sc, False
+        other = gate.claim_read(key)  # the peer's fetch left nothing usable: take the miss ourselves
+        return None, other is None
+
     def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
         """A PR's issue comments, memoized briefly so the two readers in one survey pass — the scoreboard
         meta and the in-flight review marker — share ONE fetch (a cold meta read plus a marker check
@@ -190,6 +228,19 @@ class ReviewState:
             if age < SBCACHE_TTL and cached is not None:
                 return Meta(cached, "assumed")
 
+        sc, owned = self._coalesce(pr, "comments", self._key_path(pr), force)
+        if sc is not None:
+            if sc.get("status") == "present" and isinstance(sc.get("meta"), dict):
+                return Meta(sc["meta"], "assumed")
+            if sc.get("status") == "missing":
+                return Meta({}, "missing")
+        try:
+            return self._gh_meta_fetch(pr, cache, force)
+        finally:
+            if owned:
+                gate_mod.current().release_read(f"{pr}.comments")
+
+    def _gh_meta_fetch(self, pr: int, cache: Path, force: bool) -> Meta:
         comments = self._issue_comments(pr, force=force)
         fetch_failed = comments is None
         data = None
@@ -294,12 +345,21 @@ class ReviewState:
         sc = None if force else self._sidecar(self._contest_path(pr), pr)
         if sc is not None and "contest" in sc:
             return sc["contest"]
-        rcs = self.gh.review_comments(pr)
-        if rcs is None:
-            return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
-        best = self._newest_contest(rcs)
-        self._write_sidecar(self._contest_path(pr), pr, {"status": "present" if best else "missing", "contest": best})
-        return best
+        sc, owned = self._coalesce(pr, "contest", self._contest_path(pr), force)
+        if sc is not None and "contest" in sc:
+            return sc["contest"]
+        try:
+            rcs = self.gh.review_comments(pr)
+            if rcs is None:
+                return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
+            best = self._newest_contest(rcs)
+            self._write_sidecar(
+                self._contest_path(pr), pr, {"status": "present" if best else "missing", "contest": best}
+            )
+            return best
+        finally:
+            if owned:
+                gate_mod.current().release_read(f"{pr}.contest")
 
     @staticmethod
     def _newest_contest(rcs: list[dict]):
