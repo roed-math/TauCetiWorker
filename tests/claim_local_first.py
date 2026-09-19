@@ -79,16 +79,15 @@ def locally_free(key) -> bool:
 
 
 def release(claims):
-    """Claims.release runs claim.sh through subprocess.run (not the run_claim_sh seam); stub that for
-    the call so no real claim.sh — and no network — is reached, recording the release it would make."""
-    real_run = subprocess.run
-    subprocess.run = lambda *a, **k: (
-        ST["calls"].append(("release-run", a[0][1:])) or types.SimpleNamespace(returncode=0)
-    )
-    try:
-        claims.release()
-    finally:
-        subprocess.run = real_run
+    """Claims.release goes through the run_claim_sh seam like every other claim call (it is admitted by
+    the fleet gate there), so the stub above records it as a plain `release` call; this wrapper keeps
+    the older `("release-run", args)` shape the assertions below read."""
+    before = len(ST["calls"])
+    claims.release()
+    ST["calls"][before:] = [
+        ("release-run", list(args)) if args and args[0] == "release" else (args, repo)
+        for args, repo in ST["calls"][before:]
+    ]
 
 
 # ---- 1. a sibling on this host holds the target: no network, rc 1 ---------------------------------
@@ -229,13 +228,11 @@ sibling.release()
 # ...and when it is ours, the report runs and the claim is given back afterwards.
 claims = reset([0])
 wu._do_progress_inner = lambda w, opts: ran_inner.append(1) or 0
-real_run = subprocess.run
-subprocess.run = lambda *a, **k: ST["calls"].append(("release-run", a[0][1:])) or types.SimpleNamespace(returncode=0)
 try:
     verdict = wu.do_progress(types.SimpleNamespace(claims=claims), None, None, None, False)
 finally:
     wu._do_progress_inner = saved_inner
-    subprocess.run = real_run
+ST["calls"][:] = [("release-run", list(c[0])) if c[0] and c[0][0] == "release" else c for c in ST["calls"]]
 check("do_progress when free -> the report runs, rc 0", verdict == 0 and ran_inner == [1])
 check(
     "do_progress when free -> one acquire then one release",

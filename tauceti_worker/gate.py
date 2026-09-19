@@ -311,6 +311,8 @@ def push_target_allowed(op: str, target: str) -> bool:
             return True
     if n == CLAIMS.lower():
         return True
+    if op == "sync" and n == f"{TAUCETI.split('/', 1)[0].lower()}/taucetidata":
+        return True  # the review engine's archive push (--sync-only), probed for push permission first
     remote = os.environ.get("TAUCETI_PUSH_REMOTE", "").strip()
     return bool(remote) and normalize_repo(remote) == n and op == "push"
 
@@ -1043,6 +1045,43 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def admit_or_log(op: str, target: str, kind: str, *, weight: int = 1) -> Admission | None:
+    """The gate's admit for a site whose failure path is its own: the Admission, or None after logging
+    the refusal (the caller then takes the path it takes when the operation failed)."""
+    try:
+        return current().admit(op, target, kind, weight=weight)
+    except GateRefused as e:
+        log(f"{kind} {op} {target}: {e.message()}")
+        return None
+
+
+def gated_git(argv: list[str], *, op: str, target: str, kind: str = GIT_READ, **kw):
+    """One git transport call (clone / fetch / ls-remote) through the gate. stderr is captured for the
+    record and echoed afterwards, so what the operator saw before is what they see now; a refusal is
+    the usual rc-75 CompletedProcess."""
+    import subprocess
+    import sys
+
+    gate = current()
+    try:
+        adm = gate.admit(op, target, kind)
+    except GateRefused as e:
+        log(f"git {op} {target}: {e.message()}")
+        return refused_process(argv, e)
+    env = {**(kw.pop("env", None) or os.environ), **adm.child_env()}
+    capture = kw.pop("capture_output", False)
+    t0 = time.monotonic()
+    if capture:
+        p = subprocess.run(argv, env=env, capture_output=True, text=True, **kw)
+    else:
+        p = subprocess.run(argv, env=env, stderr=subprocess.PIPE, text=True, **kw)
+        if p.stderr:
+            sys.stderr.write(p.stderr)
+            sys.stderr.flush()
+    gate.record(adm, Outcome.from_process(p, duration_ms=int((time.monotonic() - t0) * 1000)))
+    return p
+
+
 def refused_process(argv: list[str], e: GateRefused):
     """The CompletedProcess a refused `gh`/script call turns into, so every caller's existing failure
     handling applies: rc 75, and `gate: refused (<reason>)` on stderr."""
@@ -1126,6 +1165,8 @@ def classify_gh(argv: list[str]) -> tuple[str, str, str]:
             elif p.startswith(("user", "rate_limit", "notifications")):
                 target = "-"
                 op = "rate_limit" if p.startswith("rate_limit") else ("user" if p == "user" else op)
+                if p == "user" and method == "GET":
+                    kind = IDENTITY  # the identity gate's one read: exempt from the budgets, not from a halt
             else:
                 target = "-"
     else:

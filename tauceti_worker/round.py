@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 
+from . import gate as gate_mod
 from .config import Config, Die, log
 from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_TIMEOUT
 from .github import claims_repo
@@ -172,9 +173,29 @@ def reap_round_group(pgid: int, term_grace: float = 2.0) -> None:
 def run_claim_sh(args: list[str], claim_repo: str) -> int:
     """Run `claim.sh <args>` against `claim_repo` and return its verdict (see scripts/claim.sh: acquire
     is 0 mine, 1 held by another worker, 2 could not be registered). One seam, so a test can script
-    the verdicts without a git remote."""
-    env = {**os.environ, "CLAIM_REPO": claim_repo}
-    return subprocess.run([CLAIM_SH, *args], capture_output=True, env=env).returncode
+    the verdicts without a git remote.
+
+    Every subcommand is admitted by the fleet gate first — the lease writers (acquire/renew/release/gc)
+    as a `git_push` to the claim namespace, the rest as a `git_read` — and recorded after. The
+    admission token travels to claim.sh in its environment so the script does not admit a second time.
+    A refusal is rc 2 with `gate: refused (<reason>)` logged: to every caller that is "could not be
+    registered", the same cooperative fail-open as a push the namespace rejected."""
+    gate = gate_mod.current()
+    kind, op = gate_mod.classify_claim(args)
+    try:
+        adm = gate.admit(op, claim_repo, kind)
+    except gate_mod.GateRefused as e:
+        log(f"claim {op}: {e.message()}")
+        return 2
+    env = {**os.environ, "CLAIM_REPO": claim_repo, **adm.child_env()}
+    t0 = time.monotonic()
+    p = subprocess.run([CLAIM_SH, *args], capture_output=True, env=env, text=True)
+    # 1 is a verdict (held by another / lost), not a failure of the transport.
+    gate.record(
+        adm,
+        gate_mod.Outcome.from_process(p, ok=p.returncode in (0, 1), duration_ms=int((time.monotonic() - t0) * 1000)),
+    )
+    return p.returncode
 
 
 class Claims:
@@ -338,9 +359,7 @@ class Claims:
         """Give the claim back: the GitHub lease (one push) if one was registered, then the local lock."""
         if self.held:
             key, claim_repo = self.held
-            subprocess.run(
-                [CLAIM_SH, "release", key], capture_output=True, env={**os.environ, "CLAIM_REPO": claim_repo}
-            )
+            run_claim_sh(["release", key], claim_repo)  # through the gate: a halted fleet releases nothing
             self.held = None
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
@@ -365,7 +384,9 @@ def cmd_heartbeat(args) -> int:
                     return 0
         else:
             time.sleep(CLAIM_HEARTBEAT_S)
-        if subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode != 0:
+        # Through the gate like every other push: during a cooldown or a halt the renewal is refused
+        # (rc 2) and the lease is simply allowed to expire, which is the design's intent.
+        if run_claim_sh(["renew", key], os.environ.get("CLAIM_REPO", "")) != 0:
             return 0  # lease lost → stop renewing so it can expire
 
 

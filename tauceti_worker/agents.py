@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # annotations only; importing at runtime would invert the lay
     from .work_units import RoundOpts, Worker
 
 from . import build_caches
+from . import gate as gate_mod
 from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
@@ -541,13 +542,15 @@ def prepare_checkout(cfg: Config) -> bool:
     if not (co / ".git").is_dir():
         co.parent.mkdir(parents=True, exist_ok=True)
         log(f"cloning {TAUCETI} → {co} (first run)")
-        if subprocess.run(["git", "clone", "-q", f"https://github.com/{TAUCETI}", str(co)]).returncode:
+        if gate_mod.gated_git(
+            ["git", "clone", "-q", f"https://github.com/{TAUCETI}", str(co)], op="clone", target=TAUCETI
+        ).returncode:
             return False
 
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
-    if g("fetch", "-q", "origin"):
+    if gate_mod.gated_git(["git", "-C", str(co), "fetch", "-q", "origin"], op="fetch", target=TAUCETI).returncode:
         return False
     # -f discards a prior round's leftover edits and lands us on main in one step; a plain
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on
@@ -566,7 +569,10 @@ def _fetch_shallow(url: str, dir: Path) -> bool:
     """Clone or refresh a worker-owned shallow checkout and make its origin fetch-only."""
     if (dir / ".git").is_dir():
         ok = (
-            subprocess.run(["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", "HEAD"]).returncode == 0
+            gate_mod.gated_git(
+                ["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", "HEAD"], op="fetch", target=url
+            ).returncode
+            == 0
             and subprocess.run(["git", "-C", str(dir), "reset", "-q", "--hard", "FETCH_HEAD"]).returncode == 0
         )
         clean = subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"]).returncode == 0
@@ -576,7 +582,12 @@ def _fetch_shallow(url: str, dir: Path) -> bool:
 
     shutil.rmtree(dir, ignore_errors=True)
     dir.parent.mkdir(parents=True, exist_ok=True)
-    cloned = subprocess.run(["git", "clone", "-q", "--depth", "1", "--", url, str(dir)]).returncode == 0
+    cloned = (
+        gate_mod.gated_git(
+            ["git", "clone", "-q", "--depth", "1", "--", url, str(dir)], op="clone", target=url
+        ).returncode
+        == 0
+    )
     return (
         cloned and subprocess.run(["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]).returncode == 0
     )
@@ -592,10 +603,92 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
+SHIM_DIR = HERE / "scripts" / "shim"
+_SCRUBBED_TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "CLAIMS_TOKEN")
+
+
+@functools.lru_cache(maxsize=1)
+def _agent_credential_dirs() -> tuple[Path | None, Path | None]:
+    """Once per process (one round): a read-only copy of the operator's gh config (config.yml and
+    hosts.yml only, so `gh auth *` inside the agent has nowhere to persist) and a copy of ~/.gitconfig
+    whose github.com credential helper is the gate's own (`tauceti-gate credential`), so a raw
+    `git push` by absolute path still needs an admission to obtain a token. Design §4."""
+    import shutil
+    import stat
+    import tempfile
+
+    # One directory per worker, rebuilt each round (a round is a process), so nothing accumulates.
+    wid = os.environ.get("TAUCETI_WORKER_ID") or f"pid-{os.getpid()}"
+    root = Path(os.environ.get("TAUCETI_DATA_HOME") or tempfile.gettempdir()) / ".cache" / "tauceti-agent-env"
+    base = root / wid
+    if base.exists():
+        for f in base.rglob("*"):
+            try:
+                f.chmod(stat.S_IRWXU)
+            except OSError:
+                pass
+        shutil.rmtree(base, ignore_errors=True)
+    base.mkdir(parents=True, exist_ok=True)
+    gh_src = Path(os.environ.get("GH_CONFIG_DIR") or Path.home() / ".config" / "gh")
+    gh_dst: Path | None = None
+    if gh_src.is_dir():
+        gh_dst = base / "gh"
+        gh_dst.mkdir()
+        for name in ("config.yml", "hosts.yml"):
+            src = gh_src / name
+            if src.is_file():
+                shutil.copyfile(src, gh_dst / name)
+                (gh_dst / name).chmod(stat.S_IRUSR)
+        gh_dst.chmod(stat.S_IRUSR | stat.S_IXUSR)
+    git_src = Path(os.environ.get("GIT_CONFIG_GLOBAL") or Path.home() / ".gitconfig")
+    git_dst = base / "gitconfig"
+    body = ""
+    if git_src.is_file():
+        try:
+            body = git_src.read_text()
+        except OSError:
+            body = ""
+    body += (
+        "\n# --- appended by the tauceti worker for this round: every github.com credential request goes\n"
+        "# through the fleet gate (tauceti-gate credential), which delegates to gh only when admitted.\n"
+        '[credential "https://github.com"]\n\thelper = \n\thelper = !tauceti-gate credential\n\tuseHttpPath = true\n'
+        '[credential "https://gist.github.com"]\n\thelper = \n\thelper = !tauceti-gate credential\n'
+    )
+    git_dst.write_text(body)
+    git_dst.chmod(stat.S_IRUSR)
+    return gh_dst, git_dst
+
+
+def agent_boundary_env(env: dict) -> dict:
+    """The agent's process environment behind the credential boundary (design §4): the `gh`/`git` shims
+    first on PATH with the real binaries recorded for them, no token variables, and the per-round
+    read-only gh config and gate-helper gitconfig. Applied to every host agent, gate or no gate: the
+    shims refuse the same things either way and only consult the gate when it is configured."""
+    env = dict(env)
+    real_gh = shutil.which("gh") or "gh"
+    real_git = shutil.which("git") or "git"
+    env["PATH"] = f"{SHIM_DIR}:{HERE / 'scripts'}:{env.get('PATH', '')}"
+    env["TAUCETI_REAL_GH"] = real_gh
+    env["TAUCETI_REAL_GIT"] = real_git
+    env["TAUCETI_PYTHON"] = sys.executable  # scripts/tauceti-gate runs the gate CLI with the worker's interpreter
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+    for var in _SCRUBBED_TOKENS:
+        env.pop(var, None)
+    env.pop(gate_mod.TOKEN_ENV, None)  # an admission never crosses into the agent
+    if os.environ.get("TAUCETI_AGENT_ECHO"):
+        return env  # a dry echo never copies credentials around
+    gh_dst, git_dst = _agent_credential_dirs()
+    if gh_dst is not None:
+        env["GH_CONFIG_DIR"] = str(gh_dst)
+    env["GIT_CONFIG_GLOBAL"] = str(git_dst)
+    return env
+
+
 def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
-    """The exact argv + env for the host work agent. HERE is on PATH so the agent
-    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
-    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    """The exact argv + env for the host work agent. The gate's shims and then HERE/scripts lead PATH so
+    the agent resolves gh/git through the shims and git-safe-push / gh-safe-pr-create / claim.sh by
+    name (agent_boundary_env); close_fds=True replaces `9>&-`."""
+    env = agent_boundary_env(os.environ)
     profile = _authoring_profile(profile)
     if profile.provider == "codex":
         # Explicit model/effort flags are authoritative while preserving unrelated operator config

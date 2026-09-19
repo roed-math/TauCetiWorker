@@ -182,11 +182,16 @@ def gate(state: Path, wid: str | None = None, gh_run=None, *, where: str = "star
         from .github import gh_run as real_gh_run
 
         gh_run = real_gh_run
+    from . import gate as gate_mod
+
+    fleet = gate_mod.current()
+    fleet.refuse_if_halted()  # a halt any worker of the fleet recorded stops this one before it spends a read
     check = validate(gh_run)
     want = expected_login()
     if check.halts:
         path = halt_path(state)
         write_halt(path, check)
+        fleet.halt_from_identity(check)  # and the shared store, so every other client is refused too
         os.environ.pop(OK_ENV, None)
         raise Halted(
             f"identity: {check.reason} at {where} ({check.detail or 'no detail'}; credential source "
@@ -210,6 +215,9 @@ def gate(state: Path, wid: str | None = None, gh_run=None, *, where: str = "star
 def refuse_if_halted(state: Path, wid: str | None = None) -> None:
     """A loop does not start over a halt file: the last one stopped for a reason an operator has not yet
     looked at. Raises Halted naming the file and how to clear it."""
+    from . import gate as gate_mod
+
+    gate_mod.current().refuse_if_halted()
     path = halt_path(state)
     record = read_halt(path)
     if record is None and not path.exists():

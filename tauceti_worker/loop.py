@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 
+from . import gate as gate_mod
 from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
 from .constants import (
@@ -173,7 +174,45 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # round spends (REST core and the progress-guard graphql); either being low blocks launch
             # until the later of their resets. The rate_limit probe is itself exempt, so this is free
             # when we are flush.
-            gb = github_budget()
+            # 1a) The fleet gate first, without spending anything: a halt any worker recorded stops this
+            # loop the way its own identity halt would; a cooldown is slept out to its end (no back-off
+            # escalation: the end is known); a store that cannot be read is reported here, locally, and
+            # nothing contacts GitHub until it can be.
+            verdict = gate_mod.current().probe()
+            if verdict.get("state") == gate_mod.HALTED_MANUAL:
+                reason = f"the fleet gate is halted: {verdict.get('reason')} ({verdict.get('detail') or 'no detail'})"
+                log(f"gate: {reason} — stopping the loop; clear it with --clear-halt")
+                report_runtime("halted", detail=reason, phase=None, target=None, next_action_at=None)
+                return EX_HALTED
+            if verdict.get("error"):
+                log(
+                    f"gate: store unreadable ({verdict['error']}) — every remote operation is refused; retrying in {POLL}s"
+                )
+                report_runtime(
+                    "waiting-github", detail=f"gate store: {verdict['error']}", next_action_at=time.time() + POLL
+                )
+                time.sleep(POLL)
+                continue
+            if verdict.get("state") == gate_mod.COOLDOWN:
+                nap = max(1, int(float(verdict.get("until") or 0) - time.time()) + 1)
+                log(f"gate: cooldown ({verdict.get('reason')}) — waiting {nap}s for it to end before launching a round")
+                report_runtime(
+                    "waiting-github", detail=f"gate cooldown: {verdict.get('reason')}", next_action_at=time.time() + nap
+                )
+                time.sleep(nap)
+                continue
+            try:
+                gb = github_budget()
+            except gate_mod.GateRefused as e:
+                if e.reason == gate_mod.R_HALTED:
+                    log(f"gate: {e.message()} — stopping the loop; clear it with --clear-halt")
+                    report_runtime("halted", detail=e.message(), phase=None, target=None, next_action_at=None)
+                    return EX_HALTED
+                nap = max(1, int(e.until - time.time()) + 1) if e.until else POLL
+                log(f"github: {e.message()} — waiting {nap}s before launching a round")
+                report_runtime("waiting-github", detail=e.message(), next_action_at=time.time() + nap)
+                time.sleep(nap)
+                continue
             low = {k: v for k, v in (gb or {}).items() if v[0] < GH_MIN_BUDGET}
             if low:
                 reset = max(v[1] for v in low.values())

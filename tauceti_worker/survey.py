@@ -545,8 +545,23 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
             f"backing off (clear state/progress-err to retry)"
         )
 
+    import os
+
+    from . import gate as gate_mod
+    from .constants import ROADMAP
+
+    adm = gate_mod.admit_or_log("progress-due", ROADMAP, gate_mod.API_READ)
+    if adm is None:
+        return False, "progress due-check not attempted: the fleet gate refused it"
     try:
-        proc = subprocess.run(progress_argv(cfg.state, "due"), capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(
+            progress_argv(cfg.state, "due"),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env={**os.environ, **adm.child_env()},
+        )
+        gate_mod.current().record(adm, gate_mod.Outcome.from_process(proc, ok=proc.returncode in (0, EX_NOPROGRESS)))
         # The verdict is on stdout. stderr carries uvx's build chatter ("Updating ...", "Building
         # ..."), which is not part of the reason and would otherwise fill the dashboard cell.
         out = (proc.stdout or "").strip().splitlines()
@@ -560,6 +575,7 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
             detail = verdict or (err[-1].strip() if err else "")
             due, reason = False, f"progress due-check failed (rc={proc.returncode}): {detail[:200]}"
     except (OSError, subprocess.SubprocessError) as exc:
+        gate_mod.current().record(adm, gate_mod.Outcome(ok=False, text=str(exc)))
         due, reason = False, f"progress due-check could not run: {exc}"
 
     try:

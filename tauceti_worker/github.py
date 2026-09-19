@@ -11,6 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gate as gate_mod
 from .config import Die, log, one_line
 from .constants import (
     _GH_PRIMARY_RE,
@@ -325,7 +326,7 @@ def github_budget() -> dict | None:
     — the two buckets a round spends (REST and the progress-guard GraphQL query). That endpoint is itself
     exempt from the budget, so probing it is free. None on any read failure (caller proceeds rather than
     block on a flaky probe)."""
-    p = run(
+    p = gh_run(
         [
             "gh",
             "api",
@@ -333,8 +334,12 @@ def github_budget() -> dict | None:
             "--jq",
             "{core:[.resources.core.remaining,.resources.core.reset],"
             "graphql:[.resources.graphql.remaining,.resources.graphql.reset]}",
-        ]
+        ],
+        max_wait=0,  # the loop preflight, not this probe, is what waits a gate cooldown out
     )
+    refused = getattr(p, "gate_refused", None)
+    if refused is not None:
+        raise refused  # GateRefused: the preflight sleeps until `until` (or stops, when halted)
     if p.returncode != 0:
         return None
     try:
@@ -358,7 +363,16 @@ def _gh_retry_after(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROUND_WAIT) -> subprocess.CompletedProcess:
+def gh_run(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    max_wait: int = GH_INROUND_WAIT,
+    gate_kind: str | None = None,
+    gate_op: str | None = None,
+    gate_target: str | None = None,
+    weight: int = 1,
+) -> subprocess.CompletedProcess:
     """Run a `gh` command, waiting out a SECONDARY GitHub rate limit IN PLACE and retrying so the limit
     costs a pause, not a discarded round (bounded by max_wait so it can't blow ROUND_TIMEOUT). A PRIMARY
     (hourly) limit is surfaced immediately — waiting an hour inside a round under the 90-min cap would
@@ -366,12 +380,47 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
 
     A TRANSIENT failure of a READ (a 5xx, a truncated body, a dropped connection) is retried a few
     seconds later, up to GH_TRANSIENT_TRIES times. Any other failure is returned unchanged for the
-    caller to handle as before."""
+    caller to handle as before.
+
+    Every dispatch — the first and each retry — is admitted by the fleet gate first and recorded after
+    (retries are requests too, and must not escape accounting). A refused first attempt comes back as
+    a synthetic CompletedProcess: rc 75 and `gate: refused (<reason>)` on stderr, so every caller's
+    existing failure handling applies and none of them retries; the GateRefused itself rides along as
+    `p.gate_refused` for the one caller (the loop preflight) that wants the `until`. A refused retry
+    returns the last real answer. A cooldown whose end fits in `max_wait` is waited out in place, as
+    a secondary limit always was. `gate_kind`/`gate_op`/`gate_target`/`weight` override what
+    gate.classify_gh reads off the argv."""
+    gate = gate_mod.current()
+    c_kind, c_op, c_target = gate_mod.classify_gh(argv)
+    kind_, op, target = gate_kind or c_kind, gate_op or c_op, gate_target or c_target
     waited = 0
     attempt = 0
     tries = 0
+    last: subprocess.CompletedProcess | None = None
     while True:
+        try:
+            adm = gate.admit(op, target, kind_, weight=weight)
+        except gate_mod.GateRefused as e:
+            if last is not None:
+                return last
+            if e.reason in (gate_mod.R_COOLDOWN, gate_mod.R_BUDGET, gate_mod.R_SPACING) and e.until is not None:
+                nap = max(1, int(e.until - time.time()) + 1)
+                if waited + nap <= max_wait:
+                    log(f"gh: {e.message()} — waiting {nap}s for the gate, then retrying ({' '.join(argv[1:3])})")
+                    time.sleep(nap)
+                    waited += nap
+                    continue
+            log(f"gh: {e.message()} ({' '.join(argv[1:3])} {target})")
+            p = gate_mod.refused_process(argv, e)
+            p.gate_refused = e
+            return p
+        t0 = time.monotonic()
         p = run(argv, cwd=cwd)
+        gate.record(
+            adm,
+            gate_mod.Outcome.from_process(p, duration_ms=int((time.monotonic() - t0) * 1000), retry_n=tries + attempt),
+        )
+        last = p
         if p.returncode == 0:
             return p
         text = (p.stderr or "") + "\n" + (p.stdout or "")

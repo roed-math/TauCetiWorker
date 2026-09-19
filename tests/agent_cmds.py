@@ -92,9 +92,18 @@ check(
 )
 check("kiro model is explicit (never Auto)", "auto" in [arg.lower() for arg in a], False)
 
-# PATH must prepend HERE so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
-assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
-print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
+# PATH must lead with the gate's gh/git shims, then HERE/scripts, so the agent resolves gh and git
+# through the shims and git-safe-push / gh-safe-pr-create / claim.sh by name.
+assert env["PATH"].startswith(f"{tc.HERE / 'scripts' / 'shim'}:{tc.HERE / 'scripts'}:"), (
+    "PATH must lead with shim, scripts"
+)
+print("[OK ] PATH leads with the gh/git shims, then the safe-push/claim wrappers")
+# The credential boundary: no token variable crosses into the agent, and the real binaries are recorded
+# for the shims to delegate to.
+for var in ("GH_TOKEN", "GITHUB_TOKEN", "CLAIMS_TOKEN", "TAUCETI_GATE_TOKEN"):
+    assert var not in env, f"{var} must not reach the agent"
+assert env.get("TAUCETI_REAL_GH") and env.get("TAUCETI_REAL_GIT"), "the shims need the real binaries"
+print("[OK ] agent env carries no GitHub token and names the real gh/git for the shims")
 
 # Agent prompts are always passed in argv. In Bubble, an inherited terminal crosses SSH as a non-TTY
 # stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.

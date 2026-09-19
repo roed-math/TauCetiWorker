@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import gate as gate_mod
 from .agents import (
     AuthoringProfile,
     _codex_review_model_override,
@@ -858,6 +859,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             km = _kiro_review_model(reviewers)
+            # The engine's scoreboard + threads are admitted as ONE mutation of weight 1 (design §6:
+            # the engine is passed --no-sync and its own daily cap; reconciliation is _still_actionable).
+            adm = gate_mod.admit_or_log("review", TAUCETI, gate_mod.API_MUTATION)
+            if adm is None:
+                raise NoProgress(f"review #{pr}: the fleet gate refused the review (see the gate log)")
             rc = run_to_logfile(
                 [
                     "uvx",
@@ -883,6 +889,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 logf,
                 f"review #{pr}",
             )
+            gate_mod.current().record(adm, gate_mod.Outcome(ok=rc == 0, text=_log_tail(logf)))
         log(f"  review #{pr}: engine rc={rc}")
         if rc == 0:
             # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
@@ -955,6 +962,18 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             log(f"  review #{pr}: contest claim (👀) failed to release — it will TTL out in {CONTEST_CLAIM_TTL // 60}m")
 
 
+def _log_tail(logf: Path, n: int = 4000) -> str:
+    """The last bytes of an engine log, for the gate's record (gh's HTTP status lines are in there)."""
+    try:
+        with open(logf, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
 def _sync_review_outbox(w: Worker, pr: int) -> int:
     """Drain the worker's review outbox into TauCetiData using the host's gh/git creds. Reviews run
     with --no-sync (a bubble can't push to TauCetiData), so the host publishes here. Returns the
@@ -1000,9 +1019,15 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     # The sync echoes a full `$ …python …/archive.py sync --store … --data-dir …` command line and a
     # "synced N file(s)" line. Capture it so that noise stays out of the main log, surfacing only a
     # one-line summary; keep the detail in a subsidiary file only when the sync FAILS (the diagnosable case).
+    adm = gate_mod.admit_or_log("sync", "TauCetiProject/TauCetiData", gate_mod.GIT_PUSH)
+    if adm is None:
+        return gate_mod.REFUSED_RC
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv).returncode
-    p = subprocess.run(argv, capture_output=True, text=True)
+        rc = subprocess.run(argv, env={**os.environ, **adm.child_env()}).returncode
+        gate_mod.current().record(adm, gate_mod.Outcome(ok=rc == 0))
+        return rc
+    p = subprocess.run(argv, capture_output=True, text=True, env={**os.environ, **adm.child_env()})
+    gate_mod.current().record(adm, gate_mod.Outcome.from_process(p))
     if p.returncode == 0:
         m = re.search(r"synced (\d+) file", (p.stdout or "") + (p.stderr or ""))
         log(f"  review #{pr}: synced {m.group(1) if m else '?'} record(s) to TauCetiData")
@@ -1101,7 +1126,7 @@ def _do_fixlike(
         co = w.cfg.checkout
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
-        chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
+        chk = gh_run(["gh", "pr", "checkout", str(pr), "--force"], cwd=co, gate_op="pr-checkout")
         if chk.returncode:
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
@@ -1281,7 +1306,10 @@ def _do_progress_inner(w, opts) -> int | None:
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
     if (roadmap_dir / ".git").is_dir():
         ok = (
-            subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode == 0
+            gate_mod.gated_git(
+                ["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"], op="fetch", target=ROADMAP
+            ).returncode
+            == 0
             and subprocess.run(
                 ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
             ).returncode
@@ -1292,7 +1320,9 @@ def _do_progress_inner(w, opts) -> int | None:
             raise Die(f"refreshing {roadmap_dir} failed")
     else:
         roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
-        if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
+        if gate_mod.gated_git(
+            ["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)], op="clone", target=ROADMAP
+        ).returncode:
             raise Die(f"cloning {ROADMAP} failed")
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
@@ -1387,6 +1417,10 @@ def _do_progress_inner(w, opts) -> int | None:
 
     # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
     #    resumable, so a retry after an interrupted run converges rather than duplicating.
+    adm = gate_mod.admit_or_log("progress-apply", ROADMAP, gate_mod.API_MUTATION)
+    if adm is None:
+        bust_progress_cache(w.cfg)
+        raise NoProgress("progress: the fleet gate refused the report's publication; it stays due")
     proc = run_tool(
         "apply",
         "--plan",
@@ -1401,6 +1435,7 @@ def _do_progress_inner(w, opts) -> int | None:
         PROGRESS_REF,
         capture=True,
     )
+    gate_mod.current().record(adm, gate_mod.Outcome.from_process(proc, ok=proc.returncode in (0, EX_NOPROGRESS)))
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     # A failure logs its own tail and saves the whole output, so it must be handled BEFORE the
     # excerpt below — otherwise the same text lands in the log twice, once uselessly clipped.
