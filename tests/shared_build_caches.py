@@ -161,6 +161,39 @@ def main():
         # Different filesystems cannot be hardlinked; report nothing rather than silently copying.
         check("a cross-device pair links nothing", build_caches.link_into(private, Path("/proc/self")) == (0, 0))
 
+    # --- the sandbox's shared cache ----------------------------------------------------------------
+    # A bubble round reads `/shared/mathlib-cache`, an overlay whose lower is `<bubble home>/mathlib-cache`
+    # on the host; the worker's private `.cache/mathlib` is not mounted at all. So the pool must be linked
+    # into that lower before the container is opened, or every sandboxed round downloads everything.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        pool = root / "login/.cache/mathlib"
+        pool.mkdir(parents=True)
+        (pool / "theirs.ltar").write_bytes(b"theirs")
+        (pool / "half.ltar.3.part").write_bytes(b"incomplete")
+        data_home = root / "worker-home"
+        cfg = types.SimpleNamespace(data_home=data_home, wid="w1", state=root / "state")
+        env = tc.agents.os.environ
+        saved = {k: env.get(k) for k in ("TAUCETI_MATHLIB_POOL", "TAUCETI_BUBBLE_HOME", "MATHLIB_CACHE_DIR", "XDG_CACHE_HOME")}
+        messages = []
+        original_log, tc.agents.log = tc.agents.log, messages.append
+        try:
+            env["TAUCETI_MATHLIB_POOL"] = str(pool)
+            env.pop("TAUCETI_BUBBLE_HOME", None)
+            env["MATHLIB_CACHE_DIR"] = str(data_home / ".cache" / "mathlib")  # the per-worker redirect, as in a round
+            lower = tc.agents.bubble_home(cfg) / "mathlib-cache"
+            n = tc.agents.hydrate_bubble_mathlib_cache(tc.agents.bubble_home(cfg))
+            check("the pool is linked into bubble's shared-cache lower", (lower / "theirs.ltar").exists())
+            check("by hardlink", (lower / "theirs.ltar").stat().st_ino == (pool / "theirs.ltar").stat().st_ino)
+            check("a download in flight is never linked", not (lower / "half.ltar.3.part").exists())
+            check("the count is returned and logged", n == 1 and any("bubble's shared cache" in m for m in messages))
+            check("the per-worker MATHLIB_CACHE_DIR does not redirect the pool", not (data_home / ".cache" / "mathlib").exists())
+            check("a repeated hydration is a no-op", tc.agents.hydrate_bubble_mathlib_cache(lower.parent) == 0)
+        finally:
+            tc.agents.log = original_log
+            for k, v in saved.items():
+                env.pop(k, None) if v is None else env.__setitem__(k, v)
+
     # --- Lake artifact cache lifetime --------------------------------------------------------------
     # Canonical main's toolchain pin, not a transient PR checkout, is the generation boundary.  The
     # first observation is deliberately non-destructive; only a later change clears the owned store.

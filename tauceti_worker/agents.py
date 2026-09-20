@@ -471,6 +471,32 @@ def sync_mathlib_pool(cfg: Config) -> None:
         log(f"mathlib cache pool: promoted {promoted}, hydrated {hydrated} ({pool})")
 
 
+def hydrate_bubble_mathlib_cache(home: Path) -> int:
+    """Give bubble's shared Mathlib cache a link to everything the machine pool holds.
+
+    In the sandbox the container's `MATHLIB_CACHE_DIR` is `/shared/mathlib-cache`, an overlay whose
+    read-only lower is `<bubble home>/mathlib-cache` on the host, not the worker's own `.cache/mathlib`
+    that `sync_mathlib_pool` fills. Without this the pool never reaches a sandboxed round: every one
+    starts with an empty lower and downloads all ~8,700 `.ltar`s through bubble's proxy again, and the
+    overlay upper (where those downloads land) is discarded with the container, so nothing is kept for
+    the next round either. Hydrate-only: the container's writes never reach the lower, so there is
+    nothing to promote back; the pool is filled by the operator's `lake exe cache get` (or the fleet's
+    warm-pool). Best effort like the private-cache sync; an existing name is never redefined.
+    *home* is the bubble home the round will open under (what `ensure_bubble_home` resolved)."""
+    lower = home / "mathlib-cache"
+    pool = build_caches.mathlib_pool(_host_home(), {k: v for k, v in os.environ.items() if k != "MATHLIB_CACHE_DIR"})
+    if lower.resolve() == pool.resolve():
+        return 0
+    try:
+        hydrated, _ = build_caches.hydrate_only(pool, lower)
+    except OSError as e:
+        log(f"mathlib cache pool: bubble hydration skipped ({e})")
+        return 0
+    if hydrated:
+        log(f"mathlib cache pool: hydrated {hydrated} into bubble's shared cache ({lower})")
+    return hydrated
+
+
 def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
     """Drop this worker's owned Lake artifact store when canonical main changes toolchains.
 
@@ -1527,6 +1553,9 @@ def run_in_bubble(
     # replace it in this subprocess env with a private, transient Keychain handoff below; the process-wide
     # value and any operator-owned credential file remain untouched.
     env = ensure_bubble_home(cfg)
+    # Before the container exists: the lower directory is quiescent only between rounds.
+    if env.get("BUBBLE_HOME"):
+        hydrate_bubble_mathlib_cache(Path(env["BUBBLE_HOME"]))
     rounddir = cfg.state / "bubble-round"
 
     shutil.rmtree(rounddir, ignore_errors=True)
