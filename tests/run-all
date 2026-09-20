@@ -5,7 +5,7 @@
 # This runner knows how each one wants to be invoked, and which one to skip in a plain CI box:
 #   - most are stdlib-only         -> `uv run python <file>`
 #   - gate_t*.py are the GitHub-gate acceptance tests (docs/gate.md); they use tests/fakes and never
-#     touch the network, and must run with CLAIM_REPO unset (`env -u CLAIM_REPO tests/run-all`)
+#     touch the network; operator fleet variables (CLAIM_REPO, TAUCETI_PACE, ...) are scrubbed below
 #   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
 #   - dashboard has a PEP 723 header (rich/textual)      -> `uv run --script`
 #   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
@@ -158,6 +158,19 @@ if ((${#unclassified[@]})); then
   printf '  - %s\n' "${unclassified[@]}" >&2
   exit 2
 fi
+
+# --- hermetic environment -------------------------------------------------------------------------
+# An operator's login shell exports fleet settings (a pace curve, a claim namespace, a pinned login,
+# the gate store, roadmap steering). The worker reads every one of them live from the environment,
+# so a test that pins a default (quota_loop_refresh.py pins the default pace curve) fails under a
+# profile that overrides it. Scrub them once here; every test below inherits the clean environment.
+for v in TAUCETI_PACE CLAIM_REPO TAUCETI_EXPECT_LOGIN TAUCETI_GATE_DIR TAUCETI_GATE_REQUIRED \
+         TAUCETI_GATE_MUTATIONS_PER_HOUR TAUCETI_GATE_READS_PER_HOUR TAUCETI_ROADMAP_ONLY \
+         TAUCETI_ROADMAP_SKIP TAUCETI_ROADMAP_TARGETS TAUCETI_AUTO_REFRESH TAUCETI_CLAUDE_WARM \
+         TAUCETI_AGENT TAUCETI_PR TAUCETI_ACCOUNT TAUCETI_WORKER_ID TAUCETI_BUBBLE_HOME \
+         TAUCETI_REACTIONS TAUCETI_STUCK_ISSUES GH_TOKEN GITHUB_TOKEN; do
+  unset "$v"
+done
 
 # --- run ------------------------------------------------------------------------------------------
 for t in "${RUN_STDLIB[@]}"; do
