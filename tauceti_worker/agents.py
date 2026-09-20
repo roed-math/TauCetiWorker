@@ -1634,6 +1634,7 @@ def run_in_bubble(
     # the container (provider-neutral: covers codex too, and the unpaced review / probe paths that never
     # call the pacer). No-op when not isolated or on macOS.
     mirror_creds(cfg)
+    _open_mirrors_to_container(cfg)
     # That re-mirror is the LAST thing to touch the credential before bubble seeds the container, so it
     # can hand the container an account rotated in since the round's earlier --account checks. Re-check
     # against what bubble is about to receive; this is the final gate before the container spends.
@@ -1687,6 +1688,29 @@ def _kiro_review_model(reviewers: str) -> str | None:
     configured = (os.environ.get("TAUCETI_REVIEW_KIRO_MODEL") or "").strip()
     model = configured or AUTHORING_DEFAULTS["kiro"][0]
     return _validate_kiro_model_pin(model, "$TAUCETI_REVIEW_KIRO_MODEL" if configured else "repository default")
+
+
+def _open_mirrors_to_container(cfg: Config) -> None:
+    """Make the worker's credential MIRRORS readable from inside the bubble on a native Incus host.
+
+    Bubble bind-mounts them read-only at /home/user/.codex/auth.json and /home/user/.claude/
+    .credentials.json, where the engine and the agent run as `user` (uid 1000). The mirrors are
+    written 0600 by the operator's uid, which the container cannot read under its own uid map, so
+    the review engine died on \`shutil.copyfile('/home/user/.codex/auth.json')\` with
+    PermissionError. These files are the access-token-only copies in this worker's private home
+    (never the operator's originals, which keep the single-use refresh token), and the mount is into
+    this worker's own container, so 0644 widens them to nobody who could not already reach the home.
+    Linux only: Colima on macOS maps the operator to the container user."""
+    if sys.platform == "darwin":
+        return
+    from .quota import claude_dir, codex_dir
+
+    for f in (codex_dir(cfg.home) / "auth.json", claude_dir(cfg.home) / ".credentials.json"):
+        try:
+            if f.is_file():
+                os.chmod(f, 0o644)
+        except OSError:
+            pass
 
 
 def _open_store_to_container(store: Path) -> None:
