@@ -1276,6 +1276,28 @@ def ensure_bubble_home(cfg: Config) -> dict:
                 "could not configure Bubble's shared-cache overlay; refusing to expose persistent "
                 f"writable Lean caches to the agent. Bubble said: {detail}"
             )
+
+    # No editor in a worker image. Bubble installs its default editor (VS Code) into every image
+    # unless the private home's config says `tools.vscode = "no"`; a worker never opens an editor,
+    # the install is the slowest tool step, and bubble <= 0.7.31 cannot even complete it on a bare
+    # base image (its extension unpacker needs `unzip`, which only the later Lean step installs;
+    # kim-em/bubble#340). Best effort: an older bubble without `tools set` just keeps its default.
+    def editor_disabled() -> bool:
+        try:
+            with open(home / "config.toml", "rb") as f:
+                return tomllib.load(f).get("tools", {}).get("vscode") == "no"
+        except (OSError, tomllib.TOMLDecodeError):
+            return False
+
+    if not editor_disabled():
+        try:
+            p = subprocess.run(
+                [*bubble_cmd(), "tools", "set", "vscode", "no"], env=env, capture_output=True, text=True, timeout=180
+            )
+            if p.returncode != 0 or not editor_disabled():
+                log("bubble: could not disable the VS Code tool in the worker's private home; the image will carry it")
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"bubble: could not disable the VS Code tool ({e}); the image will carry it")
     return env
 
 

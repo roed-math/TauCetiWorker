@@ -175,10 +175,26 @@ try:
     check("failed overlay configuration blocks the round", blocked)
     check("failed overlay configuration writes no trust sentinel", not (cache_home / ".worker-init").exists())
 
+    # Overlay set but no editor setting: exactly one `tools set vscode no` call, which persists it.
     (cache_home / "config.toml").write_text('[security]\nshared_cache = "overlay"\n')
+    setter = shimdir / "bubble-tools-set"
+    setter.write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "$BUBBLE_HOME/tools-calls"\n'
+        '[ "$1 $2 $3 $4" = "tools set vscode no" ] && printf \'[security]\\nshared_cache = "overlay"\\n[tools]\\nvscode = "no"\\n\' > "$BUBBLE_HOME/config.toml"\n'
+        "exit 0\n"
+    )
+    setter.chmod(0o755)
+    tc.agents.bubble_cmd = lambda: [str(setter)]
+    env = tc.ensure_bubble_home(cache_cfg)
+    tools_calls = (cache_home / "tools-calls").read_text().splitlines() if (cache_home / "tools-calls").exists() else []
+    check("editor tool is disabled in the private home with one bubble call", tools_calls == ["tools set vscode no"])
+    check("verified overlay configuration is accepted directly", env["BUBBLE_HOME"] == str(cache_home))
+
+    # Fully configured home: no bubble subprocess at all.
     tc.agents.bubble_cmd = lambda: (_ for _ in ()).throw(AssertionError("unexpected Bubble subprocess"))
     env = tc.ensure_bubble_home(cache_cfg)
-    check("verified overlay configuration is accepted directly", env["BUBBLE_HOME"] == str(cache_home))
+    check("fully configured home makes no bubble call", env["BUBBLE_HOME"] == str(cache_home))
 finally:
     tc.agents.bubble_cmd = saved_bubble_cmd
     if old_bubble_home is None:
