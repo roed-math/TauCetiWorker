@@ -177,7 +177,7 @@ try:
 
     # Overlay set but no editor setting: exactly one `tools set vscode no` call, which persists it.
     (cache_home / "config.toml").write_text('[security]\nshared_cache = "overlay"\n')
-    setter = shimdir / "bubble-tools-set"
+    setter = cache_home.parent / "bubble-tools-set"  # shimdir is gone by now; cache_home's parent is live
     setter.write_text(
         "#!/bin/sh\n"
         'echo "$@" >> "$BUBBLE_HOME/tools-calls"\n'
