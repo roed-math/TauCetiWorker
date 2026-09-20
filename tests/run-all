@@ -76,6 +76,7 @@ RUN_STDLIB=(
   mirror_creds_macos.py
   no_unattended_auth.py
   oauth_refresh_loop.py
+  oauth_user_agent.py
   open_pr_pages.py
   pace_curve.py
   pr_targeting.py
