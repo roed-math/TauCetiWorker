@@ -1689,6 +1689,27 @@ def _kiro_review_model(reviewers: str) -> str | None:
     return _validate_kiro_model_pin(model, "$TAUCETI_REVIEW_KIRO_MODEL" if configured else "repository default")
 
 
+def _open_store_to_container(store: Path) -> None:
+    """Make the review store writable from inside the bubble on a native Incus host.
+
+    The store is bind-mounted read-write into the container, where the engine runs as bubble's
+    `user` (uid 1000). Under native Incus the host directory keeps its numeric owner (the operator's
+    uid, after idmap shifting) or maps to nobody (without it); either way uid 1000 cannot create
+    `/opt/review-store/reviews/<pr>/...` and the engine dies with PermissionError. Colima on macOS
+    maps the operator to the container user, which is why this never showed there. The store lives
+    in this worker's private state and is mounted only into this worker's own container, so opening
+    it to any uid changes nothing about who can reach it. Files the engine writes come back owned by
+    uid 1000; the host worker only reads them and removes them from directories it owns."""
+    if sys.platform == "darwin":
+        return
+    for root, dirs, _files in os.walk(store):
+        for d in (root, *[os.path.join(root, x) for x in dirs]):
+            try:
+                os.chmod(d, 0o777)
+            except OSError:
+                pass
+
+
 def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
@@ -1716,6 +1737,7 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
         raise Die(f"fetch {ROADMAP} failed")
     store = cfg.store_dir
     store.mkdir(parents=True, exist_ok=True)
+    _open_store_to_container(store)
     mounts = [f"{engine_dir}:/opt/engine:ro", f"{roadmap_dir}:/opt/roadmap:ro", f"{store}:/opt/review-store:rw"]
     # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview). --no-mathlib for now; wiring
     # --mathlib-dir at the bubble's vendored .lake/packages/mathlib is the reuse-rubric refinement.
