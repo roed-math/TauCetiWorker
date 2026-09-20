@@ -1696,7 +1696,7 @@ def _open_mirrors_to_container(cfg: Config) -> None:
     Bubble bind-mounts them read-only at /home/user/.codex/auth.json and /home/user/.claude/
     .credentials.json, where the engine and the agent run as `user` (uid 1000). The mirrors are
     written 0600 by the operator's uid, which the container cannot read under its own uid map, so
-    the review engine died on \`shutil.copyfile('/home/user/.codex/auth.json')\` with
+    the review engine died copying /home/user/.codex/auth.json with
     PermissionError. These files are the access-token-only copies in this worker's private home
     (never the operator's originals, which keep the single-use refresh token), and the mount is into
     this worker's own container, so 0644 widens them to nobody who could not already reach the home.
