@@ -552,6 +552,41 @@ def list_all() -> list[Publication]:
     return out
 
 
+ARCHIVE = "archive"
+
+
+def prune_interrupted() -> list[str]:
+    """Archive parked-`interrupted` publications that never got as far as a remote effect.
+
+    A round that opens a publication and then fails before its first send (a build that broke, a
+    download that hit the round cap) leaves a ledger entry with every step still `pending`; the next
+    reconcile parks it `interrupted` and nothing ever resumes it. Such an entry records no remote
+    state to reconcile against, so it is only clutter in `status`. It is moved under
+    `publications/archive/`, never deleted: the ledger stays complete. Anything with a step that was
+    attempted (done or uncertain) is kept — that is what the ledger exists for."""
+    d = publications_dir()
+    if d is None:
+        return []
+    moved: list[str] = []
+    for p in list_all():
+        if p.parked != INTERRUPTED or p.complete:
+            continue
+        if any(s["state"] != PENDING for s in p.steps):
+            continue
+        try:
+            (d / ARCHIVE).mkdir(parents=True, exist_ok=True)
+            os.replace(p.path, d / ARCHIVE / p.path.name)
+        except OSError:
+            continue
+        moved.append(p.id)
+    if moved:
+        gate_mod.current()._event(
+            decision="publication", op="prune", target="-", kind="-", op_id="-",
+            detail=f"archived {len(moved)} interrupted publication(s) with no attempted step",
+        )
+    return moved
+
+
 def queue_summary() -> dict:
     """What `status`/`report` print: open (in-progress) publications, and the parked ones by reason."""
     pubs = list_all()

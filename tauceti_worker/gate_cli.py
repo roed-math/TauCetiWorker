@@ -436,6 +436,10 @@ def cmd_publication(args) -> int:
         for pub in pub_mod.list_all():
             print(pub.summary())
         return 0
+    if args.action == "prune":
+        moved = pub_mod.prune_interrupted()
+        print(f"archived {len(moved)} interrupted publication(s) with no attempted step")
+        return 0
     pub = pub_mod.Publication.load(args.id)
     if args.action == "show":
         print(json.dumps(dataclasses_asdict(pub), indent=2, sort_keys=True))
@@ -561,7 +565,7 @@ def build_parser(prog: str = "tauceti-gate") -> argparse.ArgumentParser:
     c.add_argument("action", choices=["get", "store", "erase"])
     c.set_defaults(fn=cmd_credential)
     pb = sub.add_parser("publication", help="the publication ledger (design §6)")
-    pb.add_argument("action", choices=["create", "begin", "end", "show", "list"])
+    pb.add_argument("action", choices=["create", "begin", "end", "show", "list", "prune"])
     pb.add_argument("id", nargs="?", default=None)
     pb.add_argument("step", nargs="?", default=None)
     pb.add_argument("status", nargs="?", default=None, choices=[None, "ok", "fail"])
