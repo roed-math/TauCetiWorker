@@ -102,6 +102,7 @@ RUN_STDLIB=(
   roadmap_backpressure.py
   roadmap_claims.py
   roadmap_targets.py
+  round_done_hook.py
   round_file_changes.py
   round_group_sweep.py
   rubric_bundle.py

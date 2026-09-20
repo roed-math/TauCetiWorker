@@ -336,6 +336,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         raise NoProgress(f"{why} — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.status_label_line()}")
+    # Leave the backlog figures in this worker's status file: a fleet reconciler (gq2-fleet) sizes
+    # fix workers and switches authors on or off from them without a GitHub read of its own.
+    report_runtime(mine_open=sv.n_mine_open, mine_awaiting_author=sv.mine_awaiting_author(), survey_at=time.time())
     # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named
     # PR, and pr_focus_reason repeats the ones that apply to a target anyway, so leaving them
     # unfiltered would bury the operator's answer under a report about PRs they did not ask about.

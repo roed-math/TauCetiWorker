@@ -3,6 +3,7 @@ timeout, then settle (short pause if productive, escalating back-off otherwise).
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -62,6 +63,30 @@ def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
     old = quota_line({"claude": prov}, markup=markup)
     new = f"claude {_glyph('~', 'yellow', markup)} ({why})"
     return line.replace(old, new, 1)
+
+
+def _round_done_hook(rc: int, wid: str) -> None:
+    """Run $TAUCETI_ROUND_DONE_CMD after every round, productive or not, with the round's exit code
+    and worker id in its environment. A fleet reconciler hangs off this: a finished round is the
+    moment the backlog changed from our side. Bounded and best-effort: a hook that fails or hangs
+    is logged and never turns a round into a failure or delays the loop by more than its timeout."""
+    cmd = os.environ.get("TAUCETI_ROUND_DONE_CMD", "").strip()
+    if not cmd:
+        return
+    import shlex
+
+    try:
+        p = subprocess.run(
+            shlex.split(cmd),
+            env={**os.environ, "TAUCETI_ROUND_RC": str(rc), "TAUCETI_ROUND_WID": wid},
+            capture_output=True,
+            text=True,
+            timeout=int(os.environ.get("TAUCETI_ROUND_DONE_TIMEOUT", "180")),
+        )
+        if p.returncode != 0:
+            log(f"round-done hook exited {p.returncode}: {(p.stderr or p.stdout).strip()[-200:]}")
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        log(f"round-done hook failed: {e}")
 
 
 def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, ...] = ()) -> int:
@@ -269,6 +294,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 tail += ["--source", source]
             report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
             rc = run_round_subprocess(tail)
+            _round_done_hook(rc, cfg.wid)
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off. A
             # HALT is neither: the round's identity gate found a credential no retry fixes (or the wrong
