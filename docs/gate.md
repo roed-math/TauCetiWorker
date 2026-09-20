@@ -166,6 +166,7 @@ All durations in seconds, all counts per rolling window. "Scope" says who reads 
 | `TAUCETI_GATE_MUTATIONS_PER_HOUR` | **none — owner decision** (design §9 proposes 40) | worker, CLI | Rolling hourly cap on `api_mutation`. Unset: every mutation is refused `unconfigured`. |
 | `TAUCETI_GATE_READS_PER_HOUR` | **none — owner decision** (design §9 proposes 600) | worker, CLI | Rolling hourly cap on `api_read`. Unset: every read is refused `unconfigured`. |
 | `TAUCETI_GATE_MUTATIONS_PER_MINUTE` | `20` | worker, CLI | Rolling per-minute cap on mutations. |
+| `TAUCETI_GATE_READS_PER_MINUTE` | `100` | worker, CLI | Rolling per-minute cap on API reads; a cold survey (~210 per-PR reads) spreads over about two minutes instead of bursting in one. |
 | `TAUCETI_GATE_MUTATION_SPACING` | `5` | worker, CLI | Minimum gap between two mutations (brief §4.3). |
 | `TAUCETI_GATE_READS_RESERVE` | `200` | worker, CLI | Part of the hourly reads cap only the reserved ops (`preflight`, `reconcile`, `rate_limit`) may consume. |
 | `TAUCETI_GATE_PUSHES_PER_MINUTE` / `_PER_HOUR` | `4` / `60` | worker, CLI | Per-repository push caps (GitHub's guidance is 6/min/repo; the claims namespace is shared). |

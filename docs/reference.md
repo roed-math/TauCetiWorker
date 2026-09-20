@@ -360,6 +360,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GATE_DIR` | _(unset = no gate)_ | The fleet GitHub gate's store directory (one per account; the fleet wrapper sets it). Every `gh` call, git fetch/push, claim, review and progress run is admitted there first and recorded after. See [the GitHub gate](gate.md). |
 | `TAUCETI_GATE_REQUIRED` | _(unset)_ | `1` makes a missing `TAUCETI_GATE_DIR` a hard error instead of the no-op gate. Set it wherever the gate is meant to be in force. |
 | `TAUCETI_GATE_MUTATIONS_PER_HOUR` / `TAUCETI_GATE_READS_PER_HOUR` | **none** | Rolling hourly caps on API mutations and reads. They have no default on purpose: unset, the gate refuses every mutation/read as `unconfigured`. The design proposes 40 / 600 for the pilot, pending the owner's decision. |
+| `TAUCETI_GATE_READS_PER_MINUTE` | `100` | Rolling per-minute cap on API reads (a cold survey is ~210 reads; this spreads it over ~2 min). |
 | `TAUCETI_GATE_MUTATIONS_PER_MINUTE` / `TAUCETI_GATE_MUTATION_SPACING` | `20` / `5` | Per-minute mutation cap and the minimum seconds between two mutations. |
 | `TAUCETI_GATE_PUSHES_PER_MINUTE` / `TAUCETI_GATE_PUSHES_PER_HOUR` | `4` / `60` | Git push caps, per repository. |
 | `TAUCETI_GATE_GIT_READS_PER_HOUR` / `TAUCETI_GATE_READS_RESERVE` | `300` / `200` | Hourly git-read cap; the slice of the reads cap only publication preflight may use. |

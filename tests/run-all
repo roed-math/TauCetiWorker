@@ -41,6 +41,7 @@ RUN_STDLIB=(
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
+  gate_reads_per_minute.py
   gate_t01_shared_allowance.py
   gate_t02_credential_halt.py
   gate_t03_canonical_claim.py

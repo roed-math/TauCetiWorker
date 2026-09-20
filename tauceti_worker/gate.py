@@ -127,6 +127,7 @@ class GateConfig:
     mutations_per_hour: int | None
     reads_per_hour: int | None
     mutations_per_minute: int = 20
+    reads_per_minute: int = 100  # a cold survey is ~210 per-PR reads; spread it over ~2 min, not 1
     mutation_spacing: int = 5
     reads_reserve: int = 200
     pushes_per_minute: int = 4
@@ -149,6 +150,7 @@ class GateConfig:
             mutations_per_hour=_env_int("TAUCETI_GATE_MUTATIONS_PER_HOUR", None),
             reads_per_hour=_env_int("TAUCETI_GATE_READS_PER_HOUR", None),
             mutations_per_minute=_env_int("TAUCETI_GATE_MUTATIONS_PER_MINUTE", d["mutations_per_minute"].default),
+            reads_per_minute=_env_int("TAUCETI_GATE_READS_PER_MINUTE", d["reads_per_minute"].default),
             mutation_spacing=_env_int("TAUCETI_GATE_MUTATION_SPACING", d["mutation_spacing"].default),
             reads_reserve=_env_int("TAUCETI_GATE_READS_RESERVE", d["reads_reserve"].default),
             pushes_per_minute=_env_int("TAUCETI_GATE_PUSHES_PER_MINUTE", d["pushes_per_minute"].default),
@@ -631,6 +633,7 @@ class Gate:
                 if (reserved or op in RESERVED_OPS)
                 else max(0, cfg.reads_per_hour - cfg.reads_reserve)
             )
+            self._check_window(b, op, target, kind, API_READ, 60, cfg.reads_per_minute, weight, now)
             self._check_window(b, op, target, kind, API_READ, 3600, cap_h, weight, now)
         elif kind == GIT_PUSH:
             wkey = f"{GIT_PUSH}:{normalize_repo(target)}"
@@ -1037,6 +1040,8 @@ class Gate:
                         "cap_hour": cfg.mutations_per_hour,
                     },
                     "api_read": {
+                        "minute": self._count(b, API_READ, 60, now),
+                        "cap_minute": cfg.reads_per_minute,
                         "hour": self._count(b, API_READ, 3600, now),
                         "cap_hour": cfg.reads_per_hour,
                         "reserve": cfg.reads_reserve,
