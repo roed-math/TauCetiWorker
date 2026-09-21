@@ -851,7 +851,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment). Most often another worker pushed the branch first (safe-push declines rather "
             f"than clobber) or the agent declined to act — not a failure. Transcript: {w.cfg.logdir}"
-            + (f"; the agent's account is recorded at {inc}" if inc else "")
+            + (f"; the agent's account is recorded at {inc}" if inc else ""),
+            declined=inc is not None,
         )
     return rc
 

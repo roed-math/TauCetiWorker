@@ -25,6 +25,7 @@ RUN_STDLIB=(
   agent_transcript.py
   declined_round.py
   declined_suppression.py
+  declined_backoff.py
   auto_stage_priority.py
   authoring_profiles.py
   bubble_cache.py

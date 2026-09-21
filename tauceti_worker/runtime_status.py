@@ -79,11 +79,17 @@ def runtime_snapshot() -> dict:
     return read_json(Path(raw)) if raw else {}
 
 
-def report_failure(reason: str, *, code: int | None = None, log_file: Path | str | None = None) -> None:
-    """Publish a concise, structured failure for the supervising loop and human status views."""
+def report_failure(
+    reason: str, *, code: int | None = None, log_file: Path | str | None = None, declined: bool = False
+) -> None:
+    """Publish a concise, structured failure for the supervising loop and human status views.
+    `declined` marks a no-progress round whose agent completed and chose not to act (see
+    NoProgress); it is written on EVERY failure report, so a stale True never outlives the round
+    that set it."""
     clean = _RICH_STYLE_RE.sub("", str(reason)).strip()
     report_runtime(
         failure_reason=clean[-1000:] or "unknown failure",
         failure_code=code,
         failure_log=str(log_file) if log_file is not None else None,
+        declined=bool(declined),
     )

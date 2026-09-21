@@ -1237,7 +1237,7 @@ def cli_main() -> int:
         return 1
     except NoProgress as e:
         log(str(e))
-        report_failure(str(e), code=EX_NOPROGRESS)
+        report_failure(str(e), code=EX_NOPROGRESS, declined=getattr(e, "declined", False))
         return EX_NOPROGRESS
     except Halted as e:
         log(str(e))

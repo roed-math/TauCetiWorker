@@ -312,6 +312,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     "idle", detail="round completed", phase=None, target=None, next_action_at=time.time() + INTERROUND
                 )
                 time.sleep(INTERROUND)
+            elif rc == EX_NOPROGRESS and runtime_snapshot().get("declined"):
+                # The agent finished and chose not to act, and said why (a `declined` incident the
+                # owner sees). That is a verdict, not a stall: the survey skips that PR at that head
+                # from now on, so there is nothing to wait out. The streak is left where it was — a
+                # decline neither earns a longer backoff nor forgives an earlier real stall.
+                failed = runtime_snapshot()
+                reason = str(failed.get("failure_reason") or "the agent declined to act")
+                log(f"round declined (verdict recorded); no-progress streak stays {streak} — pausing {INTERROUND}s")
+                report_runtime("idle", detail=reason, phase=None, target=None, next_action_at=time.time() + INTERROUND)
+                time.sleep(INTERROUND)
             else:
                 streak += 1
                 nap = min(BACKOFF_BASE * (1 << min(streak, 5)), BACKOFF_MAX)

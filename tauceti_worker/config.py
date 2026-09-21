@@ -259,4 +259,13 @@ class Die(Exception):
 
 
 class NoProgress(Exception):
-    """Round did no productive work → exit EX_NOPROGRESS (75)."""
+    """Round did no productive work → exit EX_NOPROGRESS (75).
+
+    `declined`: the agent ran to completion and chose not to act, and that verdict is on record as a
+    `declined` incident. The loop treats it as a finished judgement (short pause) rather than a stall
+    (escalating backoff): the survey already skips that PR at that head, so there is nothing to wait
+    out, and a run of subsumed PRs must not park a worker for the backoff cap after each one."""
+
+    def __init__(self, message: str = "", *, declined: bool = False):
+        super().__init__(message)
+        self.declined = declined
