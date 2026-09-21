@@ -1537,6 +1537,23 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
 BUBBLE_ROUND_SCRIPTS = ("git-safe-push", "gh-safe-pr-create", "claim.sh", "gate-lib.sh", "tauceti-gate")
 
 
+def pooled_toolchain_mounts() -> list[str]:
+    """`--mount` specs giving the container every Lean toolchain the host pool holds, read-only, at
+    elan's own path. Bubble builds its image for the toolchain the PR HEAD pins, but a rebase merges
+    main, and when main has bumped `lean-toolchain` the build then needs a toolchain the image lacks
+    and the sandbox cannot download (egress denied: 2026-09-21, two green reconciliations were lost
+    to "v4.34.0-rc2 (not installed)"). The pool on the host already has it. Elan resolves a
+    read-only mounted toolchain directory like an installed one (probed on a live container: `elan
+    show` lists it, `lean` runs from it). A toolchain the image already has is shadowed by the same
+    content. Only complete installs (a `bin/lean`) are offered; a half-written one is not."""
+    pool = build_caches.elan_pool(_host_home(), os.environ) / "toolchains"
+    try:
+        names = sorted(d.name for d in pool.iterdir() if d.is_dir() and (d / "bin" / "lean").is_file())
+    except OSError:
+        return []
+    return [f"{pool / n}:/home/user/.elan/toolchains/{n}:ro" for n in names]
+
+
 def run_in_bubble(
     w: Worker,
     target: str,
@@ -1590,6 +1607,8 @@ def run_in_bubble(
 
     mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
     for m in mounts or []:
+        mount_flags += ["--mount", m]
+    for m in pooled_toolchain_mounts():  # main's toolchain after a merge, without network
         mount_flags += ["--mount", m]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the

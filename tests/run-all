@@ -27,6 +27,7 @@ RUN_STDLIB=(
   declined_suppression.py
   declined_backoff.py
   bubble_round_scripts.py
+  bubble_toolchain_mounts.py
   auto_stage_priority.py
   authoring_profiles.py
   bubble_cache.py
