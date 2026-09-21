@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
 
+from .attention import declined_at
 from .config import Config, log, roadmap_only, roadmap_skip
 from .constants import (
     AUTO_STAGES,
@@ -656,6 +657,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
     #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
     #    is rebased until it merges or CI retires it.
+    # A round that already declined a PR at its current head (main subsumes it, obsolete, …) is on
+    # record fleet-wide (attention.declined_at); re-running it at the same head only re-derives the
+    # verdict at the cost of a round, so those are suppressed until the head moves.
+    declined = {stage: declined_at(stage) for stage in ("rebase", "fix", "fix-ci")}
     for p in tended:
         labels = {label.lower() for label in p.labels}
         if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
@@ -670,6 +675,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         c = Candidate(p.number, p.head_oid, reason)
         c.attempts = counters.read(f"rebase-pr-{p.number}")
         c.budget = MAX_REBASE_ATTEMPTS
+        if (p.number, p.head_oid) in declined["rebase"]:
+            c.reason = "declined at this head (see the attention list); waits for a new head"
+            sv.rebaseable.suppressed.append(c)
+            continue
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
@@ -788,6 +797,8 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
             )
             if disp == "skip":
                 continue
+            if disp == "actionable" and (p.number, p.head_oid) in declined["fix"]:
+                disp, why = "exhausted", "a fixer declined at this head (see the attention list); waits for a new head"
             if disp == "actionable":
                 c = Candidate(
                     p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
@@ -811,7 +822,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"ci-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS
-        if per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
+        if (p.number, p.head_oid) in declined["fix-ci"]:
+            c.reason = "declined at this head (see the attention list); waits for a new head"
+            sv.red_ci.suppressed.append(c)
+        elif per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
             sv.red_ci.suppressed.append(c)
         else:
             sv.red_ci.actionable.append(c)

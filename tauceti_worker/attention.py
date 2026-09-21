@@ -16,10 +16,12 @@ decline is the owner's decision, not the worker's.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
 
+from . import interaction
 from .interaction import record_incident
 
 DECLINED = "declined"
@@ -114,3 +116,27 @@ def record_declined_round(logdir: Path, *, stage: str, pr: int | None, head: str
         )
     except Exception:  # noqa: BLE001 - reporting must never turn into a second failure
         return None
+
+
+def declined_at(stage: str) -> set[tuple[int, str]]:
+    """(pr, head) pairs a `stage` round has already declined, acknowledged or not. A decline is a
+    fact about that exact head: until the PR moves, every worker that picks it up again spends a
+    round and a model turn to reach the same conclusion (2026-09-21: fix3 and then fix2 rebased
+    #4928 three minutes apart, both declining). The survey suppresses these; a new head lifts it.
+    Acknowledged incidents count too — the owner's ack means "seen", not "try again"."""
+    out: set[tuple[int, str]] = set()
+    d = interaction.incidents_dir()  # via the module, so a test can point it elsewhere
+    for folder in (d, d / "acked"):
+        try:
+            paths = list(folder.glob(f"{DECLINED}-{stage}-*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                rec = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            pr, head = rec.get("pr"), rec.get("head")
+            if isinstance(pr, int) and isinstance(head, str) and head:
+                out.add((pr, head))
+    return out
