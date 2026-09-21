@@ -57,7 +57,13 @@ CLAUDE_BOOTSTRAP_TIMEOUT_S = 120
 # token expires: every poll reads HTTP 401 and waits for a human who is not there. The retry bound
 # matters because `claude()` is also called by the dashboard, which polls far faster than the loop —
 # a credential that cannot be rotated at all must not turn into a request flood.
-CLAUDE_REFRESH_SKEW_S = 5400
+# How early a Claude access token is rotated before its expiry. Rotation REVOKES the previous access
+# token at once (measured 2026-09-20: a sandboxed round holding the old token got "OAuth access token
+# has been revoked" nine seconds after another worker's renewal), so every mirror of the old token
+# dies with it. A worker therefore renews only before launching its own agent (choose_model /
+# authorize_claude_launch), and the skew must cover a whole round so the token outlives it: the fleet
+# sets TAUCETI_CLAUDE_REFRESH_SKEW to its round timeout plus a margin.
+CLAUDE_REFRESH_SKEW_S = int(os.environ.get("TAUCETI_CLAUDE_REFRESH_SKEW", "5400"))
 CLAUDE_REFRESH_RETRY_S = 600
 
 # The same bound for the operator's Codex source file (its skew, CODEX_REFRESH_SKEW_S, lives in
