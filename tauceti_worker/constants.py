@@ -280,7 +280,7 @@ CODEX_REFRESH_SKEW_S = int(os.environ.get("TAUCETI_CODEX_REFRESH_SKEW", str(48 *
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap"]
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "curate"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
@@ -312,6 +312,14 @@ SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 # than a working tree to roam. Its remaining exposure — merged PR descriptions reaching the model — is
 # bounded by the merge gate, which only ever admits two markdown files in one directory.
 SANDBOX_DEFAULT["progress"] = False
+# `curate` likewise: it edits the operator's target list and reads a shallow clone of main; the model
+# is handed excerpts and answers with a verdict file. No untrusted checkout is executed.
+SANDBOX_DEFAULT["curate"] = False
+# The curator's cadence: how long after an attempt before the target list is looked at again, and how
+# long a cheap "due" verdict is cached.
+CURATE_GAP = int(os.environ.get("TAUCETI_CURATE_GAP", "21600"))  # 6 h
+CURATE_TTL = int(os.environ.get("TAUCETI_CURATE_TTL", "600"))
+CURATE_MAX_CANDIDATES = int(os.environ.get("TAUCETI_CURATE_MAX_CANDIDATES", "12"))
 
 
 AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]

@@ -19,6 +19,7 @@ from .constants import (
     AUTO_STAGES,
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
+    CURATE_GAP,
     EX_NOPROGRESS,
     MAX_BUMP_ATTEMPTS,
     MAX_BUMP_PR_ATTEMPTS,
@@ -226,6 +227,7 @@ class Survey:
     red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
     bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
     progress: WorkKind = field(default_factory=lambda: WorkKind("progress"))  # a roadmap report is due
+    curate: WorkKind = field(default_factory=lambda: WorkKind("curate"))  # the target list needs a look
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -275,6 +277,7 @@ class Survey:
             "fix-ci": self.red_ci,
             "bump": self.bump,
             "progress": self.progress,
+            "curate": self.curate,
         }[name]
 
     def rescope_roadmap(self) -> None:
@@ -515,6 +518,15 @@ def progress_argv(state: Path, *args: str) -> list[str]:
         "tauceti-progress",
         *args,
     ]
+
+
+def curate_due(counters: Counters) -> tuple[bool, str]:
+    """Is a curation round due? Cheap and local: the attempt gap only. What is actually stale is the
+    round's business (it reads the PRs and main), and a run that changes nothing costs one round."""
+    last = counters.read("curate-attempt-ts")
+    if last and (time.time() - last) < CURATE_GAP:
+        return False, f"the target list was curated {(time.time() - last) / 3600:.1f}h ago; waiting out the gap"
+    return True, "target list curation is due"
 
 
 def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
@@ -855,6 +867,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         due, reason = progress_due(cfg, counters)
         c = Candidate(0, "", reason or "progress report")
         (sv.progress.actionable if due else sv.progress.suppressed).append(c)
+    # 7) curate: the operator's target list is looked at on a cadence (and the round itself decides
+    #    whether anything is stale). No network here: the attempt gap is a local counter.
+    due, reason = curate_due(counters)
+    c = Candidate(0, "", reason or "target list curation")
+    (sv.curate.actionable if due else sv.curate.suppressed).append(c)
 
     sv.next_auto_stage = _next_auto_stage(sv)
     return sv

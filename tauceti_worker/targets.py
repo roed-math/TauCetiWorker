@@ -257,3 +257,86 @@ def render_area_block(targets: Targets, area: str) -> str:
     body = "\n".join(render_item(targets, it) for it in items) if items else "(no targets listed for this area)"
     parts.append(f"{header}\n{body}")
     return "\n\n".join(parts)
+
+
+# ---- curation: keeping the file true after the PRs it names have moved on ---------------------------
+
+_INFLIGHT_RE = re.compile(r"in flight: #(\d+)")
+_LEAN_IDENT_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_'.]{3,})`")
+_LOWER_WORDS = {"none", "main", "true", "false", "then", "with", "from", "into", "over", "that", "this"}
+
+
+def inflight_prs(targets: Targets) -> list[tuple[str, TargetItem, int]]:
+    """Every `[~]` item that names its PR (`in flight: #N`), with that number."""
+    out = []
+    for area, items in targets.areas.items():
+        for it in items:
+            if it.status != "inflight":
+                continue
+            m = _INFLIGHT_RE.search(it.line)
+            if m:
+                out.append((area, it, int(m.group(1))))
+    return out
+
+
+def item_identifiers(it: TargetItem) -> list[str]:
+    """The Lean-looking identifiers the item's text names in backticks: CamelCase or dotted names
+    (`IsUnramified`, `PowerBasis.ofAdjoinEqTop'`), or snake names with an underscore. Plain words
+    and math (`ℚ_[p]`, `q − 1`) are not evidence of anything. In file order, deduplicated."""
+    seen: list[str] = []
+    for tok in _LEAN_IDENT_RE.findall(it.text):
+        if tok.lower() in _LOWER_WORDS:
+            continue
+        if not (any(c.isupper() for c in tok) or "." in tok or "_" in tok):
+            continue
+        if tok not in seen:
+            seen.append(tok)
+    return seen
+
+
+def sync_inflight(text: str, states: dict[int, str], verdicts: dict[int, dict]) -> tuple[str, list[str]]:
+    """Rewrite the `[~]` lines whose PR has finished: MERGED becomes `[x]` (`landed: #N`); CLOSED with
+    a recorded verdict that main subsumed the PR becomes `[x]` naming the upstream PRs (`subsumed
+    by: #M; closed: #N`); CLOSED without such a verdict is left for the operator and reported; OPEN
+    and unknown are left alone. Returns (new text, one line per change or open question). Pure."""
+    changes: list[str] = []
+    out = []
+    for line in text.splitlines(keepends=True):
+        m = re.match(r"- \[~\] `([^`]+)`.*?in flight: #(\d+)", line)
+        if not m:
+            out.append(line)
+            continue
+        slug, pr = m.group(1), int(m.group(2))
+        state = states.get(pr)
+        v = verdicts.get(pr) or {}
+        by = list(v.get("subsumed_by") or []) or list(v.get("mentions") or [])
+        words = " ".join(str(v.get("summary") or "").split()).lower()
+        subsumed = bool(v) and ("subsum" in words or bool(v.get("subsumed_by")))
+        if state == "MERGED":
+            line = line.replace("- [~]", "- [x]", 1).replace(f"in flight: #{pr}", f"landed: #{pr}")
+            changes.append(f"`{slug}`: done — #{pr} merged")
+        elif state == "CLOSED" and subsumed:
+            up = ", ".join(f"#{n}" for n in by) or "upstream (unnamed)"
+            line = line.replace("- [~]", "- [x]", 1).replace(f"in flight: #{pr}", f"subsumed by: {up}; closed: #{pr}")
+            changes.append(f"`{slug}`: done — #{pr} closed, subsumed by {up}")
+        elif state == "CLOSED":
+            changes.append(f"`{slug}`: #{pr} was closed with no subsumption verdict on record — owner decides ([ ] to re-author, [x] if done)")
+        out.append(line)
+    return "".join(out), changes
+
+
+def mark_landed_elsewhere(text: str, slug: str, evidence: str) -> tuple[str, bool]:
+    """Mark an open item done because main already provides it (found by the curator, not by a PR
+    of ours): `[x]` with `landed elsewhere: <evidence>` added to its metadata. Pure."""
+    out, done = [], False
+    for line in text.splitlines(keepends=True):
+        if not done and re.match(r"- \[ \] `" + re.escape(slug) + r"`", line):
+            body = line.rstrip("\n")
+            if body.endswith(")"):
+                body = body[:-1] + f"; landed elsewhere: {evidence})"
+            else:
+                body += f" (landed elsewhere: {evidence})"
+            line = body.replace("- [ ]", "- [x]", 1) + "\n"
+            done = True
+        out.append(line)
+    return "".join(out), done

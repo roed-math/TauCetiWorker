@@ -55,6 +55,7 @@ from .constants import (
     AGENT_NAMES,
     AUTO_STAGES,
     CONTEST_CLAIM_TTL,
+    CURATE_MAX_CANDIDATES,
     EX_NOPROGRESS,
     MAX_INFRA_REFUNDS,
     MAX_OPEN_PRS,
@@ -107,6 +108,7 @@ from .targets import (
     load_targets,
     open_items,
     overlay_live,
+    parse_targets,
     render_area_block,
 )
 
@@ -814,6 +816,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "bump": do_bump,
         "progress": do_progress,
         "roadmap": do_roadmap,
+        "curate": do_curate,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
     # with which agent and sandbox — the same line for every stage.
@@ -824,6 +827,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         what = f"new PR (area: {c.reason or 'any'})"
     elif stage == "progress":
         what = c.reason or "roadmap progress report"
+    elif stage == "curate":
+        what = c.reason or "target list curation"
     else:
         what = c.reason or (c.head[:12] if c.head else "")
     if stage == "review":
@@ -1227,6 +1232,188 @@ def do_rebase(w, sv, c, opts, bubble) -> int | None:
     key = f"rebase-pr-{c.pr}"
     w.counters.incr(key)
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
+
+
+def do_curate(w, sv, c, opts, bubble) -> int | None:
+    """Keep the operator's target list true, so the authors are never stalled by it.
+
+    The file marks an item `[~]` by hand (`in flight: #N`), and the live view promotes it to done
+    only when a MERGED pull request carries its marker; nothing ever demotes it. So once a PR has been
+    CLOSED — because main already had the milestone, say — the item stays "in flight" for ever, and
+    every item that needs it is ineligible: on 2026-09-21 sixteen of twenty in-flight PRs were closed,
+    none of the eighty-eight open items was eligible, and the author idled at the backoff cap. The
+    same happens when someone else's PR lands a milestone without our marker.
+
+    Two tiers, both host-side (there is no untrusted checkout to execute):
+      A. mechanical — each in-flight PR's state (one gated read each): merged → done; closed with a
+         recorded verdict that main subsumed it → done, naming the upstream PR; closed without one →
+         reported for the operator, left as it is.
+      B. evidence + model — for the items an author would take next (eligible) and the closed-without-
+         verdict ones, the Lean identifiers the milestone names are looked for in a shallow clone of
+         main; an item whose every identifier is declared there is put to the model with the hits, and
+         only a strict `landed: true` verdict with named evidence marks it done ("landed elsewhere").
+    Changes are written in place, listed in a `targets-updated` incident (the fleet's attention list),
+    and committed when the file lives in a git repository. Nothing is pushed here."""
+    w.counters.write("curate-attempt-ts", int(time.time()))
+    rc_claim = w.claims.begin_global_work("curate")
+    if rc_claim == 1:
+        log("curate: another worker holds the curate claim — skipping (COOP dedup)")
+        return None
+    try:
+        return _do_curate_inner(w, sv, opts)
+    finally:
+        w.claims.release()
+
+
+# POSIX ERE only (git grep's engine differs by platform: no \s, \b or \S on macOS).
+_DECL_RE_TEMPLATE = (
+    r"^[[:space:]]*(@\[[^]]*\][[:space:]]*)?((protected|private|noncomputable|scoped)[[:space:]]+)*"
+    r"(theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)[[:space:]]+"
+    r"([^[:space:]]+\.)?{name}([^A-Za-z0-9_'.]|$)"
+)
+
+
+def _curate_main_checkout(w) -> Path | None:
+    """A shallow, blobless clone of TauCeti's main under the worker's state, fetched fresh each run
+    through the gate (git reads). None when it cannot be had: tier B is then skipped, tier A stands."""
+    from . import gate as gate_mod
+
+    clone = w.cfg.state / "curate" / "TauCeti"
+    url = f"https://github.com/{TAUCETI}"
+    try:
+        if (clone / ".git").is_dir():
+            p = gate_mod.gated_git(["git", "-C", str(clone), "fetch", "-q", "--depth", "1", "origin", "main"],
+                                   op="curate", target=url, capture_output=True, text=True)
+            if p.returncode == 0:
+                subprocess.run(["git", "-C", str(clone), "checkout", "-q", "--force", "FETCH_HEAD"], check=False)
+                return clone
+            shutil.rmtree(clone, ignore_errors=True)
+        clone.parent.mkdir(parents=True, exist_ok=True)
+        p = gate_mod.gated_git(["git", "clone", "-q", "--filter=blob:none", "--depth", "1", "--branch", "main", url, str(clone)],
+                               op="curate", target=url, capture_output=True, text=True)
+        return clone if p.returncode == 0 else None
+    except Exception as e:  # noqa: BLE001 - a missing clone only skips tier B
+        log(f"curate: no checkout of main for the evidence pass ({e})")
+        return None
+
+
+def _grep_declarations(clone: Path, ident: str) -> list[str]:
+    name = ident.split(".")[-1]
+    p = subprocess.run(
+        ["git", "-C", str(clone), "grep", "-nE", _DECL_RE_TEMPLATE.format(name=re.escape(name)), "--", "TauCeti/"],
+        capture_output=True, text=True, timeout=120,
+    )
+    return [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()][:5]
+
+
+def _do_curate_inner(w, sv, opts) -> int | None:
+    from .attention import verdicts_by_pr
+    from .targets import inflight_prs, item_identifiers, mark_landed_elsewhere, sync_inflight
+
+    path = roadmap_targets()
+    if path is None:
+        raise NoProgress("curate: no target list configured (--roadmap-targets) — nothing to curate")
+    text = path.read_text()
+    targets = parse_targets(text)
+    # ---- tier A: the PRs the file names
+    states: dict[int, str] = {}
+    for _area, _it, pr in inflight_prs(targets):
+        d = w.gh.pr_view(pr, ["state"])
+        if d and d.get("state"):
+            states[pr] = str(d["state"])
+    new_text, changes = sync_inflight(text, states, verdicts_by_pr())
+    undecided = [ln for ln in changes if "owner decides" in ln]
+    for ln in changes:
+        log(f"curate: {ln}")
+    # ---- tier B: what main already provides
+    live, _n_in, _n_done = _live_target_view(parse_targets(new_text), path, sv, w.gh)
+    candidates: list[tuple[str, TargetItem]] = []
+    for area in live.areas:
+        candidates += [(area, it) for it in eligible_items(live, area)]
+    undecided_slugs = {re.match(r"`([^`]+)`", ln).group(1) for ln in undecided if re.match(r"`([^`]+)`", ln)}
+    for area, items in live.areas.items():
+        candidates += [(area, it) for it in items if it.slug in undecided_slugs and (area, it) not in candidates]
+    candidates = candidates[:CURATE_MAX_CANDIDATES]
+    clone = _curate_main_checkout(w) if candidates else None
+    with_evidence = []
+    main_sha = ""
+    memo_path = w.cfg.state / "curate" / "verdicts-memo.json"
+    memo: dict = {}
+    if clone is not None:
+        p = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], capture_output=True, text=True)
+        main_sha = (p.stdout or "").strip()
+        try:
+            memo = json.loads(memo_path.read_text()) if memo_path.is_file() else {}
+        except ValueError:
+            memo = {}
+        for area, it in candidates:
+            idents = item_identifiers(it)
+            if not idents:
+                continue
+            # A "not landed" verdict holds until main moves: do not pay the model twice for it.
+            prior = memo.get(it.slug) or {}
+            if prior.get("landed") is False and prior.get("main_sha") == main_sha:
+                continue
+            hits = {ident: _grep_declarations(clone, ident) for ident in idents}
+            if all(hits.values()):
+                with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
+                                      "identifiers": idents, "hits": hits})
+    if with_evidence:
+        work = w.cfg.state / "curate" / "work"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        (work / "candidates.json").write_text(json.dumps(
+            {"main_checkout": str(clone), "candidates": with_evidence}, indent=1))
+        prompt = (HERE / "prompts" / "curate.md").read_text()
+        log(f"curate: {len(with_evidence)} candidate(s) whose identifiers are declared on main — asking the model")
+        rc = run_agent_host(work, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+        verdict_file = work / "verdicts.json"
+        verdicts: dict = {}
+        if rc == 0 and verdict_file.is_file():
+            try:
+                verdicts = json.loads(verdict_file.read_text())
+            except ValueError:
+                log("curate: the model's verdicts.json is not valid JSON — ignoring it")
+        for cand in with_evidence:
+            v = verdicts.get(cand["slug"]) if isinstance(verdicts, dict) else None
+            if isinstance(v, dict) and v.get("landed") is True and isinstance(v.get("evidence"), str) and v["evidence"].strip():
+                evidence = " ".join(v["evidence"].split())[:200]
+                new_text, ok = mark_landed_elsewhere(new_text, cand["slug"], evidence)
+                if ok:
+                    changes.append(f"`{cand['slug']}`: done — landed elsewhere: {evidence}")
+                    log(f"curate: `{cand['slug']}` marked done — {evidence}")
+            elif isinstance(v, dict):
+                log(f"curate: `{cand['slug']}` not landed: {str(v.get('evidence') or '')[:120]}")
+                memo[cand["slug"]] = {"landed": False, "main_sha": main_sha, "evidence": str(v.get("evidence") or "")[:200]}
+        try:
+            memo_path.write_text(json.dumps(memo, indent=1))
+        except OSError:
+            pass
+    # ---- write, record, commit
+    applied = [ln for ln in changes if "owner decides" not in ln]
+    if new_text == text:
+        raise NoProgress(
+            "curate: the target list is current"
+            + (f"; {len(undecided)} closed PR(s) await the owner's decision" if undecided else "")
+        )
+    path.write_text(new_text)
+    record_incident("targets-updated", time.strftime("%Y%m%dT%H%M%S", time.gmtime()),
+                    path=str(path), changes=applied, undecided=undecided)
+    log(f"curate: {len(applied)} change(s) written to {path}")
+    _commit_targets(path, applied)
+    return 0
+
+
+def _commit_targets(path: Path, applied: list[str]) -> None:
+    """Commit the curated file when it is tracked in a git repository. No push: where the list lives
+    and who pushes it is the operator's arrangement."""
+    p = subprocess.run(["git", "-C", str(path.parent), "ls-files", "--error-unmatch", path.name],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return
+    msg = "curate: " + "; ".join(applied)[:300] + "\n\nWritten by the fleet's curator from the PRs' states and main."
+    subprocess.run(["git", "-C", str(path.parent), "commit", "-q", "-m", msg, "--", path.name],
+                   capture_output=True, text=True)
 
 
 def do_bump(w, sv, c, opts, bubble) -> int | None:

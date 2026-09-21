@@ -140,3 +140,25 @@ def declined_at(stage: str) -> set[tuple[int, str]]:
             if isinstance(pr, int) and isinstance(head, str) and head:
                 out.add((pr, head))
     return out
+
+
+def verdicts_by_pr() -> dict[int, dict]:
+    """The recorded `declined` verdicts by PR, wherever the owner has filed them: live, acknowledged,
+    or set aside as infrastructure (any `infra-*` folder). The newest record per PR wins."""
+    out: dict[int, dict] = {}
+    d = interaction.incidents_dir()
+    folders = [d, d / "acked", *sorted(d.glob("infra-*"))] if d.is_dir() else []
+    for folder in folders:
+        try:
+            paths = sorted(folder.glob(f"{DECLINED}-*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                rec = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            pr = rec.get("pr")
+            if isinstance(pr, int) and str(rec.get("last_at") or "") >= str(out.get(pr, {}).get("last_at") or ""):
+                out[pr] = rec
+    return out
