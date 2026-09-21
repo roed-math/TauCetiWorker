@@ -8,6 +8,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
   ```
   lake exe cache get
+  lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own artifacts for the modules `main` changed since your branch's base (Lake backtracks to the newest revision the service holds, so a fresh merge commit is fine); without this, `lake build` recompiles all of them from source
   git fetch -q origin main
   shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"; have_base=0
   base_ref="$(git merge-base origin/main HEAD)"
@@ -38,6 +39,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Verify before pushing (ALL of these MUST pass — they are exactly what the `build` check runs)
 ```
 lake exe cache get
+lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own artifacts for the modules `main` changed since your branch's base (Lake backtracks to the newest revision the service holds, so a fresh merge commit is fine); without this, `lake build` recompiles all of them from source
 git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"; have_base=0
 base_ref="$(git merge-base origin/main HEAD)"

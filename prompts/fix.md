@@ -28,6 +28,7 @@ For each finding, judge whether it is actually correct:
 ## Verify before pushing (all three MUST pass)
 ```
 lake exe cache get
+lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own artifacts for the modules `main` changed since your branch's base (Lake backtracks to the newest revision the service holds, so a fresh merge commit is fine); without this, `lake build` recompiles all of them from source
 lake build
 lake exe axioms
 ```

@@ -21,9 +21,10 @@ If the branch already includes current `main` and no concrete repair is needed, 
 
 Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.
 
-## Verify before pushing (all three MUST pass, after the merge/rebase)
+## Verify before pushing (all MUST pass, after the merge/rebase)
 ```
 lake exe cache get
+lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own artifacts for the modules `main` changed since your branch's base (Lake backtracks to the newest revision the service holds, so a fresh merge commit is fine); without this, `lake build` recompiles all of them from source
 lake build
 lake exe axioms
 ```
