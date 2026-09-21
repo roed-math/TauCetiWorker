@@ -51,8 +51,8 @@ try:
 finally:
     tc.loop.choose_model, tc.loop.github_budget, tc.loop.run_round_subprocess, tc.loop.time.sleep = saved
 
-I, B = tc.loop.INTERROUND, tc.loop.BACKOFF_BASE
-want = [I, I, B * 2, B * 4, I]  # two declines: short pauses, streak stays 0; then strikes 1 and 2; then a productive round
+PAUSE, B = tc.loop.INTERROUND, tc.loop.BACKOFF_BASE
+want = [PAUSE, PAUSE, B * 2, B * 4, PAUSE]  # two declines: short pauses, streak stays 0; then strikes 1 and 2; then a productive round
 ok = naps == want
 print(("ok   " if ok else "FAIL ") + f"sleeps {naps} (expected {want})")
 final = json.loads(status.read_text())
