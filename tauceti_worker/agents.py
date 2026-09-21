@@ -1526,6 +1526,17 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
     return seed_dir
 
 
+# What a sandboxed round finds under /opt/round. The three wrappers are the agent's only write paths;
+# since the gate (docs/gate.md) each of them SOURCES the sibling gate-lib.sh and, when the gate is
+# enabled, execs the sibling tauceti-gate. Neither was staged for the sandbox for a while, so inside a
+# bubble every wrapper died at its `source` line with "gate-lib.sh: No such file or directory" and exit
+# 75 — no fixer could push at all (2026-09-21: a green, axiom-clean reconciliation of #5508 was lost
+# that way, and the fleet's mutation count stayed at zero all day). The gate store does not cross into
+# the container, so gate-lib's functions are no-ops there; the push is still guarded by bubble's auth
+# proxy and the branch CAS. tests/bubble_round_scripts.py pins this list against the wrappers' sources.
+BUBBLE_ROUND_SCRIPTS = ("git-safe-push", "gh-safe-pr-create", "claim.sh", "gate-lib.sh", "tauceti-gate")
+
+
 def run_in_bubble(
     w: Worker,
     target: str,
@@ -1563,7 +1574,7 @@ def run_in_bubble(
     (rounddir / "prompt.txt").write_text(prompt)
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
-    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
+    for f in BUBBLE_ROUND_SCRIPTS:
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
