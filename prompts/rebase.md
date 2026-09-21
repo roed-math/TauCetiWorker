@@ -9,7 +9,7 @@ You are reconciling the branch with current main on pull request #__PR__ of TauC
 - Resolve every conflict on its merits:
   - **`TauCeti.lean` (the intentionally empty root module)**: preserve `main`'s version; do not add imports or reconstruct it.
   - **A source file under `TauCeti/`**: resolve so both the upstream change and your PR's intent are preserved. If `main` now provides something your PR duplicated, prefer the upstream version and drop the duplicate.
-- Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
+- Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge. In that case name what subsumed it: find the upstream change with `git log --oneline origin/main -- <each file this PR touches>` (squash-merged PRs end their subject with `(#NNNN)`), and end your report with one line `Subsumed-by: #NNNN` (several numbers separated by spaces; `Subsumed-by: unknown` only if `git log` shows nothing). A human decides whether to close this PR, and that line is what they act on.
 
 If the branch already includes current `main` and no concrete repair is needed, report that no update is needed and stop. Do not manufacture a commit or push an empty change just to satisfy the submission instructions.
 

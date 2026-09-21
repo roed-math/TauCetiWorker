@@ -37,6 +37,7 @@ from .agents import (
     validate_kiro_model_access,
     wrapper_bin,
 )
+from .attention import record_declined_round
 from .config import (
     Config,
     Die,
@@ -843,10 +844,14 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
     if rc == 0 and stage in PROGRESS_GUARDED and not _progressed(w, c, pre):
         tgt = f" #{c.pr}" if c.pr else ""
+        # Not silent: the agent's final words become a local `declined` incident the fleet view lists
+        # until the owner acknowledges it (a PR judged subsumed or obsolete is the owner's to close).
+        inc = record_declined_round(w.cfg.logdir, stage=stage, pr=c.pr, head=c.head, reason=c.reason)
         raise NoProgress(
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment). Most often another worker pushed the branch first (safe-push declines rather "
             f"than clobber) or the agent declined to act — not a failure. Transcript: {w.cfg.logdir}"
+            + (f"; the agent's account is recorded at {inc}" if inc else "")
         )
     return rc
 
