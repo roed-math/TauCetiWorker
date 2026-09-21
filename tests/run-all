@@ -28,6 +28,7 @@ RUN_STDLIB=(
   declined_backoff.py
   bubble_round_scripts.py
   bubble_toolchain_mounts.py
+  publication_observe.py
   auto_stage_priority.py
   authoring_profiles.py
   bubble_cache.py

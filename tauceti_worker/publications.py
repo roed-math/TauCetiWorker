@@ -66,6 +66,9 @@ UNCERTAIN = "uncertain"
 NEEDS_RECONCILIATION = "needs-reconciliation"
 STALE_HEAD = "stale-head"
 INTERRUPTED = "interrupted"
+# A step never attempted whose absence the remote has confirmed after the round (see
+# Publication.observe_unrecorded): nothing to resume, and the publication counts as complete.
+SKIPPED = "skipped"
 
 # Refusal reasons a publisher sees (`publication: refused (<reason>)`).
 R_STATE = "step-state"  # the step is sent/uncertain/done: never resent
@@ -219,7 +222,7 @@ class Publication:
 
     @property
     def complete(self) -> bool:
-        return all(s["state"] == DONE for s in self.steps)
+        return all(s["state"] in (DONE, SKIPPED) for s in self.steps)
 
     @property
     def has_uncertain(self) -> bool:
@@ -424,6 +427,59 @@ class Publication:
         )
         return out
 
+    def observe_unrecorded(self) -> dict[str, str] | None:
+        """Settle a fix/rebase publication whose round ran in a sandbox by looking at the remote.
+
+        Inside a bubble the write wrappers cannot reach this store (docs/gate.md: the store does not
+        cross into the container), so however the round went, its steps stay `pending` and the entry
+        was parked `interrupted` — 68 of them after one night, 15 of the last 30 for rounds that HAD
+        pushed. The remote tells the two apart: a branch tip that moved off the head recorded at
+        round start is the push (the branch CAS lets nothing else move it while the round holds the
+        claim); a comment carrying the publication id is the comment, and its absence after a fix/
+        rebase round is normal (those rounds need not comment) — `skipped`, not lost.
+
+        Returns {step: verdict} — "none" for a push that never landed (the entry then records no
+        remote effect and the caller archives it), UNCERTAIN when the remote could not be read (try
+        again later) — or None when the entry is not of this shape (an author publication, or one
+        with an attempted step, which `reconcile` owns)."""
+        if self.kind not in (KIND_FIX, KIND_REBASE) or not (self.remote and self.branch and self.head_sha):
+            return None
+        push, comment = self.step("push"), self.step("comment")
+        if push["state"] == PENDING:
+            if any(s["state"] != PENDING for s in self.steps):
+                return None
+            p = gate_mod.gated_git(
+                ["git", "ls-remote", self.remote, f"refs/heads/{self.branch}"],
+                op="reconcile",
+                target=self.remote,
+                capture_output=True,
+            )
+            if p.returncode != 0:
+                return {"push": UNCERTAIN}
+            tip = ""
+            for line in (p.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == f"refs/heads/{self.branch}":
+                    tip = parts[0]
+            if not tip or tip == self.head_sha:
+                return {"push": "none"}
+            push.update({
+                "state": DONE, "remote_id": tip, "at": _now_iso(), "observed": True,
+                "detail": f"observed: branch moved {self.head_sha[:12]} -> {tip[:12]} (sandboxed round; sends are not recorded)",
+            })
+        elif not (push["state"] == DONE and push.get("observed") and comment["state"] == PENDING):
+            return None
+        out = {"push": DONE}
+        verdict, remote_id, detail = self._reconcile_comment()
+        if verdict == DONE:
+            comment.update({"state": DONE, "remote_id": remote_id, "at": _now_iso(), "detail": detail})
+        elif detail.startswith("no comment carries"):
+            comment.update({"state": SKIPPED, "at": _now_iso(), "detail": "none found by publication marker (a fix/rebase round need not comment)"})
+        else:
+            comment["detail"] = detail  # the read failed: stays pending, observed again next time
+        out["comment"] = comment["state"]
+        return out
+
     def _reconcile_push(self, s: dict) -> tuple[str, str, str]:
         want = str(s.get("sha") or (self.head_sha if self.kind == KIND_AUTHOR else ""))
         if not self.remote or not want:
@@ -620,12 +676,46 @@ def reconcile_stale(worker: str | None = None, *, everything: bool = False) -> l
                 fresh.save()
         if fresh.has_uncertain:
             out.append((fresh.id, fresh.reconcile()))
-        elif fresh.parked is None and fresh.pid and not gate_mod._pid_alive(fresh.pid):
+            continue
+        # A sandboxed fix/rebase round records nothing; once its process is gone the remote decides.
+        obs = fresh.observe_unrecorded()
+        if obs is not None and obs.get("push") == "none":
+            archived = _archive(fresh)
+            out.append((fresh.id, {"archived": "no remote effect" if archived else "archive failed"}))
+            continue
+        if obs is not None and obs.get("push") == DONE:
+            with gate_mod.current().locked():
+                fresh.parked = None if fresh.complete else INTERRUPTED
+                fresh.save()
+            gate_mod.current()._event(
+                decision="publication", op="observe", target=fresh.repo, kind="-", op_id=fresh.id,
+                detail=" ".join(f"{k}={v}" for k, v in obs.items()),
+            )
+            out.append((fresh.id, obs))
+            continue
+        if fresh.parked is None and fresh.pid and not gate_mod._pid_alive(fresh.pid):
             with gate_mod.current().locked():
                 fresh.parked = INTERRUPTED
                 fresh.save()
             out.append((fresh.id, {"parked": INTERRUPTED}))
     return out
+
+
+def _archive(pub: Publication) -> bool:
+    """Move an entry that records no remote effect under publications/archive/ (never deleted)."""
+    d = publications_dir()
+    if d is None:
+        return False
+    try:
+        (d / ARCHIVE).mkdir(parents=True, exist_ok=True)
+        os.replace(pub.path, d / ARCHIVE / pub.path.name)
+    except OSError:
+        return False
+    gate_mod.current()._event(
+        decision="publication", op="archive", target=pub.repo, kind="-", op_id=pub.id,
+        detail="no remote effect after a sandboxed round (branch tip unchanged, nothing sent)",
+    )
+    return True
 
 
 def create_for_round(kind: str, **kw) -> str:
