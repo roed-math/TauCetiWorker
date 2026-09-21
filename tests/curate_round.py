@@ -141,5 +141,10 @@ try:
 except NoProgress as e:
     check("a second run reports the list as current, with the open question", "current" in str(e) and "1 closed PR" in str(e), str(e))
 check("a not-landed verdict is remembered while main is unchanged", asked == {}, str(asked))
+# The round above called do_curate directly. The fleet reaches it through the cascade, which walks
+# AUTO_STAGES: a stage that is surveyed but not listed there is never dispatched (2026-09-21).
+from tauceti_worker.constants import AUTO_STAGES as _AUTO
+check("curate is the last stage of the cascade", "curate" in _AUTO and _AUTO[-1] == "curate", str(_AUTO))
+
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)

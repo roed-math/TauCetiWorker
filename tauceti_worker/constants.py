@@ -288,8 +288,11 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # honor the project's globally paced progress reporting. The worker's fix/CI maintenance remains
 # ahead of fleet-wide reviews so author-action work cannot be starved by unrelated reviews. Roadmap
 # is the final fallback and is handled separately after these stages. The durable attempt breaker
-# keeps a stuck or rejected progress report from burning every round.
-AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
+# keeps a stuck or rejected progress report from burning every round. `curate` comes last: it is about
+# the operator's target list, not a PR, and its own attempt gap keeps it to a cadence; the fleet
+# runs it under `--only curate` on a timer (2026-09-21: a periodic round found "no eligible work"
+# because the stage was surveyed but never dispatched).
+AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review", "curate")
 
 # The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
 # left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
