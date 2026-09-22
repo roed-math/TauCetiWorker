@@ -144,7 +144,20 @@ check("a not-landed verdict is remembered while main is unchanged", asked == {},
 # The round above called do_curate directly. The fleet reaches it through the cascade, which walks
 # AUTO_STAGES: a stage that is surveyed but not listed there is never dispatched (2026-09-21).
 from tauceti_worker.constants import AUTO_STAGES as _AUTO
+
 check("curate is the last stage of the cascade", "curate" in _AUTO and _AUTO[-1] == "curate", str(_AUTO))
+
+# The gate's push allowlist: the curator may push to the operator's target-list repository and
+# nowhere else; never canonical; no other op inherits the permission.
+from tauceti_worker import gate as _gate
+
+os.environ["TAUCETI_TARGETS_REPO"] = "roed-math/tauceti-fleet"
+check("curate may push to the target-list repo", _gate.push_target_allowed("curate", "https://github.com/roed-math/tauceti-fleet.git"))
+check("curate may not push elsewhere", not _gate.push_target_allowed("curate", "https://github.com/roed-math/other.git"))
+check("the permission does not extend to other ops", not _gate.push_target_allowed("push", "https://github.com/roed-math/tauceti-fleet.git"))
+os.environ["TAUCETI_TARGETS_REPO"] = _gate.TAUCETI
+check("never canonical", not _gate.push_target_allowed("curate", f"https://github.com/{_gate.TAUCETI}.git"))
+del os.environ["TAUCETI_TARGETS_REPO"]
 
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)

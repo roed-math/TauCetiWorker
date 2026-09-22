@@ -319,6 +319,11 @@ def push_target_allowed(op: str, target: str) -> bool:
         return True
     if op == "sync" and n == f"{TAUCETI.split('/', 1)[0].lower()}/taucetidata":
         return True  # the review engine's archive push (--sync-only), probed for push permission first
+    # The curator's one push: the repository that holds the operator's target list, named by the
+    # operator (`TAUCETI_TARGETS_REPO`); never canonical, never any other op.
+    if op == "curate":
+        v = os.environ.get("TAUCETI_TARGETS_REPO", "").strip()
+        return bool(v) and normalize_repo(v) == n and not canonical
     remote = os.environ.get("TAUCETI_PUSH_REMOTE", "").strip()
     return bool(remote) and normalize_repo(remote) == n and op == "push"
 

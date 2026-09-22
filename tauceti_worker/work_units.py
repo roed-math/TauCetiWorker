@@ -1283,14 +1283,14 @@ def _curate_main_checkout(w) -> Path | None:
     try:
         if (clone / ".git").is_dir():
             p = gate_mod.gated_git(["git", "-C", str(clone), "fetch", "-q", "--depth", "1", "origin", "main"],
-                                   op="curate", target=url, capture_output=True, text=True)
+                                   op="curate", target=url, capture_output=True)
             if p.returncode == 0:
                 subprocess.run(["git", "-C", str(clone), "checkout", "-q", "--force", "FETCH_HEAD"], check=False)
                 return clone
             shutil.rmtree(clone, ignore_errors=True)
         clone.parent.mkdir(parents=True, exist_ok=True)
         p = gate_mod.gated_git(["git", "clone", "-q", "--filter=blob:none", "--depth", "1", "--branch", "main", url, str(clone)],
-                               op="curate", target=url, capture_output=True, text=True)
+                               op="curate", target=url, capture_output=True)
         return clone if p.returncode == 0 else None
     except Exception as e:  # noqa: BLE001 - a missing clone only skips tier B
         log(f"curate: no checkout of main for the evidence pass ({e})")
@@ -1392,6 +1392,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     # ---- write, record, commit
     applied = [ln for ln in changes if "owner decides" not in ln]
     if new_text == text:
+        _push_targets(path)  # a commit an earlier run could not push (gate refused, network) goes now
         raise NoProgress(
             "curate: the target list is current"
             + (f"; {len(undecided)} closed PR(s) await the owner's decision" if undecided else "")
@@ -1405,12 +1406,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
 
 
 def _commit_targets(path: Path, applied: list[str]) -> None:
-    """Commit the curated file when it is tracked in a git repository, and push the branch when the
-    operator asked for it (TAUCETI_TARGETS_PUSH=1): the list is shared between hosts through its
-    repository, so a curation that stays local on one host is not seen by the other. The push goes
-    through the gate like every git write, to the file's own `origin`, never anywhere else."""
-    from . import gate as gate_mod
-
+    """Commit the curated file when it is tracked in a git repository, then push (see _push_targets)."""
     repo = path.parent
     p = subprocess.run(["git", "-C", str(repo), "ls-files", "--error-unmatch", path.name], capture_output=True, text=True)
     if p.returncode != 0:
@@ -1420,21 +1416,39 @@ def _commit_targets(path: Path, applied: list[str]) -> None:
     if p.returncode != 0:
         log(f"curate: commit failed ({(p.stderr or p.stdout).strip()[:160]}) — the file is written, not committed")
         return
+    _push_targets(path)
+
+
+def _push_targets(path: Path) -> None:
+    """Push the target list's branch when the operator asked for it (TAUCETI_TARGETS_PUSH=1) and it is
+    ahead of its upstream: the list is shared between hosts through its repository, so a curation
+    that stays local on one host is not seen by the other. The push goes through the gate like every
+    git write (op `curate`, allowed only to TAUCETI_TARGETS_REPO), to the file's own `origin`, never
+    anywhere else. Called after a commit and also on a round that changed nothing, so a commit an
+    earlier round could not push goes on the next."""
+    from . import gate as gate_mod
+
     if os.environ.get("TAUCETI_TARGETS_PUSH", "").strip() != "1":
+        return
+    repo = path.parent
+    if subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"], capture_output=True).returncode != 0:
+        return
+    ahead = subprocess.run(["git", "-C", str(repo), "rev-list", "--count", "@{upstream}..HEAD"], capture_output=True, text=True)
+    if ahead.returncode != 0 or (ahead.stdout or "0").strip() == "0":
         return
     origin = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
     if not origin:
         return
     try:
         q = gate_mod.gated_git(["git", "-C", str(repo), "push", "-q", "origin", "HEAD"], op="curate", target=origin,
-                               kind=gate_mod.GIT_PUSH, capture_output=True, text=True)
+                               kind=gate_mod.GIT_PUSH, capture_output=True)
     except Exception as e:  # noqa: BLE001 - a refused push leaves the commit for the next run
         log(f"curate: push not attempted ({e}) — the commit stays local")
         return
     if q.returncode != 0:
         log(f"curate: push to {origin} failed ({(q.stderr or q.stdout).strip()[:160]}) — the commit stays local")
     else:
-        log(f"curate: pushed the curated list to {origin}")
+        log(f"curate: pushed {ahead.stdout.strip()} commit(s) of the curated list to {origin}")
 
 
 def do_bump(w, sv, c, opts, bubble) -> int | None:
