@@ -92,13 +92,17 @@ def subsuming_prs(summary: str, target: int | None) -> tuple[list[int], list[int
 
 
 def record_declined_round(logdir: Path, *, stage: str, pr: int | None, head: str = "",
-                          reason: str = "") -> Path | None:
+                          reason: str = "", target: str = "") -> Path | None:
     """Record the agent's own account of a nothing-landed round as a `declined` incident. Never raises:
     an incident is a report, and the round's outcome (no-progress) is already decided."""
     try:
         log_path = newest_agent_log(logdir)
         summary = final_assistant_text(log_path) if log_path else ""
-        key = f"{stage}-{pr}" if pr else f"{stage}-{(head or 'unknown')[:12]}"
+        # An authoring round has no PR yet: key it by its target (`Area/slug`), so two declined targets
+        # are two incidents and the picker can skip each (2026-09-23: every authoring decline shared
+        # the key `roadmap-unknown`, and 215 rounds re-picked three targets main already had).
+        key = f"{stage}-{pr}" if pr else (f"{stage}-{target.replace('/', '-')}" if target
+                                           else f"{stage}-{(head or 'unknown')[:12]}")
         declared, mentioned = subsuming_prs(summary, pr)
         return record_incident(
             DECLINED,
@@ -112,6 +116,7 @@ def record_declined_round(logdir: Path, *, stage: str, pr: int | None, head: str
             subsumed_by=declared,  # what the agent DECLARED (the prompt's trailer)
             mentions=mentioned,  # other PRs it named in prose; a lead, not a verdict
             transcript=str(log_path) if log_path else "",
+            **({"target": target} if target else {}),
             publication=os.environ.get("TAUCETI_PUBLICATION_ID") or "",
         )
     except Exception:  # noqa: BLE001 - reporting must never turn into a second failure
@@ -140,6 +145,41 @@ def declined_at(stage: str) -> set[tuple[int, str]]:
             if isinstance(pr, int) and isinstance(head, str) and head:
                 out.add((pr, head))
     return out
+
+
+def declined_targets() -> dict[str, dict]:
+    """Target slugs an authoring round declined, with the incident: `{slug: record}`, live or
+    acknowledged. The author's picker skips these, since every author would reach the same conclusion
+    (usually "main already has this"), and the curator weighs the agent's account against main. A
+    record the curator judged `not-landed` no longer counts: the target goes back to the authors."""
+    out: dict[str, dict] = {}
+    d = interaction.incidents_dir()
+    for folder in (d, d / "acked"):
+        try:
+            paths = sorted(folder.glob(f"{DECLINED}-roadmap-*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                rec = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            target = rec.get("target")
+            if not isinstance(target, str) or "/" not in target or rec.get("curator") == "not-landed":
+                continue
+            out[target.split("/", 1)[1]] = {**rec, "path": str(path)}
+    return out
+
+
+def mark_declined_target(path: str, **fields) -> None:
+    """Annotate a declined-target incident in place (the curator's verdict). Never raises."""
+    try:
+        p = Path(path)
+        rec = json.loads(p.read_text())
+        rec.update(fields)
+        p.write_text(json.dumps(rec, indent=1))
+    except (OSError, ValueError):
+        pass
 
 
 def verdicts_by_pr() -> dict[int, dict]:

@@ -139,7 +139,7 @@ try:
     W.do_curate(w, sv, None, SimpleNamespace(), False)
     check("a second run raises NoProgress", False)
 except NoProgress as e:
-    check("a second run reports the list as current, with the open question", "current" in str(e) and "1 closed PR" in str(e), str(e))
+    check("a second run reports the list as current, with the open question", "current" in str(e) and "1 item(s) await" in str(e), str(e))
 check("a not-landed verdict is remembered while main is unchanged", asked == {}, str(asked))
 # The round above called do_curate directly. The fleet reaches it through the cascade, which walks
 # AUTO_STAGES: a stage that is surveyed but not listed there is never dispatched (2026-09-21).

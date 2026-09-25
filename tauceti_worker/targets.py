@@ -280,11 +280,16 @@ def inflight_prs(targets: Targets) -> list[tuple[str, TargetItem, int]]:
 
 
 def item_identifiers(it: TargetItem) -> list[str]:
-    """The Lean-looking identifiers the item's text names in backticks: CamelCase or dotted names
+    """The Lean-looking identifiers the item's text names in backticks; see `lean_identifiers`."""
+    return lean_identifiers(it.text)
+
+
+def lean_identifiers(text: str) -> list[str]:
+    """The Lean-looking identifiers a text names in backticks: CamelCase or dotted names
     (`IsUnramified`, `PowerBasis.ofAdjoinEqTop'`), or snake names with an underscore. Plain words
-    and math (`ℚ_[p]`, `q − 1`) are not evidence of anything. In file order, deduplicated."""
+    and math (`ℚ_[p]`, `q − 1`) are not evidence of anything. In order, deduplicated."""
     seen: list[str] = []
-    for tok in _LEAN_IDENT_RE.findall(it.text):
+    for tok in _LEAN_IDENT_RE.findall(text or ""):
         if tok.lower() in _LOWER_WORDS:
             continue
         if not (any(c.isupper() for c in tok) or "." in tok or "_" in tok):

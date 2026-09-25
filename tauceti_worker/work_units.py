@@ -166,6 +166,7 @@ class Worker:
     counters: Counters
     rc: RoundContext
     claims: Claims
+    current_target: str = ""  # `Area/slug` of the target this round's authoring works on, if any
 
 
 def _bubble(stage: str, opts: RoundOpts) -> bool:
@@ -851,7 +852,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         tgt = f" #{c.pr}" if c.pr else ""
         # Not silent: the agent's final words become a local `declined` incident the fleet view lists
         # until the owner acknowledges it (a PR judged subsumed or obsolete is the owner's to close).
-        inc = record_declined_round(w.cfg.logdir, stage=stage, pr=c.pr, head=c.head, reason=c.reason)
+        inc = record_declined_round(w.cfg.logdir, stage=stage, pr=c.pr, head=c.head, reason=c.reason,
+                                    target=getattr(w, "current_target", "") if stage == "roadmap" else "")
         raise NoProgress(
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment). Most often another worker pushed the branch first (safe-push declines rather "
@@ -1307,8 +1309,8 @@ def _grep_declarations(clone: Path, ident: str) -> list[str]:
 
 
 def _do_curate_inner(w, sv, opts) -> int | None:
-    from .attention import verdicts_by_pr
-    from .targets import inflight_prs, item_identifiers, mark_landed_elsewhere, sync_inflight
+    from .attention import declined_targets, mark_declined_target, verdicts_by_pr
+    from .targets import inflight_prs, item_identifiers, lean_identifiers, mark_landed_elsewhere, sync_inflight
 
     path = roadmap_targets()
     if path is None:
@@ -1333,8 +1335,13 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     undecided_slugs = {re.match(r"`([^`]+)`", ln).group(1) for ln in undecided if re.match(r"`([^`]+)`", ln)}
     for area, items in live.areas.items():
         candidates += [(area, it) for it in items if it.slug in undecided_slugs and (area, it) not in candidates]
-    candidates = candidates[:CURATE_MAX_CANDIDATES]
-    clone = _curate_main_checkout(w) if candidates else None
+    # ---- tier C: targets an author declined (the agent said main already has them). The agent's own
+    # account names the declarations; they are checked on main and put to the model like tier B.
+    declined = declined_targets()
+    declined_cands = [(area, it) for area, items in live.areas.items() for it in items
+                      if it.status == "open" and it.slug in declined][:CURATE_MAX_CANDIDATES]
+    candidates = [(a, it) for a, it in candidates if it.slug not in declined][:CURATE_MAX_CANDIDATES]
+    clone = _curate_main_checkout(w) if (candidates or declined_cands) else None
     with_evidence = []
     main_sha = ""
     memo_path = w.cfg.state / "curate" / "verdicts-memo.json"
@@ -1358,6 +1365,24 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             if all(hits.values()):
                 with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
                                       "identifiers": idents, "hits": hits})
+        for area, it in declined_cands:
+            rec = declined[it.slug]
+            prior = memo.get(it.slug) or {}
+            if prior.get("landed") is False and prior.get("main_sha") == main_sha:
+                continue
+            account = str(rec.get("summary") or "")
+            named = lean_identifiers(account)
+            hits = {ident: h for ident in named if (h := _grep_declarations(clone, ident))}
+            if hits:
+                with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
+                                      "identifiers": list(hits), "hits": hits, "author_account": account[:2000],
+                                      "declined_incident": rec.get("path", "")})
+            else:
+                note = (f"`{it.slug}`: an author declined it as already done, but its account names no declaration "
+                        f"found on main — owner decides ([x] if done; to hand it back to the authors, delete "
+                        f"{rec.get('path', 'its declined incident')})")
+                undecided.append(note)
+                log(f"curate: {note}")
     if with_evidence:
         work = w.cfg.state / "curate" / "work"
         shutil.rmtree(work, ignore_errors=True)
@@ -1382,8 +1407,15 @@ def _do_curate_inner(w, sv, opts) -> int | None:
                 if ok:
                     changes.append(f"`{cand['slug']}`: done — landed elsewhere: {evidence}")
                     log(f"curate: `{cand['slug']}` marked done — {evidence}")
+                if cand.get("declined_incident"):
+                    mark_declined_target(cand["declined_incident"], curator="landed", curator_evidence=evidence)
             elif isinstance(v, dict):
                 log(f"curate: `{cand['slug']}` not landed: {str(v.get('evidence') or '')[:120]}")
+                if cand.get("declined_incident"):
+                    # The author was wrong: the target goes back to the authors.
+                    mark_declined_target(cand["declined_incident"], curator="not-landed",
+                                         curator_evidence=str(v.get("evidence") or "")[:200])
+                    log(f"curate: `{cand['slug']}` handed back to the authors (the decline did not hold up)")
                 memo[cand["slug"]] = {"landed": False, "main_sha": main_sha, "evidence": str(v.get("evidence") or "")[:200]}
         try:
             memo_path.write_text(json.dumps(memo, indent=1))
@@ -1395,7 +1427,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         _push_targets(path)  # a commit an earlier run could not push (gate refused, network) goes now
         raise NoProgress(
             "curate: the target list is current"
-            + (f"; {len(undecided)} closed PR(s) await the owner's decision" if undecided else "")
+            + (f"; {len(undecided)} item(s) await the owner's decision" if undecided else "")
         )
     path.write_text(new_text)
     record_incident("targets-updated", time.strftime("%Y%m%dT%H%M%S", time.gmtime()),
@@ -1886,6 +1918,21 @@ def _render_assigned(live: Targets, it: TargetItem) -> str:
     return f"Assigned target: `{it.slug}` — {it.text} ({'; '.join(clauses)})\n  Context — the rest of this area's list:"
 
 
+def _without_declined(candidates: list[tuple[str, TargetItem]]) -> list[tuple[str, TargetItem]]:
+    """The target candidates minus those an author already declined (`attention.declined_targets`);
+    NoProgress when that leaves none, so the loop backs off instead of re-picking them."""
+    from .attention import declined_targets
+
+    declined = declined_targets()
+    kept = [(a, it) for a, it in candidates if it.slug not in declined]
+    if candidates and not kept:
+        raise NoProgress(
+            "roadmap: every eligible target was declined by an author as already done ("
+            + ", ".join(sorted({it.slug for _a, it in candidates})) + ") — the curator or the owner decides"
+        )
+    return kept
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
@@ -1897,7 +1944,12 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         # settle who does what here, before any model runs, through the round's lease + heartbeat.
         targets, n_inflight, n_merged = _live_target_view(targets, targets_path, sv, w.gh)
         candidates = _target_candidates(targets, targets_path, only, skip)
+        # A target an author already declined (the agent found it on main, most often) is not offered
+        # again: every author would spend a round to reach the same answer. The curator weighs the
+        # agent's account against main and marks it done, or hands it back.
+        candidates = _without_declined(candidates)
         only, item, claimed = _claim_target(w.claims, candidates, targets_path)
+        w.current_target = f"{only}/{item.slug}"
         n_open = sum(len(open_items(targets, a)) for a in targets.areas)
         log(
             f"→ ROADMAP target: {only}/{item.slug} ({'claimed' if claimed else 'unclaimed'}; {len(candidates)} "

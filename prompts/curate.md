@@ -9,6 +9,11 @@ the roadmap README), the identifiers it names, and for each identifier the `git 
 checkout of `main` at `main_checkout` (path:line: declaration). Inspect those files in that checkout as
 much as you need (read-only; do not run `lake build`, do not edit anything there).
 
+Some candidates also carry `author_account`: an authoring agent was assigned the milestone and
+stopped, saying `main` already has it; the identifiers and hits for those candidates are the
+declarations that account names. Treat the account as a lead, not a verdict: check it against the
+milestone text as strictly as any other candidate.
+
 A milestone has landed only if the declarations on `main` actually state what the milestone describes:
 the same objects, the same generality (a `ℚ_p`-only shortcut does not discharge a milestone stated for
 every local field), and the essential theorems, not just a definition with the same name. Be strict: a
