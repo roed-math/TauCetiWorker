@@ -41,6 +41,8 @@ ACCOUNTS = {
     "compactness-lemma": "Stopped: already on main as `nonempty_iInter_of_directed_nonempty_isClosed`, from PR #6239.",
     "transgression": "Stopped: main already has `transgressionMap` and its exactness.",
     "pro-p-frattini": "Stopped: I believe this exists already, but I did not find its name.",
+    "h2-bijection": "Stopped: merged PR #8400 covers it: [the bijection](/home/user/tauceti/TauCeti/Ext/Cohomology.lean:2), "
+                    "and [a stale path](/home/user/tauceti/TauCeti/Gone.lean:9).",
     "directed-inter": "Stopped: Mathlib already has `IsCompact.nonempty_iInter_of_directed_isClosed`; a copy would be a duplicate.",
 }
 
@@ -56,13 +58,15 @@ p1 = decline("ProfiniteProPGroups", "compactness-lemma")
 p2 = decline("ProfiniteCohomology", "transgression")
 p3 = decline("ProfiniteProPGroups", "pro-p-frattini")
 p4 = decline("ProfiniteProPGroups", "directed-inter")
+p5 = decline("ProfiniteProPGroups", "h2-bijection")
 names = sorted(p.name for p in (TMP / "incidents").glob("declined-*.json"))
 check("one incident per declined target", names == ["declined-roadmap-ProfiniteCohomology-transgression.json",
                                                     "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json",
                                                     "declined-roadmap-ProfiniteProPGroups-directed-inter.json",
+                                                    "declined-roadmap-ProfiniteProPGroups-h2-bijection.json",
                                                     "declined-roadmap-ProfiniteProPGroups-pro-p-frattini.json"], str(names))
 check("declined_targets lists them by slug",
-      set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini", "directed-inter"})
+      set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini", "directed-inter", "h2-bijection"})
 
 # ---- the picker ---------------------------------------------------------------------------------------
 LIST = TMP / "targets.md"
@@ -73,6 +77,7 @@ LIST.write_text("""# t
 - [ ] `compactness-lemma` — L0, "Prove the directed intersection lemma." (serves: B1; needs: none)
 - [ ] `pro-p-frattini` — L1, "Prove the Frattini quotient statement." (serves: B1; needs: none)
 - [ ] `still-open` — L1, "Prove `somethingNew`." (serves: B1; needs: none)
+- [ ] `h2-bijection` — L5, "Extensions correspond to H²." (serves: B3; needs: none)
 - [ ] `directed-inter` — L1, "A directed family of closed sets has nonempty intersection." (serves: B1; needs: none)
 
 ## ProfiniteCohomology
@@ -94,6 +99,8 @@ clone = TMP / "state" / "curate" / "TauCeti"
 (clone / "TauCeti").mkdir(parents=True)
 (clone / "TauCeti" / "Compact.lean").write_text("theorem nonempty_iInter_of_directed_nonempty_isClosed : True := trivial\n")
 (clone / "TauCeti" / "Transgression.lean").write_text("def transgressionMap : Nat := 0\n")
+(clone / "TauCeti" / "Ext").mkdir()
+(clone / "TauCeti" / "Ext" / "Cohomology.lean").write_text("-- extensions\ntheorem extClassEquivH2 : True := trivial\n")
 # a fake Mathlib at the commit main pins, holding only the lemma the "directed-inter" decline names
 ML = TMP / "mathlib-origin"
 (ML / "Mathlib" / "Topology").mkdir(parents=True)
@@ -160,6 +167,9 @@ check("a decline naming a Mathlib declaration is checked against the pinned Math
       any(h.startswith("Mathlib:Mathlib/Topology/Compact.lean")
           for hs in asked.get("directed-inter", {}).get("hits", {}).values() for h in hs), str(asked.get("directed-inter")))
 check("…and a confirmed one marks the item done", "- [x] `directed-inter`" in new, new)
+check("a decline citing file:line on main goes to the model with the cited line, not the missing file",
+      asked.get("h2-bijection", {}).get("hits") == {"TauCeti/Ext/Cohomology.lean": ["TauCeti/Ext/Cohomology.lean:2: theorem extClassEquivH2 : True := trivial"]},
+      str(asked.get("h2-bijection", {}).get("hits")))
 check("an unconfirmed one stays open", "- [ ] `transgression`" in new and "- [ ] `pro-p-frattini`" in new)
 still = set(attention.declined_targets())
 check("a confirmed decline leaves the attention list",

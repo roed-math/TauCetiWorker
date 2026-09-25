@@ -1312,6 +1312,31 @@ def _grep_declarations(clone: Path, ident: str, subdir: str = "TauCeti/") -> lis
     return [prefix + ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()][:5]
 
 
+_CITED_RE = re.compile(r"(TauCeti/[A-Za-z0-9_/]+\.lean)(?::(\d+))?")
+
+
+def _cited_locations(clone: Path, text: str) -> dict[str, list[str]]:
+    """`{path: ["path:line: text"]}` for the `TauCeti/….lean[:line]` locations a text cites that exist
+    in the checkout of main (at most eight). A path that is not there is no evidence."""
+    out: dict[str, list[str]] = {}
+    for m in _CITED_RE.finditer(text or ""):
+        rel, line = m.group(1), m.group(2)
+        f = clone / rel
+        if not f.is_file() or len(out) >= 8 and rel not in out:
+            continue
+        entry = rel
+        if line:
+            try:
+                src = f.read_text(errors="replace").splitlines()
+                n = int(line)
+                entry = f"{rel}:{n}: {src[n - 1].strip()[:160]}" if 0 < n <= len(src) else rel
+            except (OSError, ValueError):
+                pass
+        if entry not in out.setdefault(rel, []):
+            out[rel].append(entry)
+    return out
+
+
 def _curate_mathlib_checkout(w, main_clone: Path) -> Path | None:
     """A shallow checkout of the Mathlib commit TauCeti's main pins, under the worker's state, fetched
     through the gate (a git read) and kept until the pin moves. An author often declines a target
@@ -1411,6 +1436,10 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             account = str(rec.get("summary") or "")
             named = lean_identifiers(account)
             hits = {ident: h for ident in named if (h := _grep_declarations(clone, ident))}
+            if not hits:
+                # An account may cite locations instead of names ("…/Cohomology.lean:544"): each cited
+                # file that exists on main, with the cited line, is evidence of the same kind.
+                hits = _cited_locations(clone, account)
             if not hits and named:
                 # "Mathlib already has it" is the other common decline; look there too.
                 if mathlib is None:
