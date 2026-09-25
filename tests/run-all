@@ -67,6 +67,7 @@ RUN_STDLIB=(
   gate_t14_noop_suppression.py
   gate_t15_offline_escape.py
   gate_t16_store_unavailable.py
+  gate_body_is_not_a_status.py
   publication_prune.py
   github_failure_reason.py
   github_ratelimit.py

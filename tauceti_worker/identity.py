@@ -52,7 +52,8 @@ _GH_USER_ARGV = ["gh", "api", "user", "--jq", ".login"]
 # (exit 4, no HTTP status); the others carry the status.
 _INVALID_RE = re.compile(r"HTTP 401|Bad credentials|not logged in|gh auth login", re.I)
 _FORBIDDEN_RE = re.compile(r"HTTP 403")
-_HALT_WORDS_RE = re.compile(r"suspended|locked|too many", re.I)
+# Whole words: "blocked" (a scoreboard rubric state) contains "locked" and halted the fleet once.
+_HALT_WORDS_RE = re.compile(r"\b(?:suspended|locked|too many)\b", re.I)
 _CONTROL_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f-\x9f]")  # whole escape sequences first
 # Never let a token-shaped string into a file or a log line, whatever produced the text.
 _TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")

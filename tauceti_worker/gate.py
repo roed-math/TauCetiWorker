@@ -227,9 +227,13 @@ class Outcome:
         if isinstance(text, bytes):
             text = text.decode(errors="replace")
         rc = getattr(p, "returncode", 1)
+        ok = (rc == 0) if ok is None else ok
+        # The status comes from gh's error line on a FAILED call only. A successful call's stdout is a
+        # response body, and bodies quote anything: on 2026-09-24 a PR comment that said "my retry
+        # request returned HTTP 403" was read as a 403, and the fleet halted as if suspended.
         return cls(
-            ok=(rc == 0) if ok is None else ok,
-            status=parse_status(text),
+            ok=ok,
+            status=None if ok else parse_status(text),
             text=text,
             duration_ms=duration_ms,
             retry_n=retry_n,
@@ -700,7 +704,7 @@ class Gate:
         now = self.now()
         b = self._budget()
         b["inflight"] = [e for e in b["inflight"] if e.get("token") != a.token]
-        status = o.status if o.status is not None else parse_status(o.text)
+        status = o.status if o.status is not None else (None if o.ok else parse_status(o.text))
         text = o.text or ""
         rate_remaining = _header(o, "x-ratelimit-remaining", _RATE_REMAINING_RE)
         rate_reset = _header(o, "x-ratelimit-reset", _RATE_RESET_RE)
