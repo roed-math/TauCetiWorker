@@ -162,6 +162,9 @@ check("a decline naming a Mathlib declaration is checked against the pinned Math
 check("…and a confirmed one marks the item done", "- [x] `directed-inter`" in new, new)
 check("an unconfirmed one stays open", "- [ ] `transgression`" in new and "- [ ] `pro-p-frattini`" in new)
 still = set(attention.declined_targets())
+check("a confirmed decline leaves the attention list",
+      not (TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json").exists()
+      and (TMP / "incidents" / "acked" / "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json").exists())
 check("the refuted decline is handed back to the authors", "transgression" not in still, str(still))
 check("the decline that names nothing on main waits for the owner", "pro-p-frattini" in still, str(still))
 inc = json.loads(next((TMP / "incidents").glob("targets-updated-*.json")).read_text())

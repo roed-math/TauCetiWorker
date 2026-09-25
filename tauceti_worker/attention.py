@@ -172,12 +172,17 @@ def declined_targets() -> dict[str, dict]:
 
 
 def mark_declined_target(path: str, **fields) -> None:
-    """Annotate a declined-target incident in place (the curator's verdict). Never raises."""
+    """Annotate a declined-target incident with the curator's verdict. Never raises. A decline the
+    curator confirmed (`curator="landed"`) needs nobody any more, so it moves to `acked/` and leaves
+    the fleet's attention list; it still counts for declined_targets, which reads both."""
     try:
         p = Path(path)
         rec = json.loads(p.read_text())
         rec.update(fields)
         p.write_text(json.dumps(rec, indent=1))
+        if fields.get("curator") == "landed" and p.parent.name != "acked":
+            (p.parent / "acked").mkdir(exist_ok=True)
+            p.replace(p.parent / "acked" / p.name)
     except (OSError, ValueError):
         pass
 
