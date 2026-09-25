@@ -41,6 +41,7 @@ ACCOUNTS = {
     "compactness-lemma": "Stopped: already on main as `nonempty_iInter_of_directed_nonempty_isClosed`, from PR #6239.",
     "transgression": "Stopped: main already has `transgressionMap` and its exactness.",
     "pro-p-frattini": "Stopped: I believe this exists already, but I did not find its name.",
+    "directed-inter": "Stopped: Mathlib already has `IsCompact.nonempty_iInter_of_directed_isClosed`; a copy would be a duplicate.",
 }
 
 
@@ -54,11 +55,14 @@ def decline(area, slug):
 p1 = decline("ProfiniteProPGroups", "compactness-lemma")
 p2 = decline("ProfiniteCohomology", "transgression")
 p3 = decline("ProfiniteProPGroups", "pro-p-frattini")
+p4 = decline("ProfiniteProPGroups", "directed-inter")
 names = sorted(p.name for p in (TMP / "incidents").glob("declined-*.json"))
 check("one incident per declined target", names == ["declined-roadmap-ProfiniteCohomology-transgression.json",
                                                     "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json",
+                                                    "declined-roadmap-ProfiniteProPGroups-directed-inter.json",
                                                     "declined-roadmap-ProfiniteProPGroups-pro-p-frattini.json"], str(names))
-check("declined_targets lists them by slug", set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini"})
+check("declined_targets lists them by slug",
+      set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini", "directed-inter"})
 
 # ---- the picker ---------------------------------------------------------------------------------------
 LIST = TMP / "targets.md"
@@ -69,6 +73,7 @@ LIST.write_text("""# t
 - [ ] `compactness-lemma` — L0, "Prove the directed intersection lemma." (serves: B1; needs: none)
 - [ ] `pro-p-frattini` — L1, "Prove the Frattini quotient statement." (serves: B1; needs: none)
 - [ ] `still-open` — L1, "Prove `somethingNew`." (serves: B1; needs: none)
+- [ ] `directed-inter` — L1, "A directed family of closed sets has nonempty intersection." (serves: B1; needs: none)
 
 ## ProfiniteCohomology
 - [ ] `transgression` — L2, "Construct the transgression." (serves: B3; needs: none)
@@ -89,6 +94,16 @@ clone = TMP / "state" / "curate" / "TauCeti"
 (clone / "TauCeti").mkdir(parents=True)
 (clone / "TauCeti" / "Compact.lean").write_text("theorem nonempty_iInter_of_directed_nonempty_isClosed : True := trivial\n")
 (clone / "TauCeti" / "Transgression.lean").write_text("def transgressionMap : Nat := 0\n")
+# a fake Mathlib at the commit main pins, holding only the lemma the "directed-inter" decline names
+ML = TMP / "mathlib-origin"
+(ML / "Mathlib" / "Topology").mkdir(parents=True)
+(ML / "Mathlib" / "Topology" / "Compact.lean").write_text(
+    "theorem IsCompact.nonempty_iInter_of_directed_isClosed : True := trivial\n")
+subprocess.run(["git", "-C", str(ML), "init", "-q"], check=True)
+subprocess.run(["git", "-C", str(ML), "add", "."], check=True)
+subprocess.run(["git", "-C", str(ML), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "ml"], check=True)
+ml_rev = subprocess.run(["git", "-C", str(ML), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+(clone / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "url": str(ML), "rev": ml_rev}]}))
 subprocess.run(["git", "-C", str(clone), "init", "-q"], check=True)
 subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
 subprocess.run(["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main"], check=True)
@@ -99,8 +114,10 @@ asked = {}
 def fake_agent(cwd, prompt, profile, logdir):
     cand = json.loads((Path(cwd) / "candidates.json").read_text())["candidates"]
     asked.update({c["slug"]: c for c in cand})
-    v = {c["slug"]: ({"landed": True, "evidence": "TauCeti/Compact.lean:1 `nonempty_iInter_of_directed_nonempty_isClosed` — the lemma"}
-                     if c["slug"] == "compactness-lemma" else {"landed": False, "evidence": "only the map, no exactness"})
+    yes = {"compactness-lemma": "TauCeti/Compact.lean:1 `nonempty_iInter_of_directed_nonempty_isClosed` — the lemma",
+           "directed-inter": "Mathlib/Topology/Compact.lean:1 `IsCompact.nonempty_iInter_of_directed_isClosed` — in Mathlib"}
+    v = {c["slug"]: ({"landed": True, "evidence": yes[c["slug"]]} if c["slug"] in yes
+                     else {"landed": False, "evidence": "only the map, no exactness"})
          for c in cand}
     (Path(cwd) / "verdicts.json").write_text(json.dumps(v))
     return 0
@@ -139,6 +156,10 @@ check("…with the agent's account and the declarations it named",
 new = LIST.read_text()
 check("a confirmed decline marks the item done, landed elsewhere",
       "- [x] `compactness-lemma`" in new and "landed elsewhere" in new, new)
+check("a decline naming a Mathlib declaration is checked against the pinned Mathlib",
+      any(h.startswith("Mathlib:Mathlib/Topology/Compact.lean")
+          for hs in asked.get("directed-inter", {}).get("hits", {}).values() for h in hs), str(asked.get("directed-inter")))
+check("…and a confirmed one marks the item done", "- [x] `directed-inter`" in new, new)
 check("an unconfirmed one stays open", "- [ ] `transgression`" in new and "- [ ] `pro-p-frattini`" in new)
 still = set(attention.declined_targets())
 check("the refuted decline is handed back to the authors", "transgression" not in still, str(still))

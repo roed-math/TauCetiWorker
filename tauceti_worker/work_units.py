@@ -569,8 +569,11 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
 
 
 def _open_pr_numbers(w: Worker) -> set[int] | None:
+    """This account's open PRs. Only ours: other contributors' workers also put target markers on
+    their PRs, so a list of everyone's let any stranger's new PR during the round read as this round's
+    work, and a round whose agent declined was taken for a success (2026-09-25)."""
     try:
-        return {p["number"] for p in w.gh.pr_list(["number"], state="open")}
+        return {p["number"] for p in w.gh.pr_list(["number"], author="@me", state="open")}
     except GitHubError:
         return None
 
@@ -1299,13 +1302,47 @@ def _curate_main_checkout(w) -> Path | None:
         return None
 
 
-def _grep_declarations(clone: Path, ident: str) -> list[str]:
+def _grep_declarations(clone: Path, ident: str, subdir: str = "TauCeti/") -> list[str]:
     name = ident.split(".")[-1]
     p = subprocess.run(
-        ["git", "-C", str(clone), "grep", "-nE", _DECL_RE_TEMPLATE.format(name=re.escape(name)), "--", "TauCeti/"],
+        ["git", "-C", str(clone), "grep", "-nE", _DECL_RE_TEMPLATE.format(name=re.escape(name)), "--", subdir],
         capture_output=True, text=True, timeout=120,
     )
-    return [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()][:5]
+    prefix = "" if subdir == "TauCeti/" else f"{clone.name}:"
+    return [prefix + ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()][:5]
+
+
+def _curate_mathlib_checkout(w, main_clone: Path) -> Path | None:
+    """A shallow checkout of the Mathlib commit TauCeti's main pins, under the worker's state, fetched
+    through the gate (a git read) and kept until the pin moves. An author often declines a target
+    because MATHLIB already has it (the reuse rubric forbids a duplicate), and the declaration it
+    names is then not in TauCeti's sources at all. None when it cannot be had."""
+    from . import gate as gate_mod
+
+    try:
+        manifest = json.loads((main_clone / "lake-manifest.json").read_text())
+        pkg = next(p for p in manifest["packages"] if p.get("name") == "mathlib")
+        url, rev = str(pkg["url"]), str(pkg["rev"])
+    except (OSError, ValueError, KeyError, StopIteration):
+        return None
+    ml = w.cfg.state / "curate" / "Mathlib"
+    head = subprocess.run(["git", "-C", str(ml), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if head.returncode == 0 and head.stdout.strip() == rev:
+        return ml
+    try:
+        ml.mkdir(parents=True, exist_ok=True)
+        if not (ml / ".git").is_dir():
+            subprocess.run(["git", "-C", str(ml), "init", "-q"], check=True)
+        p = gate_mod.gated_git(["git", "-C", str(ml), "fetch", "-q", "--depth", "1", url, rev],
+                               op="curate", target=url, capture_output=True)
+        if p.returncode != 0:
+            log(f"curate: could not fetch Mathlib {rev[:12]} ({(p.stderr or '').strip()[:120]})")
+            return None
+        subprocess.run(["git", "-C", str(ml), "checkout", "-q", "--force", "FETCH_HEAD"], check=True)
+        return ml
+    except Exception as e:  # noqa: BLE001 - Mathlib evidence is optional; TauCeti's stands without it
+        log(f"curate: no Mathlib checkout ({e})")
+        return None
 
 
 def _do_curate_inner(w, sv, opts) -> int | None:
@@ -1365,6 +1402,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             if all(hits.values()):
                 with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
                                       "identifiers": idents, "hits": hits})
+        mathlib = None
         for area, it in declined_cands:
             rec = declined[it.slug]
             prior = memo.get(it.slug) or {}
@@ -1373,6 +1411,12 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             account = str(rec.get("summary") or "")
             named = lean_identifiers(account)
             hits = {ident: h for ident in named if (h := _grep_declarations(clone, ident))}
+            if not hits and named:
+                # "Mathlib already has it" is the other common decline; look there too.
+                if mathlib is None:
+                    mathlib = _curate_mathlib_checkout(w, clone) or False
+                if mathlib:
+                    hits = {ident: h for ident in named if (h := _grep_declarations(mathlib, ident, "Mathlib/"))}
             if hits:
                 with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
                                       "identifiers": list(hits), "hits": hits, "author_account": account[:2000],
@@ -1387,8 +1431,10 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         work = w.cfg.state / "curate" / "work"
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True)
+        ml_dir = w.cfg.state / "curate" / "Mathlib"
         (work / "candidates.json").write_text(json.dumps(
-            {"main_checkout": str(clone), "candidates": with_evidence}, indent=1))
+            {"main_checkout": str(clone), "candidates": with_evidence,
+             **({"mathlib_checkout": str(ml_dir)} if (ml_dir / ".git").is_dir() else {})}, indent=1))
         prompt = (HERE / "prompts" / "curate.md").read_text()
         log(f"curate: {len(with_evidence)} candidate(s) whose identifiers are declared on main — asking the model")
         rc = run_agent_host(work, prompt, _effective_authoring_profile(opts), w.cfg.logdir)

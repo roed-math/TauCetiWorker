@@ -14,6 +14,10 @@ stopped, saying `main` already has it; the identifiers and hits for those candid
 declarations that account names. Treat the account as a lead, not a verdict: check it against the
 milestone text as strictly as any other candidate.
 
+A hit that begins `Mathlib:` is in the checkout of the Mathlib commit TauCeti's `main` pins, at
+`mathlib_checkout`. A milestone Mathlib already provides in the stated generality has landed too:
+the project reuses Mathlib rather than duplicating it. Name the Mathlib file and declaration then.
+
 A milestone has landed only if the declarations on `main` actually state what the milestone describes:
 the same objects, the same generality (a `ℚ_p`-only shortcut does not discharge a milestone stated for
 every local field), and the essential theorems, not just a definition with the same name. Be strict: a
