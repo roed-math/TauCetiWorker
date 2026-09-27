@@ -53,6 +53,12 @@ check("open items now eligible behind the merged one", [it.slug for it in T.elig
 idents = T.item_identifiers(by["open-item"])
 check("identifiers: CamelCase and dotted names, not math or plain words", idents == ["Teich.omega", "residueMap"], str(idents))
 check("no identifiers for a plain-prose item", T.item_identifiers(by["bare-item"]) == [])
+# The leading name of quoted code counts, and a namespace cut off by "…" does not (2026-09-27: four
+# undecided items whose declarations were all on main gave the curator no names).
+check("the leading name of quoted code is an identifier",
+      T.lean_identifiers("Define `unitFiltration K i : Subgroup Kˣ` and `finiteExtensionNormedField K L`.")
+      == ["unitFiltration", "finiteExtensionNormedField"])
+check("a dangling namespace is not", T.lean_identifiers("agreement with `Subgroup.` …") == [])
 
 marked, ok = T.mark_landed_elsewhere(new, "open-item", "TauCeti/X.lean:12 `Teich.omega`")
 t2 = T.parse_targets(marked)

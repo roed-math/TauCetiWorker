@@ -1349,10 +1349,11 @@ def _mark_merged_markers(text: str, merged: list[dict]) -> tuple[str, list[str]]
     return text, changes
 
 
-def _grep_declarations(clone: Path, ident: str, subdir: str = "TauCeti/") -> list[str]:
+def _grep_declarations(clone: Path, ident: str, subdir: str = "TauCeti/", *, ignore_case: bool = False) -> list[str]:
     name = ident.split(".")[-1]
     p = subprocess.run(
-        ["git", "-C", str(clone), "grep", "-nE", _DECL_RE_TEMPLATE.format(name=re.escape(name)), "--", subdir],
+        ["git", "-C", str(clone), "grep", "-nE" + ("i" if ignore_case else ""),
+         _DECL_RE_TEMPLATE.format(name=re.escape(name)), "--", subdir],
         capture_output=True, text=True, timeout=120,
     )
     prefix = "" if subdir == "TauCeti/" else f"{clone.name}:"
@@ -1480,17 +1481,20 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         except ValueError:
             memo = {}
         for area, it in candidates:
-            idents = item_identifiers(it)
-            if not idents:
-                continue
             # A "not landed" verdict holds until main moves: do not pay the model twice for it.
             prior = memo.get(it.slug) or {}
             if prior.get("landed") is False and prior.get("main_sha") == main_sha:
                 continue
+            idents = item_identifiers(it)
             hits = {ident: _grep_declarations(clone, ident) for ident in idents}
-            if all(hits.values()):
+            # The slug is, by the list's convention, the main declaration in kebab-case: look for it too
+            # (case-insensitively, dashes dropped), since an item's text often quotes no bare name at all.
+            by_slug = _grep_declarations(clone, it.slug.replace("-", ""), ignore_case=True)
+            if (idents and all(hits.values())) or by_slug:
+                if by_slug:
+                    hits[f"(slug) {it.slug}"] = by_slug
                 with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
-                                      "identifiers": idents, "hits": hits})
+                                      "identifiers": list(hits), "hits": hits})
         mathlib = None
         for area, it in declined_cands:
             rec = declined[it.slug]

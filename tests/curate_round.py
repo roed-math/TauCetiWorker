@@ -43,6 +43,7 @@ targets.write_text("""# targets
 - [ ] `landed-by-others` — L1, "Prove `Teich.omega` is a section of `residueMap`." (serves: B2; needs: `merged-one`)
 - [ ] `half-there` — L1, "Prove `Gone.thing` and `alsoGone`." (serves: B2; needs: `merged-one`)
 - [ ] `not-landed` — L1, "Prove `frobeniusAlgEquiv`." (serves: B2; needs: `merged-one`)
+- [ ] `also-gone` — L1, "A milestone described in prose only." (serves: B2; needs: `merged-one`)
 """)
 os.environ["TAUCETI_ROADMAP_TARGETS"] = str(targets)
 
@@ -123,7 +124,9 @@ check("tier A read each in-flight PR once", sorted(GH.calls) == [101, 102, 103],
 new = targets.read_text()
 check("merged and subsumed items are done", "- [x] `merged-one`" in new and "landed: #101" in new and "- [x] `subsumed-one`" in new and "subsumed by: #900; closed: #102" in new)
 check("the closed PR without a verdict is left in flight", "- [~] `closed-quiet`" in new)
-check("only fully evidenced eligible items went to the model", asked.get("slugs") == ["landed-by-others", "not-landed"], str(asked))
+check("only evidenced eligible items went to the model", asked.get("slugs") == ["landed-by-others", "not-landed", "also-gone"], str(asked))
+check("an item whose slug names a declaration on main goes to the model even with no names in its text",
+      "also-gone" in asked.get("slugs", []))
 check("the prompt tells the model where to write", asked.get("prompt_names_file") is True)
 check("the confirmed item is marked landed elsewhere with its evidence", "- [x] `landed-by-others`" in new and "landed elsewhere: TauCeti/Teich.lean:1" in new)
 check("the refused and half-evidenced items stay open", "- [ ] `not-landed`" in new and "- [ ] `half-there`" in new)

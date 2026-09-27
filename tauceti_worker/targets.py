@@ -262,7 +262,9 @@ def render_area_block(targets: Targets, area: str) -> str:
 # ---- curation: keeping the file true after the PRs it names have moved on ---------------------------
 
 _INFLIGHT_RE = re.compile(r"in flight: #(\d+)")
-_LEAN_IDENT_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_'.]{3,})`")
+# The LEADING name of any backticked code: `unitFiltration K i : Subgroup Kˣ` names `unitFiltration`,
+# not nothing (2026-09-27: four items whose declarations were all on main gave the curator no names).
+_LEAN_IDENT_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_'.]{3,})(?=[`\s(])")
 _LOWER_WORDS = {"none", "main", "true", "false", "then", "with", "from", "into", "over", "that", "this"}
 
 
@@ -290,6 +292,8 @@ def lean_identifiers(text: str) -> list[str]:
     and math (`ℚ_[p]`, `q − 1`) are not evidence of anything. In order, deduplicated."""
     seen: list[str] = []
     for tok in _LEAN_IDENT_RE.findall(text or ""):
+        if tok.endswith("."):  # `Subgroup.` is a namespace cut off by the text, not a declaration
+            continue
         if tok.lower() in _LOWER_WORDS:
             continue
         if not (any(c.isupper() for c in tok) or "." in tok or "_" in tok):
