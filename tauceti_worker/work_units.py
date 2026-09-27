@@ -2160,7 +2160,10 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
     except NoProgress as e:
         # An idle author is waste: while there is room under the project's cap, it authors outside the
         # list instead (owner's ruling, 2026-09-27); the list itself is untouched.
-        n_ours = len(sv._mine_open_prs)
+        mine = getattr(sv, "_mine_open_prs", None)
+        if mine is None:
+            raise  # no survey, no count: nothing says there is room, so the list's reason stands
+        n_ours = len(mine)
         if n_ours > TARGETS_FALLBACK_MAX_OPEN:
             raise NoProgress(f"{e}; not authoring outside the list either ({n_ours} open PRs of ours > "
                              f"{TARGETS_FALLBACK_MAX_OPEN})") from None
