@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""`git` for review rounds in a bubble: keep bubble's routing when the caller hides the user config.
+
+Inside a bubble, git reaches GitHub only through bubble's auth proxy, and that routing lives in the
+container user's ~/.gitconfig (`url.<proxy>.insteadOf = https://github.com/` plus the proxy's token
+header). TauCetiReview's pr_diff (#146, 2026-09-26) runs git with GIT_CONFIG_GLOBAL=/dev/null so no
+user or system config can affect the diff; in a bubble that also dropped the routing, git tried
+github.com directly, the sandbox refused, and every review died after a 135 s connect timeout
+("could not compute the diff"). This wrapper re-applies exactly those two kinds of setting, from the
+same file, as `-c` options, and only when the caller has blanked the global config; otherwise it is
+plain git. It is first on PATH only for review rounds.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+rest = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
+                       if p and os.path.abspath(p) != here)
+real = shutil.which("git", path=rest)
+if real is None:
+    sys.exit("review-git: no git on PATH")
+args = [real]
+if os.environ.get("GIT_CONFIG_GLOBAL") == os.devnull:
+    cfg = os.path.join(os.environ.get("HOME", ""), ".gitconfig")
+    if os.path.isfile(cfg):
+        out = subprocess.run(
+            [real, "config", "--file", cfg, "--get-regexp", r"^(url\..*\.insteadof|http\..*\.extraheader)$"],
+            capture_output=True, text=True,
+        ).stdout
+        for line in out.splitlines():
+            key, _, value = line.partition(" ")
+            args += ["-c", f"{key}={value}"]
+os.execv(real, args + sys.argv[1:])

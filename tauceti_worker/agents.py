@@ -1594,6 +1594,11 @@ def run_in_bubble(
     for f in BUBBLE_ROUND_SCRIPTS:
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
+    # The review rounds' git (see scripts/review-git/git): in its own folder, so it is on PATH only
+    # where do_review_bubble puts it.
+    (rounddir / "review-git").mkdir(exist_ok=True)
+    shutil.copy(HERE / "scripts" / "review-git" / "git", rounddir / "review-git" / "git")
+    os.chmod(rounddir / "review-git" / "git", 0o755)
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -1833,8 +1838,12 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     codex_flag = f" --codex-model {shlex.quote(cm)}" if cm else ""  # operator override; else engine default
     km = _kiro_review_model(reviewers)
     kiro_flag = f" --kiro-model {shlex.quote(km)}" if km else ""
+    # review-git first: the engine's pr_diff hides the user git config, which in a bubble is also what
+    # routes git through the proxy (scripts/review-git/git). `$PATH` is expanded by the same shell that
+    # expands run_in_bubble's own prefix, so /opt/round is named again here.
     inner = (
-        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
+        "env PATH=/opt/round/review-git:/opt/round:$PATH "
+        "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
         f"--no-mathlib --no-sync --store /opt/review-store --post "
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
