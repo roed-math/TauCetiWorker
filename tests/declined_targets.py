@@ -43,6 +43,8 @@ ACCOUNTS = {
     "pro-p-frattini": "Stopped: I believe this exists already, but I did not find its name.",
     "h2-bijection": "Stopped: merged PR #8400 covers it: [the bijection](/home/user/tauceti/TauCeti/Ext/Cohomology.lean:2), "
                     "and [a stale path](/home/user/tauceti/TauCeti/Gone.lean:9).",
+    "ambient-model": "Stopped: already covered by merged PR #8192, which uses the identical target marker.",
+    "relation-rank": "Stopped: blocked by overlapping open work in PR #9043; compose after it merges.",
     "directed-inter": "Stopped: Mathlib already has `IsCompact.nonempty_iInter_of_directed_isClosed`; a copy would be a duplicate.",
 }
 
@@ -59,14 +61,19 @@ p2 = decline("ProfiniteCohomology", "transgression")
 p3 = decline("ProfiniteProPGroups", "pro-p-frattini")
 p4 = decline("ProfiniteProPGroups", "directed-inter")
 p5 = decline("ProfiniteProPGroups", "h2-bijection")
+p6 = decline("ProfiniteCohomology", "ambient-model")
+p7 = decline("ProfiniteProPGroups", "relation-rank")
 names = sorted(p.name for p in (TMP / "incidents").glob("declined-*.json"))
-check("one incident per declined target", names == ["declined-roadmap-ProfiniteCohomology-transgression.json",
+check("one incident per declined target", names == ["declined-roadmap-ProfiniteCohomology-ambient-model.json",
+                                                    "declined-roadmap-ProfiniteCohomology-transgression.json",
                                                     "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json",
                                                     "declined-roadmap-ProfiniteProPGroups-directed-inter.json",
                                                     "declined-roadmap-ProfiniteProPGroups-h2-bijection.json",
-                                                    "declined-roadmap-ProfiniteProPGroups-pro-p-frattini.json"], str(names))
+                                                    "declined-roadmap-ProfiniteProPGroups-pro-p-frattini.json",
+                                                    "declined-roadmap-ProfiniteProPGroups-relation-rank.json"], str(names))
 check("declined_targets lists them by slug",
-      set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini", "directed-inter", "h2-bijection"})
+      set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini", "directed-inter", "h2-bijection",
+                                            "ambient-model", "relation-rank"})
 
 # ---- the picker ---------------------------------------------------------------------------------------
 LIST = TMP / "targets.md"
@@ -77,10 +84,12 @@ LIST.write_text("""# t
 - [ ] `compactness-lemma` — L0, "Prove the directed intersection lemma." (serves: B1; needs: none)
 - [ ] `pro-p-frattini` — L1, "Prove the Frattini quotient statement." (serves: B1; needs: none)
 - [ ] `still-open` — L1, "Prove `somethingNew`." (serves: B1; needs: none)
+- [ ] `relation-rank` — L6, "The relation rank." (serves: B3; needs: none)
 - [ ] `h2-bijection` — L5, "Extensions correspond to H²." (serves: B3; needs: none)
 - [ ] `directed-inter` — L1, "A directed family of closed sets has nonempty intersection." (serves: B1; needs: none)
 
 ## ProfiniteCohomology
+- [ ] `ambient-model` — L4, "The ambient model." (serves: B6; needs: none)
 - [ ] `transgression` — L2, "Construct the transgression." (serves: B3; needs: none)
 """)
 t = parse_targets(LIST.read_text())
@@ -130,6 +139,10 @@ def fake_agent(cwd, prompt, profile, logdir):
     return 0
 
 
+PRS = {
+    8192: {"state": "MERGED", "body": '<!--tauceti-target:v1 {"focus":"ProfiniteCohomology","id":"ambient-model"}-->'},
+    9043: {"state": "OPEN", "body": "overlapping work"},
+}
 W.run_agent_host = fake_agent
 W._effective_authoring_profile = lambda opts: "claude"
 W._live_target_view = lambda t, path, sv, gh: (t, 0, 0)
@@ -151,7 +164,7 @@ class Counters:
         return 0
 
 
-w = SimpleNamespace(cfg=SimpleNamespace(state=TMP / "state", logdir=TMP / "logs"), gh=SimpleNamespace(pr_view=lambda *a: {}, pr_list=lambda *a, **k: []),
+w = SimpleNamespace(cfg=SimpleNamespace(state=TMP / "state", logdir=TMP / "logs"), gh=SimpleNamespace(pr_view=lambda n, f: PRS.get(n, {}), pr_list=lambda *a, **k: []),
                     claims=Claims(), counters=Counters())
 rc = W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
 check("the curator round wrote a change", rc == 0, str(rc))
@@ -175,11 +188,26 @@ still = set(attention.declined_targets())
 check("a confirmed decline leaves the attention list",
       not (TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json").exists()
       and (TMP / "incidents" / "acked" / "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json").exists())
+check("a decline naming a PR merged with the item's marker marks it done, landed: #N",
+      "- [x] `ambient-model` — L4, \"The ambient model.\" (serves: B6; needs: none; landed: #8192)" in new, new)
+check("…without asking the model", "ambient-model" not in asked)
+check("a decline blocked on an open PR stays skipped, not done, and asks nobody",
+      "- [ ] `relation-rank`" in new and "relation-rank" in attention.declined_targets() and "relation-rank" not in asked
+      and not (TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-relation-rank.json").exists())
 check("the refuted decline is handed back to the authors", "transgression" not in still, str(still))
 check("the decline that names nothing on main waits for the owner", "pro-p-frattini" in still, str(still))
 inc = json.loads(next((TMP / "incidents").glob("targets-updated-*.json")).read_text())
 check("the owner is told about it", any("pro-p-frattini" in u and "owner decides" in u for u in inc.get("undecided", [])),
       str(inc.get("undecided")))
+
+# ---- once the blocking PR merges, the next pass hands the target back ----------------------------------------
+PRS[9043] = {"state": "MERGED", "body": "someone else's work, no marker for relation-rank"}
+try:
+    W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
+except NoProgress:
+    pass
+check("when the blocking PR is no longer open, the target goes back to the authors",
+      "relation-rank" not in attention.declined_targets(), str(sorted(attention.declined_targets())))
 
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)

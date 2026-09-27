@@ -583,8 +583,8 @@ class GitHub:
         raise GitHubError(f"open PR query exceeded {OPEN_PR_MAX_PAGES} pages of {page} ({len(out)} PRs so far)")
 
     def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open",
-                search: str | None = None) -> list[dict]:
-        args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200", "--json", ",".join(fields)]
+                search: str | None = None, limit: int = 200) -> list[dict]:
+        args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", str(limit), "--json", ",".join(fields)]
         if author:
             args += ["--author", author]
         if search:

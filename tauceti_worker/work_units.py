@@ -1302,6 +1302,28 @@ def _curate_main_checkout(w) -> Path | None:
         return None
 
 
+def _declined_by_named_prs(w, rec: dict, area: str, slug: str) -> tuple[str, int]:
+    """What the PRs a declining author named say about its target: ("merged", N) when #N is merged
+    and carries this item's marker; ("blocked", N) when #N is still open (the author stopped to avoid
+    overlapping it); ("unblocked", N) when the PR a previous pass found blocking is no longer open;
+    else ("", 0). At most five gated reads."""
+    named = [int(n) for n in list(rec.get("subsumed_by") or []) + list(rec.get("mentions") or []) if str(n).isdigit()]
+    blocked_on = rec.get("blocked_on")
+    open_pr = 0
+    for n in list(dict.fromkeys(named))[:5]:
+        d = w.gh.pr_view(n, ["state", "body"]) or {}
+        state = str(d.get("state") or "")
+        if state == "MERGED" and (area, slug) in set(target_marker_ids(d.get("body") or "")):
+            return "merged", n
+        if state == "OPEN" and not open_pr:
+            open_pr = n
+    if open_pr:
+        return "blocked", open_pr
+    if isinstance(blocked_on, int):
+        return "unblocked", blocked_on
+    return "", 0
+
+
 def _mark_merged_markers(text: str, merged: list[dict]) -> tuple[str, list[str]]:
     """Mark done every listed item that is not yet done and whose marker a merged PR carries. Pure
     apart from parsing: `merged` is `[{number, body}]`."""
@@ -1390,7 +1412,14 @@ def _curate_mathlib_checkout(w, main_clone: Path) -> Path | None:
 
 def _do_curate_inner(w, sv, opts) -> int | None:
     from .attention import declined_targets, mark_declined_target, verdicts_by_pr
-    from .targets import inflight_prs, item_identifiers, lean_identifiers, mark_landed_elsewhere, sync_inflight
+    from .targets import (
+        inflight_prs,
+        item_identifiers,
+        lean_identifiers,
+        mark_landed_elsewhere,
+        mark_merged,
+        sync_inflight,
+    )
 
     path = roadmap_targets()
     if path is None:
@@ -1407,8 +1436,9 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     # ---- tier A': merged PRs carrying a listed item's marker, whoever opened them. The live view sees
     # these only while they are recent; writing them into the file keeps them.
     try:
-        merged = w.gh.pr_list(["number", "body"], state="merged", search=MERGED_MARKER_SEARCH)
-    except GitHubError as e:
+        # The curator runs every few hours, so it looks further back than a round's live view.
+        merged = w.gh.pr_list(["number", "body"], state="merged", search=MERGED_MARKER_SEARCH, limit=CURATE_MERGED_LIMIT)
+    except (GitHubError, TypeError) as e:
         merged = []
         log(f"curate: could not list merged PRs with target markers ({e})")
     new_text, more = _mark_merged_markers(new_text, merged)
@@ -1457,6 +1487,25 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         mathlib = None
         for area, it in declined_cands:
             rec = declined[it.slug]
+            # The PRs the agent named settle most declines outright: one merged with this item's marker
+            # means done; one still open means the target is blocked, not done, and waits for it.
+            verdict, pr_no = _declined_by_named_prs(w, rec, area, it.slug)
+            if verdict == "merged":
+                new_text, ok = mark_merged(new_text, it.slug, pr_no)
+                if ok:
+                    changes.append(f"`{it.slug}`: done — landed: #{pr_no} (merged with its marker, named by the declining author)")
+                    log(f"curate: `{it.slug}` marked done — #{pr_no} merged with its marker")
+                mark_declined_target(rec.get("path", ""), curator="landed", curator_evidence=f"#{pr_no} merged with its marker")
+                continue
+            if verdict == "blocked":
+                log(f"curate: `{it.slug}` is blocked on open #{pr_no}, not done — skipped until that PR closes")
+                mark_declined_target(rec.get("path", ""), blocked_on=pr_no)
+                continue
+            if verdict == "unblocked":
+                mark_declined_target(rec.get("path", ""), curator="not-landed",
+                                     curator_evidence=f"the PR it waited on (#{pr_no}) is no longer open")
+                log(f"curate: `{it.slug}` handed back to the authors (#{pr_no}, which blocked it, is no longer open)")
+                continue
             prior = memo.get(it.slug) or {}
             if prior.get("landed") is False and prior.get("main_sha") == main_sha:
                 continue
@@ -1930,6 +1979,7 @@ MAX_TARGET_ACQUIRES = 8  # claim.sh acquires per round — each is a git push ro
 # after it merged (2026-09-25). This window reaches back about a day; the list file and the curator
 # hold everything older.
 MERGED_MARKER_SEARCH = '"tauceti-target:v1" in:body sort:updated-desc'
+CURATE_MERGED_LIMIT = 1000  # the curator's look-back: several days of marker-bearing merges
 
 
 def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, int, int]:
