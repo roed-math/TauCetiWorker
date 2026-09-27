@@ -65,6 +65,10 @@ t2 = T.parse_targets(marked)
 it2 = {it.slug: it for items in t2.areas.values() for it in items}["open-item"]
 check("landed elsewhere marks the item done with its evidence in the metadata", ok and it2.status == "done" and "landed elsewhere: TauCeti/X.lean:12" in it2.line)
 check("marking an unknown slug changes nothing", T.mark_landed_elsewhere(new, "nope", "x") == (new, False))
+inflight = "- [~] `stuck` — L0, \"Define `unitFiltration`.\" (serves: B1; needs: none; in flight: #5500)\n"
+got, ok = T.mark_landed_elsewhere(inflight, "stuck", "TauCeti/U.lean:95 `unitFiltration`")
+check("an in-flight item whose PR closed is marked done too, without its in-flight clause",
+      ok and got == "- [x] `stuck` — L0, \"Define `unitFiltration`.\" (serves: B1; needs: none; landed elsewhere: TauCeti/U.lean:95 `unitFiltration`)\n", got)
 check("idempotent sync", T.sync_inflight(new, states, verdicts)[0] == new)
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)

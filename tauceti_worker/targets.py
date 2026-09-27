@@ -335,17 +335,19 @@ def sync_inflight(text: str, states: dict[int, str], verdicts: dict[int, dict]) 
 
 
 def mark_landed_elsewhere(text: str, slug: str, evidence: str) -> tuple[str, bool]:
-    """Mark an open item done because main already provides it (found by the curator, not by a PR
-    of ours): `[x]` with `landed elsewhere: <evidence>` added to its metadata. Pure."""
+    """Mark an open or in-flight item done because main already provides it (found by the curator, not
+    by a PR of ours): `[x]` with `landed elsewhere: <evidence>` added to its metadata; an `in flight:`
+    clause (its PR closed) is dropped. Pure. In-flight counts: on 2026-09-27 four `[~]` items whose PRs
+    had closed were confirmed on main, and the verdicts were dropped because only `[ ]` matched."""
     out, done = [], False
     for line in text.splitlines(keepends=True):
-        if not done and re.match(r"- \[ \] `" + re.escape(slug) + r"`", line):
-            body = line.rstrip("\n")
+        if not done and re.match(r"- \[[ ~]\] `" + re.escape(slug) + r"`", line):
+            body = re.sub(r";?\s*in flight: #\d+", "", line.rstrip("\n"))
             if body.endswith(")"):
                 body = body[:-1] + f"; landed elsewhere: {evidence})"
             else:
                 body += f" (landed elsewhere: {evidence})"
-            line = body.replace("- [ ]", "- [x]", 1) + "\n"
+            line = re.sub(r"^- \[[ ~]\]", "- [x]", body, count=1) + "\n"
             done = True
         out.append(line)
     return "".join(out), done
