@@ -151,7 +151,7 @@ class Counters:
         return 0
 
 
-w = SimpleNamespace(cfg=SimpleNamespace(state=TMP / "state", logdir=TMP / "logs"), gh=SimpleNamespace(pr_view=lambda *a: {}),
+w = SimpleNamespace(cfg=SimpleNamespace(state=TMP / "state", logdir=TMP / "logs"), gh=SimpleNamespace(pr_view=lambda *a: {}, pr_list=lambda *a, **k: []),
                     claims=Claims(), counters=Counters())
 rc = W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
 check("the curator round wrote a change", rc == 0, str(rc))

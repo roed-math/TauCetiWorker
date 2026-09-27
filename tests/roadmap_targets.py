@@ -163,7 +163,7 @@ class FakeGitHub:
         self.fail = fail
         self.calls = []
 
-    def pr_list(self, fields, *, author=None, state="open"):
+    def pr_list(self, fields, *, author=None, state="open", search=None):
         self.calls.append((tuple(fields), state))
         if self.fail:
             raise tc.github.GitHubError("gh pr list failed: 504")

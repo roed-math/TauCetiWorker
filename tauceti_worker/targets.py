@@ -345,3 +345,20 @@ def mark_landed_elsewhere(text: str, slug: str, evidence: str) -> tuple[str, boo
             done = True
         out.append(line)
     return "".join(out), done
+
+
+def mark_merged(text: str, slug: str, pr: int) -> tuple[str, bool]:
+    """Mark an open or in-flight item done because a MERGED PR carries its target marker: `[x]` with
+    `landed: #N` in its metadata (an `in flight:` clause is dropped). Pure."""
+    out, done = [], False
+    for line in text.splitlines(keepends=True):
+        if not done and re.match(r"- \[[ ~]\] `" + re.escape(slug) + r"`", line):
+            body = re.sub(r";?\s*in flight: #\d+", "", line.rstrip("\n"))
+            if body.endswith(")"):
+                body = body[:-1] + f"; landed: #{pr})"
+            else:
+                body += f" (landed: #{pr})"
+            line = re.sub(r"^- \[[ ~]\]", "- [x]", body, count=1) + "\n"
+            done = True
+        out.append(line)
+    return "".join(out), done

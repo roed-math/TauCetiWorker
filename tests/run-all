@@ -32,6 +32,7 @@ RUN_STDLIB=(
   curate_sync.py
   curate_round.py
   declined_targets.py
+  merged_markers.py
   auto_stage_priority.py
   authoring_profiles.py
   bubble_cache.py

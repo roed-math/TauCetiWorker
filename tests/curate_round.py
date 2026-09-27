@@ -111,7 +111,7 @@ class GH:
         GH.calls.append(pr)
         return {"state": STATES.get(pr, "OPEN")}
 
-    def pr_list(self, fields, state="merged"):
+    def pr_list(self, fields, state="merged", **kw):
         return []
 
 

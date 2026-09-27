@@ -1302,6 +1302,24 @@ def _curate_main_checkout(w) -> Path | None:
         return None
 
 
+def _mark_merged_markers(text: str, merged: list[dict]) -> tuple[str, list[str]]:
+    """Mark done every listed item that is not yet done and whose marker a merged PR carries. Pure
+    apart from parsing: `merged` is `[{number, body}]`."""
+    from .targets import mark_merged
+
+    listed = parse_targets(text)
+    status = {(area, it.slug): it.status for area, items in listed.areas.items() for it in items}
+    changes = []
+    for d in sorted(merged, key=lambda d: int(d.get("number") or 0)):
+        for key in target_marker_ids(d.get("body") or ""):
+            if status.get(key) in ("open", "inflight"):
+                text, ok = mark_merged(text, key[1], int(d["number"]))
+                if ok:
+                    status[key] = "done"
+                    changes.append(f"`{key[1]}`: done — landed: #{d['number']} (merged with its marker)")
+    return text, changes
+
+
 def _grep_declarations(clone: Path, ident: str, subdir: str = "TauCeti/") -> list[str]:
     name = ident.split(".")[-1]
     p = subprocess.run(
@@ -1386,6 +1404,15 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         if d and d.get("state"):
             states[pr] = str(d["state"])
     new_text, changes = sync_inflight(text, states, verdicts_by_pr())
+    # ---- tier A': merged PRs carrying a listed item's marker, whoever opened them. The live view sees
+    # these only while they are recent; writing them into the file keeps them.
+    try:
+        merged = w.gh.pr_list(["number", "body"], state="merged", search=MERGED_MARKER_SEARCH)
+    except GitHubError as e:
+        merged = []
+        log(f"curate: could not list merged PRs with target markers ({e})")
+    new_text, more = _mark_merged_markers(new_text, merged)
+    changes += more
     undecided = [ln for ln in changes if "owner decides" in ln]
     for ln in changes:
         log(f"curate: {ln}")
@@ -1897,6 +1924,14 @@ def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
 MAX_TARGET_ACQUIRES = 8  # claim.sh acquires per round — each is a git push round-trip
 
 
+# The merged PRs that carry a target marker, most recently UPDATED first (a merge is an update). A plain
+# `pr list --state merged` returns the most recently CREATED ones: with ~200 PRs a day, a long-lived PR
+# merging today was outside the window, and an author was sent to redo #8199's target a few minutes
+# after it merged (2026-09-25). This window reaches back about a day; the list file and the curator
+# hold everything older.
+MERGED_MARKER_SEARCH = '"tauceti-target:v1" in:body sort:updated-desc'
+
+
 def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, int, int]:
     """The operator's list under the live PR overlay (see targets.overlay_live): an open PR whose
     target marker names a listed (area, slug) puts that item in flight; a merged one marks it done.
@@ -1910,7 +1945,7 @@ def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, in
     done: set[tuple[str, str]] = set()
     if gh is not None:
         try:
-            for d in gh.pr_list(["number", "body"], state="merged"):
+            for d in gh.pr_list(["number", "body"], state="merged", search=MERGED_MARKER_SEARCH):
                 done.update(target_marker_ids(d.get("body") or ""))
         except GitHubError as e:
             log(f"roadmap: could not list merged PRs for the live target view ({e}) — using the marks in {path}")
