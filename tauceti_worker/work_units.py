@@ -331,7 +331,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     if not opts.dry_run:
         mirror_creds(w.cfg)
         _reconcile_previous_publications(w)
-    sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
+    # The deep survey reads every open PR's review state (scoreboard, threads) to classify review and
+    # fix work. A round that can only author or curate uses none of it: the open-PR list, their labels
+    # and target markers come from the one listing. Skipping it roughly halved the fleet's reads while
+    # four authors sat idle at the read budget (2026-09-27).
+    sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=not _author_only(opts))
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
@@ -2015,6 +2019,10 @@ MAX_TARGET_ACQUIRES = 8  # claim.sh acquires per round — each is a git push ro
 # merging today was outside the window, and an author was sent to redo #8199's target a few minutes
 # after it merged (2026-09-25). This window reaches back about a day; the list file and the curator
 # hold everything older.
+# When a target list has nothing to offer, an author works outside it only while this account has at
+# most this many open PRs: the project's backpressure rule stops authoring at MAX_OPEN_PRS, and a list
+# item that becomes eligible should find room for its PR. Owner's ruling, 2026-09-27.
+TARGETS_FALLBACK_MAX_OPEN = int(os.environ.get("TAUCETI_TARGETS_FALLBACK_MAX_OPEN", "6"))
 MERGED_MARKER_SEARCH = '"tauceti-target:v1" in:body sort:updated-desc'
 CURATE_MERGED_LIMIT = 1000  # the curator's look-back: several days of marker-bearing merges
 
@@ -2130,6 +2138,38 @@ def _without_declined(candidates: list[tuple[str, TargetItem]]) -> list[tuple[st
     return kept
 
 
+def _author_only(opts) -> bool:
+    """A round restricted to authoring and/or curating: nothing in it reads review state."""
+    only = set(getattr(opts, "only", None) or [])
+    return bool(only) and only <= {"roadmap", "curate"}
+
+
+def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]):
+    """The target this authoring round works on, under the live overlay, or None when the list has
+    nothing to offer (every eligible item in flight, blocked, declined or claimed) and this account has
+    room for a PR outside it: at most TARGETS_FALLBACK_MAX_OPEN open PRs. Without that room the reason
+    stands as NoProgress. Returns (live targets, area, item, claimed, candidates, n_inflight, n_merged)."""
+    try:
+        live, n_inflight, n_merged = _live_target_view(targets, path, sv, w.gh)
+        candidates = _target_candidates(live, path, only, skip)
+        # A target an author already declined (the agent found it on main, most often) is not offered
+        # again: every author would spend a round to reach the same answer. The curator weighs the
+        # agent's account against main and marks it done, or hands it back.
+        candidates = _without_declined(candidates)
+        area, item, claimed = _claim_target(w.claims, candidates, path)
+    except NoProgress as e:
+        # An idle author is waste: while there is room under the project's cap, it authors outside the
+        # list instead (owner's ruling, 2026-09-27); the list itself is untouched.
+        n_ours = len(sv._mine_open_prs)
+        if n_ours > TARGETS_FALLBACK_MAX_OPEN:
+            raise NoProgress(f"{e}; not authoring outside the list either ({n_ours} open PRs of ours > "
+                             f"{TARGETS_FALLBACK_MAX_OPEN})") from None
+        log(f"roadmap: {e} — authoring outside the target list instead ({n_ours} open PRs of ours ≤ "
+            f"{TARGETS_FALLBACK_MAX_OPEN})")
+        return None
+    return live, area, item, claimed, candidates, n_inflight, n_merged
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
@@ -2139,29 +2179,27 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     if targets is not None:
         # The worker, not the agent, chooses and claims the target: N workers started on one file
         # settle who does what here, before any model runs, through the round's lease + heartbeat.
-        targets, n_inflight, n_merged = _live_target_view(targets, targets_path, sv, w.gh)
-        candidates = _target_candidates(targets, targets_path, only, skip)
-        # A target an author already declined (the agent found it on main, most often) is not offered
-        # again: every author would spend a round to reach the same answer. The curator weighs the
-        # agent's account against main and marks it done, or hands it back.
-        candidates = _without_declined(candidates)
-        only, item, claimed = _claim_target(w.claims, candidates, targets_path)
-        w.current_target = f"{only}/{item.slug}"
-        n_open = sum(len(open_items(targets, a)) for a in targets.areas)
-        log(
-            f"→ ROADMAP target: {only}/{item.slug} ({'claimed' if claimed else 'unclaimed'}; {len(candidates)} "
-            f"eligible of {n_open} open in {len({a for a, _ in candidates})} areas; live: {n_inflight} in flight, "
-            f"{n_merged} merged)"
-        )
-        assigned_str = _render_assigned(targets, item)
-    elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
+        picked = _pick_target(w, sv, targets, targets_path, only, skip)
+        if picked is None:
+            targets, only = None, (c.reason or "any")
+        else:
+            targets, only, item, claimed, candidates, n_inflight, n_merged = picked
+            w.current_target = f"{only}/{item.slug}"
+            n_open = sum(len(open_items(targets, a)) for a in targets.areas)
+            log(
+                f"→ ROADMAP target: {only}/{item.slug} ({'claimed' if claimed else 'unclaimed'}; {len(candidates)} "
+                f"eligible of {n_open} open in {len({a for a, _ in candidates})} areas; live: {n_inflight} in flight, "
+                f"{n_merged} merged)"
+            )
+            assigned_str = _render_assigned(targets, item)
+    if targets is None and only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         raw_areas = roadmap_areas(w.gh)
         areas = [a for a in raw_areas if a not in skip]
         if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
             raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
         only = random.choice(areas) if areas else "any"
         log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)})")
-    elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
+    elif targets is None and only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is
     # already excluded from the auto pick above, so this only matters for an explicit --roadmap-only.
