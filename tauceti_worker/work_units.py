@@ -2144,6 +2144,51 @@ def _author_only(opts) -> bool:
     return bool(only) and only <= {"roadmap", "curate"}
 
 
+from . import constants as _constants  # noqa: E402 - ROUND_TIMEOUT for the fallback slots' expiry
+
+
+def _fallback_dir() -> Path | None:
+    """Where fleet workers record that they are authoring outside the target list: beside the shared
+    gate store, so every worker of one fleet sees every other. None outside a fleet (no gate)."""
+    g = os.environ.get("TAUCETI_GATE_DIR", "").strip()
+    return Path(g) / "fallback-authoring" if g else None
+
+
+def _fallback_slots(w) -> int:
+    """Other workers' live slots (a slot outlives its round only by a crash; it expires with the
+    round timeout)."""
+    d = _fallback_dir()
+    if d is None or not d.is_dir():
+        return 0
+    n, now = 0, time.time()
+    for f in d.iterdir():
+        try:
+            if f.name == w.cfg.wid:
+                continue
+            if now - f.stat().st_mtime > _constants.ROUND_TIMEOUT + 600:
+                f.unlink(missing_ok=True)
+                continue
+            n += 1
+        except OSError:
+            continue
+    return n
+
+
+def _hold_fallback_slot(w) -> None:
+    import atexit
+
+    d = _fallback_dir()
+    if d is None:
+        return
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        slot = d / w.cfg.wid
+        slot.write_text(str(os.getpid()))
+        atexit.register(lambda: slot.unlink(missing_ok=True))  # the round is its own process
+    except OSError:
+        pass
+
+
 def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]):
     """The target this authoring round works on, under the live overlay, or None when the list has
     nothing to offer (every eligible item in flight, blocked, declined or claimed) and this account has
@@ -2164,11 +2209,15 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
         if mine is None:
             raise  # no survey, no count: nothing says there is room, so the list's reason stands
         n_ours = len(mine)
-        if n_ours > TARGETS_FALLBACK_MAX_OPEN:
-            raise NoProgress(f"{e}; not authoring outside the list either ({n_ours} open PRs of ours > "
-                             f"{TARGETS_FALLBACK_MAX_OPEN})") from None
-        log(f"roadmap: {e} — authoring outside the target list instead ({n_ours} open PRs of ours ≤ "
-            f"{TARGETS_FALLBACK_MAX_OPEN})")
+        # Several authors can reach this point in the same minute; each one authoring outside the list
+        # holds a slot until its round ends, so together they never take the count past the cap.
+        others = _fallback_slots(w)
+        if n_ours + others >= TARGETS_FALLBACK_MAX_OPEN + 1:
+            raise NoProgress(f"{e}; not authoring outside the list either ({n_ours} open PRs of ours"
+                             f"{f' + {others} being authored' if others else ''} > {TARGETS_FALLBACK_MAX_OPEN})") from None
+        _hold_fallback_slot(w)
+        log(f"roadmap: {e} — authoring outside the target list instead ({n_ours} open PRs of ours"
+            f"{f' + {others} being authored' if others else ''} ≤ {TARGETS_FALLBACK_MAX_OPEN})")
         return None
     return live, area, item, claimed, candidates, n_inflight, n_merged
 

@@ -54,7 +54,7 @@ def sv_with(n):
     return SimpleNamespace(_mine_open_prs=[object()] * n)
 
 
-w = SimpleNamespace(claims=None, gh=None)
+w = SimpleNamespace(claims=None, gh=None, cfg=SimpleNamespace(wid="gq2-x9"))
 W._claim_target = lambda claims, candidates, path: (candidates[0][0], candidates[0][1], True)
 
 got = W._pick_target(w, sv_with(7), ELIGIBLE, Path("t.md"), "auto", [])
@@ -77,6 +77,22 @@ def all_claimed(claims, candidates, path):
 W._claim_target = all_claimed
 check("every eligible item claimed counts as nothing to take",
       W._pick_target(w, sv_with(2), ELIGIBLE, Path("t.md"), "auto", []) is None)
+
+# ---- concurrent authors share the headroom -------------------------------------------------------------
+import os  # noqa: E402
+
+os.environ["TAUCETI_GATE_DIR"] = str(TMP / "gate")
+W._claim_target = all_claimed
+wa = SimpleNamespace(claims=None, gh=None, cfg=SimpleNamespace(wid="gq2-c1"))
+wb = SimpleNamespace(claims=None, gh=None, cfg=SimpleNamespace(wid="gq2-c2"))
+check("the first author at six open PRs takes the last slot", W._pick_target(wa, sv_with(6), ELIGIBLE, Path("t.md"), "auto", []) is None)
+try:
+    W._pick_target(wb, sv_with(6), ELIGIBLE, Path("t.md"), "auto", [])
+    check("a second author at the same moment backs off", False)
+except NoProgress as e:
+    check("a second author at the same moment backs off", "1 being authored" in str(e), str(e))
+(TMP / "gate" / "fallback-authoring" / "gq2-c1").unlink()
+check("once the first round ends, the slot is free again", W._pick_target(wb, sv_with(6), ELIGIBLE, Path("t.md"), "auto", []) is None)
 
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)
