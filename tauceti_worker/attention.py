@@ -104,6 +104,17 @@ def record_declined_round(logdir: Path, *, stage: str, pr: int | None, head: str
         key = f"{stage}-{pr}" if pr else (f"{stage}-{target.replace('/', '-')}" if target
                                            else f"{stage}-{(head or 'unknown')[:12]}")
         declared, mentioned = subsuming_prs(summary, pr)
+        # A target the curator handed back and an author declined AGAIN is a real disagreement: carry
+        # the hand-back count forward so the curator asks the owner instead of handing it back again.
+        handed_back = 0
+        if target:
+            prior = interaction.incidents_dir() / "acked" / f"{DECLINED}-{key}.json"
+            try:
+                rec = json.loads(prior.read_text())
+                if rec.get("curator") == "not-landed":
+                    handed_back = int(rec.get("handed_back") or 0) + 1
+            except (OSError, ValueError):
+                pass
         return record_incident(
             DECLINED,
             key,
@@ -117,6 +128,7 @@ def record_declined_round(logdir: Path, *, stage: str, pr: int | None, head: str
             mentions=mentioned,  # other PRs it named in prose; a lead, not a verdict
             transcript=str(log_path) if log_path else "",
             **({"target": target} if target else {}),
+            **({"handed_back": handed_back} if handed_back else {}),
             publication=os.environ.get("TAUCETI_PUBLICATION_ID") or "",
         )
     except Exception:  # noqa: BLE001 - reporting must never turn into a second failure

@@ -207,6 +207,33 @@ inc = json.loads(next((TMP / "incidents").glob("targets-updated-*.json")).read_t
 check("the owner is told about it", any("pro-p-frattini" in u and "owner decides" in u for u in inc.get("undecided", [])),
       str(inc.get("undecided")))
 
+# ---- a target declined again after a hand-back is a dispute for the owner, not another round trip -------------
+decline("ProfiniteCohomology", "transgression")   # the author declines the handed-back target again
+rec = json.loads((TMP / "incidents" / "declined-roadmap-ProfiniteCohomology-transgression.json").read_text())
+check("the second decline remembers the hand-back", rec.get("handed_back") == 1, str(rec))
+check("…and the target is skipped again", "transgression" in attention.declined_targets())
+asked.clear()
+try:
+    W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
+except NoProgress:
+    pass
+rec = json.loads((TMP / "incidents" / "declined-roadmap-ProfiniteCohomology-transgression.json").read_text())
+check("the curator does not hand a disputed target back again", rec.get("curator") == "disputed"
+      and "transgression" in attention.declined_targets(), str(rec.get("curator")))
+check("…it asks the owner, on the live list", (TMP / "incidents" / "declined-roadmap-ProfiniteCohomology-transgression.json").exists())
+
+# ---- a decline whose item is done by other means archives itself -----------------------------------------------
+(TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-still-open.json").write_text(json.dumps(
+    {"kind": "declined", "target": "ProfiniteProPGroups/still-open", "summary": "done elsewhere", "mentions": []}))
+LIST.write_text(LIST.read_text().replace("- [ ] `still-open`", "- [x] `still-open`"))
+try:
+    W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
+except NoProgress:
+    pass
+check("a decline whose item is already done leaves the attention list",
+      not (TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-still-open.json").exists()
+      and (TMP / "incidents" / "acked" / "declined-roadmap-ProfiniteProPGroups-still-open.json").exists())
+
 # ---- once the blocking PR merges, the next pass hands the target back ----------------------------------------
 PRS[9043] = {"state": "MERGED", "body": "someone else's work, no marker for relation-rank"}
 try:

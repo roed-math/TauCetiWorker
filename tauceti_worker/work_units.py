@@ -1515,6 +1515,16 @@ def _do_curate_inner(w, sv, opts) -> int | None:
                 continue
             prior = memo.get(it.slug) or {}
             if prior.get("landed") is False and prior.get("main_sha") == main_sha:
+                if int(rec.get("handed_back") or 0) and rec.get("curator") != "disputed":
+                    # Declined again after a hand-back, and main has not moved since the "not landed"
+                    # verdict: the same question would get the same answer. It is the owner's now.
+                    note = (f"`{it.slug}`: authors declined it again after it was handed back, and the curator "
+                            f"still finds it incomplete ({str(prior.get('evidence') or '')[:140]}) — owner decides "
+                            f"([x] if done; to hand it back, delete {rec.get('path')})")
+                    undecided.append(note)
+                    mark_declined_target(rec.get("path", ""), curator="disputed",
+                                         curator_evidence=str(prior.get("evidence") or "")[:200])
+                    log(f"curate: {note}")
                 continue
             account = str(rec.get("summary") or "")
             named = lean_identifiers(account)
@@ -1532,7 +1542,8 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             if hits:
                 with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
                                       "identifiers": list(hits), "hits": hits, "author_account": account[:2000],
-                                      "declined_incident": rec.get("path", "")})
+                                      "declined_incident": rec.get("path", ""),
+                                      "handed_back": int(rec.get("handed_back") or 0)})
             else:
                 note = (f"`{it.slug}`: an author declined it as already done, but its account names no declaration "
                         f"found on main — owner decides ([x] if done; to hand it back to the authors, delete "
@@ -1569,7 +1580,17 @@ def _do_curate_inner(w, sv, opts) -> int | None:
                     mark_declined_target(cand["declined_incident"], curator="landed", curator_evidence=evidence)
             elif isinstance(v, dict):
                 log(f"curate: `{cand['slug']}` not landed: {str(v.get('evidence') or '')[:120]}")
-                if cand.get("declined_incident"):
+                if cand.get("declined_incident") and cand.get("handed_back"):
+                    # Handed back once already and declined again: the authors and this model disagree.
+                    # Another round trip settles nothing; the owner decides, and the target stays skipped.
+                    note = (f"`{cand['slug']}`: authors declined it again after it was handed back, and the curator "
+                            f"still finds it incomplete ({str(v.get('evidence') or '')[:140]}) — owner decides "
+                            f"([x] if done; to hand it back, delete {cand['declined_incident']})")
+                    undecided.append(note)
+                    mark_declined_target(cand["declined_incident"], curator="disputed",
+                                         curator_evidence=str(v.get("evidence") or "")[:200])
+                    log(f"curate: {note}")
+                elif cand.get("declined_incident"):
                     # The author was wrong: the target goes back to the authors.
                     mark_declined_target(cand["declined_incident"], curator="not-landed",
                                          curator_evidence=str(v.get("evidence") or "")[:200])
@@ -1579,6 +1600,11 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             memo_path.write_text(json.dumps(memo, indent=1))
         except OSError:
             pass
+    # A decline whose item is done by now (a merged marker, a verdict, the owner) needs nobody.
+    final = {it.slug: it.status for items in parse_targets(new_text).areas.values() for it in items}
+    for slug, rec in declined.items():
+        if final.get(slug) == "done" and rec.get("curator") != "landed":
+            mark_declined_target(rec.get("path", ""), curator="landed", curator_evidence="the item is done in the list")
     # ---- write, record, commit
     applied = [ln for ln in changes if "owner decides" not in ln]
     if new_text == text:
