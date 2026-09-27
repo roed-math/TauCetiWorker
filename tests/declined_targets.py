@@ -44,6 +44,7 @@ ACCOUNTS = {
     "h2-bijection": "Stopped: merged PR #8400 covers it: [the bijection](/home/user/tauceti/TauCeti/Ext/Cohomology.lean:2), "
                     "and [a stale path](/home/user/tauceti/TauCeti/Gone.lean:9).",
     "ambient-model": "Stopped: already covered by merged PR #8192, which uses the identical target marker.",
+    "late-unblock": "No PR: the target is blocked by overlapping open work in PR #9050; compose after it merges.",
     "relation-rank": "Stopped: blocked by overlapping open work in PR #9043; compose after it merges.",
     "directed-inter": "Stopped: Mathlib already has `IsCompact.nonempty_iInter_of_directed_isClosed`; a copy would be a duplicate.",
 }
@@ -63,17 +64,19 @@ p4 = decline("ProfiniteProPGroups", "directed-inter")
 p5 = decline("ProfiniteProPGroups", "h2-bijection")
 p6 = decline("ProfiniteCohomology", "ambient-model")
 p7 = decline("ProfiniteProPGroups", "relation-rank")
+p8 = decline("ProfiniteProPGroups", "late-unblock")
 names = sorted(p.name for p in (TMP / "incidents").glob("declined-*.json"))
 check("one incident per declined target", names == ["declined-roadmap-ProfiniteCohomology-ambient-model.json",
                                                     "declined-roadmap-ProfiniteCohomology-transgression.json",
                                                     "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json",
                                                     "declined-roadmap-ProfiniteProPGroups-directed-inter.json",
                                                     "declined-roadmap-ProfiniteProPGroups-h2-bijection.json",
+                                                    "declined-roadmap-ProfiniteProPGroups-late-unblock.json",
                                                     "declined-roadmap-ProfiniteProPGroups-pro-p-frattini.json",
                                                     "declined-roadmap-ProfiniteProPGroups-relation-rank.json"], str(names))
 check("declined_targets lists them by slug",
       set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini", "directed-inter", "h2-bijection",
-                                            "ambient-model", "relation-rank"})
+                                            "ambient-model", "relation-rank", "late-unblock"})
 
 # ---- the picker ---------------------------------------------------------------------------------------
 LIST = TMP / "targets.md"
@@ -84,6 +87,7 @@ LIST.write_text("""# t
 - [ ] `compactness-lemma` — L0, "Prove the directed intersection lemma." (serves: B1; needs: none)
 - [ ] `pro-p-frattini` — L1, "Prove the Frattini quotient statement." (serves: B1; needs: none)
 - [ ] `still-open` — L1, "Prove `somethingNew`." (serves: B1; needs: none)
+- [ ] `late-unblock` — L6, "Composes #9050's result." (serves: B3; needs: none)
 - [ ] `relation-rank` — L6, "The relation rank." (serves: B3; needs: none)
 - [ ] `h2-bijection` — L5, "Extensions correspond to H²." (serves: B3; needs: none)
 - [ ] `directed-inter` — L1, "A directed family of closed sets has nonempty intersection." (serves: B1; needs: none)
@@ -142,6 +146,7 @@ def fake_agent(cwd, prompt, profile, logdir):
 PRS = {
     8192: {"state": "MERGED", "body": '<!--tauceti-target:v1 {"focus":"ProfiniteCohomology","id":"ambient-model"}-->'},
     9043: {"state": "OPEN", "body": "overlapping work"},
+    9050: {"state": "MERGED", "body": "the blocking work, merged before any curator pass saw it open"},
 }
 W.run_agent_host = fake_agent
 W._effective_authoring_profile = lambda opts: "claude"
@@ -194,6 +199,8 @@ check("…without asking the model", "ambient-model" not in asked)
 check("a decline blocked on an open PR stays skipped, not done, and asks nobody",
       "- [ ] `relation-rank`" in new and "relation-rank" in attention.declined_targets() and "relation-rank" not in asked
       and not (TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-relation-rank.json").exists())
+check("a blocked decline whose PR merged before any pass saw it open goes straight back to the authors",
+      "late-unblock" not in attention.declined_targets() and "- [ ] `late-unblock`" in new)
 check("the refuted decline is handed back to the authors", "transgression" not in still, str(still))
 check("the decline that names nothing on main waits for the owner", "pro-p-frattini" in still, str(still))
 inc = json.loads(next((TMP / "incidents").glob("targets-updated-*.json")).read_text())

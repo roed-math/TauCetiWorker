@@ -1302,6 +1302,9 @@ def _curate_main_checkout(w) -> Path | None:
         return None
 
 
+_BLOCKED_RE = re.compile(r"\bblocked\b|overlapping open|open work|after (it|that PR|#\d+) merges|waits? (for|on) #?\d+", re.I)
+
+
 def _declined_by_named_prs(w, rec: dict, area: str, slug: str) -> tuple[str, int]:
     """What the PRs a declining author named say about its target: ("merged", N) when #N is merged
     and carries this item's marker; ("blocked", N) when #N is still open (the author stopped to avoid
@@ -1321,6 +1324,10 @@ def _declined_by_named_prs(w, rec: dict, area: str, slug: str) -> tuple[str, int
         return "blocked", open_pr
     if isinstance(blocked_on, int):
         return "unblocked", blocked_on
+    # An author that stopped for overlapping OPEN work, whose PR has closed or merged before any pass saw
+    # it open, is unblocked now; its account says which kind of decline it was.
+    if named and _BLOCKED_RE.search(str(rec.get("summary") or "")):
+        return "unblocked", named[0]
     return "", 0
 
 
