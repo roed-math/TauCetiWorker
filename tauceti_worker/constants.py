@@ -140,6 +140,13 @@ EX_HALTED = 77  # sysexits EX_NOPERM: the identity gate halted the worker (halt.
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
 BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))  # cap on the escalating sleep (15 min)
+# After a round that found nothing to do, never survey again sooner than this: a deep survey re-reads
+# every changed PR, and reviewers backing off 60 s then 120 s ran 13 surveys an hour for 5 reviews,
+# most of the fleet's read budget (2026-09-27). A round that knows when something opens up (a review
+# deferred to its previous reviewer) leaves that time in NEXT_ELIGIBLE_COUNTER and the loop sleeps
+# until then, still no less than this floor.
+IDLE_SURVEY_FLOOR = int(os.environ.get("TAUCETI_IDLE_FLOOR", "300"))
+NEXT_ELIGIBLE_COUNTER = "next-eligible-at"
 
 # The escalating back-off exists because a no-op round must NOT re-cycle every INTERROUND seconds and
 # re-hammer the API — the failure that ran ~700 no-op rounds against a rate-limited GitHub.
@@ -170,6 +177,9 @@ GH_SECONDARY_BASE = 60  # first secondary-limit sleep when no Retry-After is giv
 OPEN_PR_PAGE = int(os.environ.get("TAUCETI_OPEN_PR_PAGE", "100"))  # PRs per request (GitHub's maximum)
 
 OPEN_PR_MAX_PAGES = int(os.environ.get("TAUCETI_OPEN_PR_MAX_PAGES", "100"))  # refuse to loop forever
+# One listing serves every worker of a fleet for this long (github.GitHub.open_prs): nine workers each
+# fetching the same pages every survey was a fixed ~2 reads per survey per worker.
+OPEN_PR_SHARED_TTL = int(os.environ.get("TAUCETI_OPEN_PR_SHARED_TTL", "60"))
 
 GH_TRANSIENT_TRIES = 3  # retries after a transient failure, then surface it
 
@@ -216,7 +226,10 @@ SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached
 # though nothing announced it. Deliberately not "until the next reset": a heuristic we cannot verify
 # gets a ceiling. A read served under this rule is `assumed`, never `fresh`, and cannot authorize a
 # mutation; see dispatch()'s revalidation of the one PR a round acts on.
-SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
+# Since 2026-09-27 the key is the comments' own activity (github._activity_key): their COUNT catches a
+# deletion too, so the blind spot above only remains where the listing lacks that key. Three hours
+# bounds it there; half an hour re-read every reviewable PR twice an hour for nothing.
+SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "10800"))
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 

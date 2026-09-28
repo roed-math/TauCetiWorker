@@ -18,7 +18,9 @@ from .constants import (
     EX_HALTED,
     EX_NOPROGRESS,
     GH_MIN_BUDGET,
+    IDLE_SURVEY_FLOOR,
     INTERROUND,
+    NEXT_ELIGIBLE_COUNTER,
     OPENROUTER_MODELS,
     POLL,
 )
@@ -63,6 +65,29 @@ def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
     old = quota_line({"claude": prov}, markup=markup)
     new = f"claude {_glyph('~', 'yellow', markup)} ({why})"
     return line.replace(old, new, 1)
+
+
+def _take_next_eligible(cfg) -> float | None:
+    """The time the round said something opens up (NEXT_ELIGIBLE_COUNTER), consumed: a hint answers
+    for the round that wrote it and no later one."""
+    state = getattr(cfg, "state", None)
+    if state is None:
+        return None
+    f = state / NEXT_ELIGIBLE_COUNTER
+    try:
+        v = float(f.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    f.unlink(missing_ok=True)
+    return v if v > 0 else None
+
+
+def idle_nap(backoff: float, hint: float | None, now: float | None = None) -> float:
+    """How long to sleep after a round that found nothing: until the round's hint when it gave one,
+    else the escalating backoff; never less than IDLE_SURVEY_FLOOR nor more than BACKOFF_MAX."""
+    now = time.time() if now is None else now
+    want = (hint - now) if hint is not None else backoff
+    return int(min(max(want, IDLE_SURVEY_FLOOR), max(BACKOFF_MAX, IDLE_SURVEY_FLOOR)))
 
 
 def _round_done_hook(rc: int, wid: str) -> None:
@@ -294,6 +319,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 tail += ["--source", source]
             report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
             rc = run_round_subprocess(tail)
+            hint = _take_next_eligible(cfg)
             _round_done_hook(rc, cfg.wid)
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off. A
@@ -325,6 +351,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             else:
                 streak += 1
                 nap = min(BACKOFF_BASE * (1 << min(streak, 5)), BACKOFF_MAX)
+                if rc == EX_NOPROGRESS:
+                    nap = idle_nap(nap, hint)
                 tag = "timed out" if rc in (124, 137) else ("no progress" if rc == EX_NOPROGRESS else f"rc={rc}")
                 failed = runtime_snapshot()
                 published = failed.get("failure_reason")

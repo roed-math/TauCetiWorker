@@ -77,7 +77,10 @@ class ReviewState:
         left the open list must go back to being unobserved rather than keep an answer from a previous
         pass. An empty `updated_at` is not recorded — "no clock" has to read as "cannot tell", which
         falls back to the plain TTL, not as a key that might match another blank."""
-        seen = {p.number: p.updated_at for p in prs if getattr(p, "updated_at", "")}
+        # The comments' own activity key when the listing carried it (it ignores CI, label and push
+        # churn that moves updatedAt without touching a comment), else updatedAt.
+        seen = {p.number: (getattr(p, "activity_key", "") or p.updated_at) for p in prs
+                if getattr(p, "activity_key", "") or getattr(p, "updated_at", "")}
         # Drop memoized comments for any PR whose clock moved. The memo exists to coalesce the two
         # readers inside ONE pass; carried across a change it would hand a stale response to the fetch
         # that a moved clock just forced, and that response would then be written under the NEW key and

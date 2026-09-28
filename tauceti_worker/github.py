@@ -26,6 +26,7 @@ from .constants import (
     GH_TRANSIENT_TRIES,
     OPEN_PR_MAX_PAGES,
     OPEN_PR_PAGE,
+    OPEN_PR_SHARED_TTL,
     TAUCETI,
 )
 from .interaction import (
@@ -486,6 +487,8 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
         author{login __typename}
         labels(first:50){totalCount nodes{name}}
         commits(last:1){nodes{commit{status{contexts{context state createdAt}}}}}
+        comments(first:1,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount nodes{updatedAt}}
+        reviews(last:1){totalCount nodes{updatedAt}}
       }
     }
   }
@@ -518,7 +521,21 @@ def _pr_json_from_graphql(node: dict) -> dict:
             {"context": c.get("context"), "state": c.get("state"), "startedAt": c.get("createdAt")}
             for c in (status.get("contexts") or [])
         ],
+        "activityKey": _activity_key(node),
     }
+
+
+def _activity_key(node: dict) -> str:
+    """What the survey's per-PR comment reads depend on, and nothing else: the issue comments' count
+    and newest edit (a scoreboard is edited in place, so newest-by-UPDATE, not by creation) and the
+    reviews' count and newest (a reply to a review comment is a new review). `updatedAt` also moves
+    on every CI status, label and push, which made most cached reads miss (2026-09-27). "" when the
+    query did not return them, which falls back to `updatedAt`."""
+    ic, rv = node.get("comments"), node.get("reviews")
+    if not isinstance(ic, dict) or not isinstance(rv, dict):
+        return ""
+    newest = lambda conn: ((conn.get("nodes") or [{}])[0] or {}).get("updatedAt") or "-"  # noqa: E731
+    return f"ic{ic.get('totalCount', 0)}@{newest(ic)}|rv{rv.get('totalCount', 0)}@{newest(rv)}"
 
 
 class GitHub:
@@ -529,6 +546,46 @@ class GitHub:
         return gh_run(["gh", *args])
 
     def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
+        """Every open PR (see _open_prs_fetch), shared across a fleet's workers for OPEN_PR_SHARED_TTL:
+        a listing fetched by any worker is served to the others from the gate store's cache, and a
+        worker that finds it stale fetches under a lock, so peers wait for its answer instead of
+        fetching the same pages alongside it. Outside a fleet (no gate store) it is a plain fetch."""
+        g = gate_mod.current()
+        if not (g.enabled and g.dir is not None and OPEN_PR_SHARED_TTL > 0):
+            return self._open_prs_fetch(page=page)
+        import fcntl
+
+        d = g.cache_dir
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"open_prs-{self.repo.replace('/', '__')}.json"
+
+        def fresh():
+            try:
+                c = json.loads(path.read_text())
+                if 0 <= time.time() - float(c["fetched_at"]) < OPEN_PR_SHARED_TTL and isinstance(c.get("prs"), list):
+                    return c["prs"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            return None
+
+        hit = fresh()
+        if hit is not None:
+            return hit
+        with open(d / f"{path.name}.lock", "a+") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            hit = fresh()  # a peer may have fetched while we waited for the lock
+            if hit is not None:
+                return hit
+            prs = self._open_prs_fetch(page=page)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            try:
+                tmp.write_text(json.dumps({"fetched_at": time.time(), "prs": prs}))
+                os.replace(tmp, path)
+            except OSError:
+                pass  # an unwritable cache is a slower fleet, not a wrong one
+            return prs
+
+    def _open_prs_fetch(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
         """Every open PR, paged, in the same shape `gh pr list --json` returns (so PRInfo.from_json
         reads either).
 

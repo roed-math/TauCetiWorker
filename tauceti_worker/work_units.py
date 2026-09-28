@@ -59,6 +59,7 @@ from .constants import (
     EX_NOPROGRESS,
     MAX_INFRA_REFUNDS,
     MAX_OPEN_PRS,
+    NEXT_ELIGIBLE_COUNTER,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_REF,
@@ -438,6 +439,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if deferred:
             waits = [REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at) for c in deferred if c.ready_at is not None]
             next_wait = max(0, int(min(waits))) if waits else REVIEW_AFFINITY_GRACE_S
+            # Tell the loop when the first of these opens up, so an idle reviewer sleeps until then
+            # instead of re-surveying every PR a minute later (see loop.idle_nap).
+            w.counters.write(NEXT_ELIGIBLE_COUNTER, int(stamp + next_wait))
             log(
                 f"  review: deferring {len(deferred)} PR(s) for their previous reviewers; "
                 f"next first-refusal window expires in {next_wait // 60}m {next_wait % 60:02d}s"

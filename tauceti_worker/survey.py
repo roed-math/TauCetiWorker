@@ -144,6 +144,9 @@ class PRInfo:
     # changed since it last read its comments (see ReviewState.observe). Free in the query we already
     # make; "" when unknown, which reads as "cannot tell" and falls back to the plain TTL.
     updated_at: str = ""
+    # The narrower key for the comment reads (github._activity_key): moves only when comments or
+    # reviews change. "" when unknown; ReviewState then keys on updated_at as before.
+    activity_key: str = ""
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -180,6 +183,7 @@ class PRInfo:
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
+            activity_key=str(d.get("activityKey") or ""),
         )
 
 

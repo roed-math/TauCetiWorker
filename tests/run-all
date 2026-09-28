@@ -35,6 +35,8 @@ RUN_STDLIB=(
   merged_markers.py
   review_git_shim.py
   targets_fallback.py
+  idle_nap.py
+  read_efficiency.py
   auto_stage_priority.py
   authoring_profiles.py
   bubble_cache.py
