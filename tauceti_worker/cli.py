@@ -619,6 +619,9 @@ def build_parser() -> argparse.ArgumentParser:
     # `tauceti gate …` is the `tauceti-gate` CLI (tauceti_worker.gate_cli); its own parser reads the rest.
     g = sub.add_parser("gate", help="the fleet GitHub gate: admit/record/status/report/halt/resume (see docs/gate.md)")
     g.add_argument("gate_args", nargs=argparse.REMAINDER)
+    # `tauceti roadmap-change prepare|show|open PR`: file a decide-stage roadmap proposal (decide.py).
+    rc = sub.add_parser("roadmap-change", help="file a decide-stage roadmap proposal as a TauCetiRoadmap PR")
+    rc.add_argument("rc_args", nargs=argparse.REMAINDER)
     return p
 
 
@@ -695,6 +698,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_egress_probe(args)
     if cmd == "_managed-run":
         return cmd_managed_runner(args)
+    if cmd == "roadmap-change":
+        from .decide import roadmap_change_main
+
+        return roadmap_change_main(args.rc_args)
     if cmd == "gate":
         from .gate_cli import main as gate_main
 

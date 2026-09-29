@@ -24,9 +24,10 @@ anything, and use no network: everything you need is in these files.
   ordering finding is resolved by getting the earlier stage into a PR, not by arguing.
 - Agents never open a PR or an issue in TauCetiRoadmap. A roadmap change (adding a milestone,
   splitting or reordering one) always needs a human.
-- Agents do not close pull requests. If you conclude a PR should be closed (main already has its
-  content, another PR supersedes it, it has no path to any roadmap target), escalate with that
-  recommendation and your evidence, and the owner closes it.
+- You may close a PR only when it is subsumed: what it adds is already on main, through merged PRs
+  or declarations you can point to. Then rule `close` with that evidence. Every other reason to
+  close (another open PR supersedes it, it has no path to any roadmap target) is the owner's call:
+  escalate with the recommendation and your evidence.
 - A contest (a reply on a review thread explaining why a finding is wrong) is the fixer's tool, not
   yours. Choose `retry` when there is evidence the fixer did not have and that would change the
   outcome, and say what it is. Do not choose `retry` just to have the same argument again. A
@@ -54,13 +55,21 @@ For each case choose exactly one:
   the smallest set of milestones that clears the finding. If the missing stage is large, list its
   first milestones and say in `note` what remains. An item already in the list is fine too: give its
   existing slug.
+- `close`: the PR is subsumed by what main already has. Give `merged_prs` (the merged PRs that
+  subsume it) and/or `on_main` (the Lean names of the declarations on main that do what it does;
+  check each one in `main_checkout`), and `comment`, the explanation posted on the PR as it is
+  closed: two or three sentences a reviewer can check, naming where its content now lives. Before
+  closing, the code checks that each named PR has merged and each named declaration is on main, that
+  the PR is the fleet's own, and that it carries no hold label. If any check fails it escalates
+  instead. Be strict: a wrong close throws away work, while a wrong escalation only costs the owner a
+  look. Partial overlap is not subsumption.
 - `roadmap`: only a roadmap change resolves it (the PR does work the roadmap does not list, or lists
   in an order that cannot be met, and building the prerequisite is not a sensible path). Write
   `proposal`: a short, ready-to-file description of the change to that roadmap's README (the
-  section, the proposed wording, and one paragraph on why), for the owner to open as a TauCetiRoadmap
-  PR. Use this sparingly: `prerequisite` is almost always better when the roadmap already has the
-  missing stage.
-- `escalate`: anything else, and every case where you recommend closing the PR. Put your analysis in
+  section, the proposed wording, and one paragraph on why). The owner reads it and, if they agree,
+  has it filed as a TauCetiRoadmap PR. Use this sparingly: `prerequisite` is almost always better when
+  the roadmap already has the missing stage.
+- `escalate`: anything else, including a close for a reason other than subsumption. Put your analysis in
   `note`, what you recommend in `recommend` (for example `close: subsumed by #1234`), and the facts
   that support it in `evidence` (PR numbers, `file:line` on main, the README passage).
 
@@ -81,7 +90,9 @@ Write exactly one file, `decisions.json`, in this directory, keyed by PR number:
   "1235": {"decision": "wait", "note": "...", "blocked_on_prs": [1300], "blocked_on_targets": []},
   "1236": {"decision": "retry", "note": "..."},
   "1237": {"decision": "roadmap", "note": "...", "proposal": "..."},
-  "1238": {"decision": "escalate", "note": "...", "recommend": "close: ...", "evidence": "..."}
+  "1238": {"decision": "close", "note": "...", "merged_prs": [1100], "on_main": ["unitFiltration"],
+           "comment": "..."},
+  "1239": {"decision": "escalate", "note": "...", "recommend": "close: superseded by #1300", "evidence": "..."}
 }
 ```
 

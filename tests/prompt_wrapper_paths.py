@@ -40,7 +40,7 @@ WRAPPERS = ("git-safe-push", "gh-safe-pr-create", "claim.sh")
 
 # Prompts the worker reads verbatim rather than through fill_prompt (work_units.do_curate, decide.py):
 # the host-side stages hand the model a data file and ask for a verdict file, with no wrappers.
-RAW_PROMPTS = ("curate.md", "decide.md")
+RAW_PROMPTS = ("curate.md", "decide.md", "roadmap-change.md")
 
 # The keys each call site passes, so a prompt that grows a placeholder without a substitution fails
 # here rather than reaching an agent. Mirrors work_units._do_fixlike / do_roadmap.

@@ -22,27 +22,42 @@ The decide stage makes those rulings. Two tiers, host-side like the curator:
        wait          blocked on named open PR(s) or listed target(s); looked at again when they move
        prerequisite  blocked on a roadmap item nobody is building: it is added to the target list, at
                      the top of its area, and the PR waits for it
-       roadmap       only a roadmap change resolves it: a drafted proposal for the owner to file, since
-                     TauCeti's AGENTS.md forbids agents to open TauCetiRoadmap PRs or issues
-       escalate      anything else, including a recommendation to close the PR: the owner decides,
-                     with the analysis beside the fixer's account
+       close         the PR is subsumed: every PR it names as subsuming it has merged, or every
+                     declaration it names is on main. The code checks that evidence, that the PR is the
+                     account's own and carries no hold label, and a daily cap, and only then closes it
+                     with a comment giving the evidence (the owner allowed this on 2026-09-29; off unless
+                     TAUCETI_DECIDE_CLOSE is 1). Anything short of that becomes an escalation.
+       roadmap       only a roadmap change resolves it: a drafted proposal for the owner. TauCeti's
+                     AGENTS.md forbids agents to open TauCetiRoadmap PRs or issues on their own, and
+                     TauCetiRoadmap's CONTRIBUTING.md asks that nobody post a roadmap change they have
+                     not read, so the owner files it: `roadmap-change prepare` has an agent apply the
+                     proposal to the roadmap's README on a branch and shows the diff, and `roadmap-change
+                     open`, run on the owner's say-so, opens the PR (see roadmap_change_main). The PR
+                     then waits for that roadmap PR.
+       escalate      anything else: the owner decides, with the analysis beside the fixer's account
 
 The code checks each ruling against what it can verify (open PRs, listed targets, the roadmap
-checkout) and turns an invalid one into an escalation. Nothing here writes to TauCeti: the stage's
-only writes are the local incident records, drafted proposals, and the operator's target list.
+checkout, main) and turns an invalid one into an escalation. Its writes are the local incident
+records, drafted proposals, the operator's target list, and a close of one of the account's own PRs.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
+from . import gate as gate_mod
 from . import interaction
-from .agents import fetch_ref, run_agent_host
+from .agents import fetch_ref, resolve_authoring_profile, run_agent_host
 from .attention import (
+    CLOSED,
     ESCALATE,
     NOTED,
     RETRY,
@@ -54,14 +69,16 @@ from .attention import (
     reopen_decision,
     undecided_declines,
 )
-from .config import NoProgress, log, roadmap_targets
-from .constants import DECIDE_MAX_CASES, REVIEW
+from .config import Die, NoProgress, log, roadmap_targets
+from .constants import DECIDE_MAX_CASES, DECIDE_MAX_CLOSES_PER_DAY, REVIEW, TAUCETI
 from .constants import ROADMAP as ROADMAP_REPO
+from .github import GitHub, me
 from .paths import HERE
 from .targets import _AREA_RE, insert_items, parse_targets
 
 KEEP_LABELS = {"keep", "hold", "wip", "human", "do-not-close"}
 PREREQUISITE = "prerequisite"
+CLOSE = "close"
 _SLUG_OK = re.compile(r"[a-z0-9][a-z0-9-]{2,80}")
 _SCOREBOARD = "<!--tauceti-scoreboard-->"
 _META_RE = re.compile(r"<!--tauceti-meta:v1 .*?-->", re.S)
@@ -189,14 +206,35 @@ def _recheck_wait(w, path: Path, rec: dict, open_by_no: dict, targets) -> str:
             moved.append(f"the prerequisite `{slug}` has landed")
         else:
             return ""
+    roadmap_merged = []
+    for n in rec.get("blocked_on_roadmap_prs") or []:
+        d = GitHub(ROADMAP_REPO).pr_view(n, ["state"])
+        if not d or not d.get("state") or d["state"] == "OPEN":
+            return ""
+        if d["state"] != "MERGED":
+            reopen_decision(path)
+            return (
+                f"#{pr}: {ROADMAP_REPO}#{n}, the roadmap change it waited on, closed unmerged — back for a new ruling"
+            )
+        roadmap_merged.append(n)
+        moved.append(f"the roadmap change {ROADMAP_REPO}#{n} this PR waited on has merged")
     if not moved:
         return ""
-    note = (
-        "What changed since this PR was parked: " + "; ".join(moved) + ". The scope rubric accepts a "
-        "prerequisite stage that exists on main or in an open PR (TauCetiReview rubrics/scope.md, "
-        "'confirm that stage exists on `main` or in an open PR'). If the blocking finding is about that "
-        "prerequisite, reply on its thread with this evidence; otherwise address the findings as usual."
-    )
+    if roadmap_merged:
+        note = (
+            "What changed since this PR was parked: " + "; ".join(moved) + ". The roadmap now reads as that "
+            "PR proposed. Reply on the blocking scope finding's thread citing "
+            + ", ".join(f"https://github.com/{ROADMAP_REPO}/pull/{n}" for n in roadmap_merged)
+            + " and quoting the new wording, so the rubric is re-run against the current roadmap; then address "
+            "any other findings as usual."
+        )
+    else:
+        note = (
+            "What changed since this PR was parked: " + "; ".join(moved) + ". The scope rubric accepts a "
+            "prerequisite stage that exists on main or in an open PR (TauCetiReview rubrics/scope.md, "
+            "'confirm that stage exists on `main` or in an open PR'). If the blocking finding is about that "
+            "prerequisite, reply on its thread with this evidence; otherwise address the findings as usual."
+        )
     if rec.get("decision_note"):
         note += f" The earlier ruling said: {_clip(rec['decision_note'], 600)}"
     record_decision(path, RETRY, decision_note=note)
@@ -223,7 +261,7 @@ def _history(path: Path, rec: dict) -> list[dict]:
 
 def _evidence(w, pr: int, rec: dict, history: list[dict]) -> dict:
     """What the model is shown about one declined PR. Bounded: a scoreboard, the newest thread replies."""
-    d = w.gh.pr_view(pr, ["title", "body", "labels", "headRefOid", "files", "url"]) or {}
+    d = w.gh.pr_view(pr, ["title", "body", "labels", "headRefOid", "files", "url", "author"]) or {}
     issue = w.gh.issue_comments(pr) or []
     boards = [c for c in issue if _SCOREBOARD in (c.get("body") or "")]
     scoreboard = _META_RE.sub("", boards[-1].get("body") or "") if boards else ""
@@ -234,6 +272,7 @@ def _evidence(w, pr: int, rec: dict, history: list[dict]) -> dict:
         "pr": pr,
         "url": d.get("url") or f"https://github.com/TauCetiProject/TauCeti/pull/{pr}",
         "title": d.get("title") or "",
+        "author": (d.get("author") or {}).get("login") or "",
         "labels": [lb.get("name") for lb in d.get("labels") or []],
         "head": head,
         "body": _clip(d.get("body"), 4000),
@@ -313,9 +352,17 @@ def _rule_with_model(w, sv, opts, cases, open_by_no, tpath, targets) -> list[str
     out: list[str] = []
     text = tpath.read_text() if tpath is not None and tpath.is_file() else ""
     added: list[str] = []
+    ctx = SimpleNamespace(
+        w=w,
+        open_by_no=open_by_no,
+        targets=targets,
+        refs=refs,
+        clone=clone,
+        login=os.environ.get("TAUCETI_EXPECT_LOGIN", "").strip() or me(),
+    )
     for pr, (path, rec, ev) in by_pr.items():
         v = answers.get(str(pr))
-        line, text, new = _apply(path, rec, ev, v if isinstance(v, dict) else None, open_by_no, targets, text, refs)
+        line, text, new = _apply(path, rec, ev, v if isinstance(v, dict) else None, ctx, text)
         added += new
         out.append(line)
     if added and tpath is not None:
@@ -339,8 +386,9 @@ def _escalate(path: Path, why: str, v: dict | None = None) -> str:
     return f"{path.name}: escalated to the owner — {_clip(why, 160)}"
 
 
-def _apply(path, rec, ev, v, open_by_no, targets, text, refs) -> tuple[str, str, list[str]]:
+def _apply(path, rec, ev, v, ctx, text) -> tuple[str, str, list[str]]:
     """Check one ruling and act on it. Returns (log line, the target list text, slugs added to it)."""
+    open_by_no, targets, refs = ctx.open_by_no, ctx.targets, ctx.refs
     pr = rec["pr"]
     if v is None:
         return _escalate(path, "the decide stage gave no ruling for this PR"), text, []
@@ -407,9 +455,69 @@ def _apply(path, rec, ev, v, open_by_no, targets, text, refs) -> tuple[str, str,
         f.write_text(f"# Proposed roadmap change for PR #{pr}\n\n{proposal[:12000]}\n")
         record_decision(path, ROADMAP, decision_note=note, proposal=str(f))
         return f"#{pr}: needs a roadmap change — proposal drafted at {f}", text, []
+    if kind == CLOSE:
+        return _close(path, rec, ev, v, ctx, note), text, []
     if kind == ESCALATE:
         return _escalate(path, note or "the decide stage could not settle it", v), text, []
     return _escalate(path, f"the decide stage gave an unknown ruling {kind!r}", v), text, []
+
+
+def _close(path: Path, rec: dict, ev: dict, v: dict, ctx, note: str) -> str:
+    """Close a PR the ruling says is subsumed, once the code has checked everything it can. Any check
+    that fails turns the ruling into an escalation carrying the same recommendation, so the owner sees
+    exactly what the stage wanted to do and why it did not."""
+    pr = rec["pr"]
+    ask = {**v, "recommend": v.get("recommend") or "close"}
+    if os.environ.get("TAUCETI_DECIDE_CLOSE", "").strip() != "1":
+        return _escalate(path, f"recommends closing; closing is off for this fleet (decide.close): {note}", ask)
+    if not ctx.login or ev.get("author") != ctx.login:
+        return _escalate(
+            path, f"recommends closing a PR this account did not open ({ev.get('author') or '?'}): {note}", ask
+        )
+    labels = {str(lb).lower() for lb in ev.get("labels") or []}
+    if labels & KEEP_LABELS:
+        return _escalate(path, f"recommends closing a PR under a hold label: {note}", ask)
+    comment = str(v.get("comment") or "").strip()
+    if len(comment) < 40:
+        return _escalate(path, f"a close ruling must carry the comment to post: {note}", ask)
+    merged = [n for n in v.get("merged_prs") or [] if isinstance(n, int) and n != pr]
+    decls = [str(s) for s in v.get("on_main") or [] if isinstance(s, str) and s.strip()]
+    if not (merged or decls):
+        return _escalate(path, f"a close ruling must name merged PRs or declarations on main: {note}", ask)
+    found: list[str] = []
+    for n in merged:
+        d = ctx.w.gh.pr_view(n, ["state"])
+        if not d or d.get("state") != "MERGED":
+            return _escalate(path, f"recommends closing as subsumed by #{n}, which has not merged: {note}", ask)
+        found.append(f"#{n} (merged)")
+    if decls:
+        from .work_units import _grep_declarations
+
+        if ctx.clone is None:
+            return _escalate(path, f"recommends closing, but main could not be checked out to verify it: {note}", ask)
+        for name in decls:
+            hits = _grep_declarations(ctx.clone, name)
+            if not hits:
+                return _escalate(path, f"recommends closing, but `{name}` is not declared on main: {note}", ask)
+            found.append(f"`{name}` ({':'.join(hits[0].split(':', 2)[:2])})")  # a hit is `path:line:text`
+    day = time.strftime("%Y%m%d", time.gmtime())
+    done_today = int(ctx.w.counters.read(f"decide-closes-{day}") or 0)
+    if done_today >= DECIDE_MAX_CLOSES_PER_DAY:
+        return _escalate(
+            path, f"recommends closing; today's cap of {DECIDE_MAX_CLOSES_PER_DAY} closes is spent: {note}", ask
+        )
+    body = (
+        f"{comment[:1500]}\n\nEvidence checked before closing: {', '.join(found)}.\n\n"
+        f"Closed by the fleet's decide stage (an AI agent acting for @{ctx.login}'s owner), after a fixer found "
+        "nothing left to do on this PR. If this is wrong, reopen it."
+    )
+    p = ctx.w.gh._gh(["pr", "close", str(pr), "--repo", TAUCETI, "--comment", body])
+    if p.returncode != 0:
+        why = ((p.stderr or "") + (p.stdout or "")).strip()[-200:]
+        return _escalate(path, f"recommends closing, but the close failed ({why}): {note}", ask)
+    ctx.w.counters.write(f"decide-closes-{day}", done_today + 1)
+    record_decision(path, CLOSED, decision_note=note or comment[:300], subsumed_by=merged, close_evidence=found)
+    return f"#{pr}: closed — {', '.join(found)}"
 
 
 def _check_item(item, pr: int, targets, refs: Path, taken: list[str]) -> tuple[str, str, str, str]:
@@ -435,3 +543,215 @@ def _check_item(item, pr: int, targets, refs: Path, taken: list[str]) -> tuple[s
     needs_s = ", ".join(f"`{s}`" for s in needs) or "none"
     line = f"- [ ] `{slug}` — {text} (unblocks: #{pr}; needs: {needs_s}; source: {source}; added by the decide stage)"
     return "", area, line, slug
+
+
+# ---- filing a roadmap proposal, on the owner's say-so ----------------------------------------------------
+#
+# `tauceti roadmap-change prepare PR` has an agent apply a `roadmap` ruling's proposal to the roadmap's
+# README on a branch of a fresh TauCetiRoadmap clone, and prints the diff. `tauceti roadmap-change open PR`
+# pushes that branch to the account's TauCetiRoadmap fork and opens the pull request, then parks the
+# TauCeti PR on it (a `wait` whose blocker is the roadmap PR; see _recheck_wait). The two steps are
+# separate so the owner reads the change before it is posted, as TauCetiRoadmap's CONTRIBUTING.md asks;
+# the fleet's `tauceti-fleet attention --file-roadmap PR` runs both with a confirmation between them.
+
+_README_RE = re.compile(r"TauCetiRoadmap/([A-Za-z0-9_-]+)/README\.md")
+
+
+def _roadmap_record(pr: int) -> tuple[Path, dict]:
+    """The live `roadmap` ruling on PR `pr`."""
+    for path in sorted(interaction.incidents_dir().glob(f"declined-*-{pr}.json")):
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if rec.get("pr") == pr and rec.get("decision") == ROADMAP and rec.get("proposal"):
+            return path, rec
+    raise Die(f"#{pr}: no roadmap ruling awaits filing (`tauceti-fleet attention` lists them)")
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> str:
+    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise Die(f"git {' '.join(args[:2])}: {(p.stderr or p.stdout).strip()[-300:]}")
+    return p.stdout
+
+
+def roadmap_change_prepare(pr: int) -> Path:
+    """Apply the proposal on a branch of a fresh clone and commit it; returns the work directory."""
+    path, rec = _roadmap_record(pr)
+    proposal = Path(rec["proposal"]).read_text()
+    work = decisions_dir() / f"roadmap-{pr}"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    repo = work / "repo"
+    p = gate_mod.gated_git(
+        ["git", "clone", "-q", "--filter=blob:none", f"https://github.com/{ROADMAP_REPO}", str(repo)],
+        op="clone",
+        target=ROADMAP_REPO,
+        capture_output=True,
+    )
+    if p.returncode != 0:
+        raise Die(f"clone {ROADMAP_REPO}: {(p.stderr or p.stdout).strip()[-300:]}")
+    branch = f"decide/tauceti-{pr}"
+    _git(repo, "checkout", "-q", "-b", branch)
+    (work / "request.json").write_text(
+        json.dumps(
+            {
+                "tauceti_pr": pr,
+                "tauceti_pr_url": f"https://github.com/{TAUCETI}/pull/{pr}",
+                "proposal": proposal,
+                "ruling": rec.get("decision_note") or "",
+                "fixer_account": rec.get("summary") or "",
+                "checkout": "repo",
+            },
+            indent=1,
+        )
+    )
+    profile = resolve_authoring_profile("claude")
+    log(f"roadmap-change: #{pr}: asking {profile.model or 'the model'} to apply the proposal in {repo}")
+    rc = run_agent_host(work, (HERE / "prompts" / "roadmap-change.md").read_text(), profile, work / "logs")
+    if rc != 0:
+        raise Die(f"roadmap-change: the agent exited {rc}; see {work / 'logs'}")
+    changed = [ln[3:] for ln in _git(repo, "status", "--porcelain").splitlines() if ln.strip()]
+    readmes = [c for c in changed if _README_RE.fullmatch(c)]
+    if len(changed) != 1 or len(readmes) != 1 or not _git(repo, "diff", "--name-only").strip():
+        raise Die(f"roadmap-change: the change must edit exactly one existing roadmap README; it touched {changed}")
+    try:
+        meta = json.loads((work / "pr.json").read_text())
+        title, body = str(meta["title"]).strip(), str(meta["body"]).strip()
+    except (OSError, ValueError, KeyError, TypeError):
+        raise Die("roadmap-change: the agent wrote no usable pr.json (title and body)") from None
+    if not (5 <= len(title) <= 100) or len(body) < 100:
+        raise Die("roadmap-change: pr.json's title or body is too short (or the title too long)")
+    area = _README_RE.fullmatch(readmes[0]).group(1)
+    name = _git(repo, "config", "user.name", check=False).strip() or os.environ.get("TAUCETI_EXPECT_LOGIN", "") or me()
+    email = _git(repo, "config", "user.email", check=False).strip() or f"{name}@users.noreply.github.com"
+    msg = f"{title}\n\nFor {TAUCETI}#{pr}.\n\nCo-Authored-By: {profile.model or 'Claude'} <noreply@anthropic.com>\n"
+    _git(repo, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-q", "-a", "-m", msg)
+    (work / "state.json").write_text(
+        json.dumps(
+            {
+                "pr": pr,
+                "branch": branch,
+                "area": area,
+                "title": title,
+                "body": body,
+                "head": _git(repo, "rev-parse", "HEAD").strip(),
+                "model": profile.model or "",
+                "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+            indent=1,
+        )
+    )
+    return work
+
+
+def roadmap_change_show(pr: int) -> str:
+    """The prepared change as the owner should read it: title, description, and the diff."""
+    work = decisions_dir() / f"roadmap-{pr}"
+    try:
+        st = json.loads((work / "state.json").read_text())
+    except (OSError, ValueError):
+        raise Die(f"#{pr}: nothing prepared (run `roadmap-change prepare {pr}` first)") from None
+    diff = _git(work / "repo", "show", "--format=", st["head"])
+    return f"Title: {st['title']}\n\n{st['body']}\n\n--- diff ({st['area']}/README.md) ---\n{diff}"
+
+
+def roadmap_change_open(pr: int) -> str:
+    """Push the prepared branch to the account's TauCetiRoadmap fork and open the PR; park the TauCeti
+    PR on it. Returns the new PR's URL."""
+    path, rec = _roadmap_record(pr)
+    work = decisions_dir() / f"roadmap-{pr}"
+    try:
+        st = json.loads((work / "state.json").read_text())
+    except (OSError, ValueError):
+        raise Die(f"#{pr}: nothing prepared (run `roadmap-change prepare {pr}` first)") from None
+    repo = work / "repo"
+    if _git(repo, "rev-parse", "HEAD").strip() != st["head"]:
+        raise Die(f"#{pr}: the prepared branch changed since it was shown; prepare it again")
+    login = os.environ.get("TAUCETI_EXPECT_LOGIN", "").strip() or me()
+    fork = os.environ.get("TAUCETI_ROADMAP_FORK", "").strip() or f"{login}/TauCetiRoadmap"
+    parent = GitHub(fork).api_jq(f"repos/{fork}", ".parent.full_name")
+    if (parent or "").strip() != ROADMAP_REPO:
+        raise Die(
+            f"{fork} is not a fork of {ROADMAP_REPO} (create one with `gh repo fork {ROADMAP_REPO} --clone=false`,"
+            " or name yours in TAUCETI_ROADMAP_FORK)"
+        )
+    url = f"https://github.com/{fork}"
+    os.environ["TAUCETI_PUSH_REMOTE"] = url  # the gate's push allowlist: this fork, op `push`, this process only
+    helper = f"!{HERE / 'scripts' / 'tauceti-gate'} credential"
+    p = gate_mod.gated_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"credential.helper={helper}",
+            "push",
+            "-q",
+            f"{url}.git",
+            f"HEAD:refs/heads/{st['branch']}",
+        ],
+        op="push",
+        target=url,
+        kind=gate_mod.GIT_PUSH,
+        capture_output=True,
+    )
+    if p.returncode != 0:
+        raise Die(f"push to {fork}: {(p.stderr or p.stdout).strip()[-300:]}")
+    gh = GitHub(ROADMAP_REPO)
+    q = gh._gh(
+        [
+            "pr",
+            "create",
+            "--repo",
+            ROADMAP_REPO,
+            "--base",
+            "main",
+            "--head",
+            f"{login}:{st['branch']}",
+            "--title",
+            st["title"],
+            "--body",
+            st["body"],
+        ]
+    )
+    if q.returncode != 0:
+        raise Die(f"gh pr create: {(q.stderr or q.stdout).strip()[-300:]}")
+    pr_url = (q.stdout or "").strip().splitlines()[-1]
+    m = re.search(r"/pull/(\d+)", pr_url)
+    if not m:
+        raise Die(f"gh pr create said {pr_url!r}; the PR may exist, check {ROADMAP_REPO}")
+    number = int(m.group(1))
+    lab = gh._gh(["pr", "edit", str(number), "--repo", ROADMAP_REPO, "--add-label", "awaiting-review"])
+    if lab.returncode != 0:
+        log(f"roadmap-change: could not label {pr_url} awaiting-review; ask on the PR or Zulip for it")
+    record_decision(
+        path,
+        WAIT,
+        blocked_on_prs=[],
+        blocked_on_targets=[],
+        blocked_on_roadmap_prs=[number],
+        roadmap_pr=pr_url,
+        decision_note=f"the roadmap change is filed as {pr_url}; this PR waits for it",
+    )
+    return pr_url
+
+
+def roadmap_change_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="tauceti roadmap-change", description="File a decide-stage roadmap proposal as a TauCetiRoadmap PR."
+    )
+    ap.add_argument("action", choices=("prepare", "show", "open"))
+    ap.add_argument("pr", type=int, help="the TauCeti PR the proposal unblocks")
+    a = ap.parse_args(argv)
+    if a.action == "prepare":
+        roadmap_change_prepare(a.pr)
+        print(roadmap_change_show(a.pr))
+    elif a.action == "show":
+        print(roadmap_change_show(a.pr))
+    else:
+        print(roadmap_change_open(a.pr))
+    return 0

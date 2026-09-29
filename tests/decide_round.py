@@ -73,7 +73,9 @@ def read(name, folder=INC):
 
 live("fix-101", stage="fix", pr=101, head="h101")
 live("fix-102", stage="fix", pr=102, head="h102")
-live("roadmap-unknown", stage="roadmap", pr=0, summary="The Foo roadmap has no milestone left.\nDetails.")  # as recorded: pr 0
+live(
+    "roadmap-unknown", stage="roadmap", pr=0, summary="The Foo roadmap has no milestone left.\nDetails."
+)  # as recorded: pr 0
 live("roadmap-Area-pre-thing", stage="roadmap", target="Area/pre-thing")
 live("fix-103", stage="fix", pr=103, head="h103")
 live("fix-104", stage="fix", pr=104, head="h104")
@@ -311,7 +313,8 @@ check(
     r109.get("decision") == "escalate" and r109.get("recommend", "").startswith("close") and r109.get("evidence"),
 )
 check(
-    "the prompt tells the model agents do not close PRs", "Agents do not close pull requests" in asked.get("prompt", "")
+    "the prompt limits closing to subsumed PRs",
+    "You may close a PR only when it is subsumed" in asked.get("prompt", ""),
 )
 
 # nothing new: the next round has only the unchanged wait to look at, and says so
@@ -341,6 +344,203 @@ check(
     "an area missing from a list without Gaps is appended",
     ok and t2.endswith("## New\n- [ ] `x-y-z` — text (needs: none)\n"),
     repr(t2),
+)
+
+# ---- closing: only the account's own subsumed PRs, on evidence the code checks, within a daily cap
+import subprocess as sp  # noqa: E402
+
+from tauceti_worker.constants import ROADMAP as ROADMAP_REPO  # noqa: E402
+
+main = TMP / "main"
+(main / "TauCeti").mkdir(parents=True)
+(main / "TauCeti" / "Foo.lean").write_text("theorem Foo.bar : True := trivial\n")
+for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "main"]):
+    sp.run(["git", "-C", str(main), *cmd], check=True)
+W._curate_main_checkout = lambda w: main
+os.environ["TAUCETI_EXPECT_LOGIN"] = "me"
+os.environ["TAUCETI_DECIDE_CLOSE"] = "1"
+D.DECIDE_MAX_CASES = 10
+D.DECIDE_MAX_CLOSES_PER_DAY = 2
+STATES.update({1100: "MERGED", 1101: "OPEN"})
+AUTHORS = {304: "someone-else"}
+writes = []
+_view = GH.pr_view
+
+
+def view(self, n, fields):
+    d = _view(self, n, fields)
+    if "author" in fields:
+        d["author"] = {"login": AUTHORS.get(n, "me")}
+    return d
+
+
+def gh_write(self, args):
+    writes.append(args)
+    return sp.CompletedProcess(args, 0, stdout="", stderr="")
+
+
+GH.pr_view, GH._gh = view, gh_write
+COMMENT = "Everything this PR adds is on main now, through the merged PR named below; nothing is left to land."
+ANSWERS = {
+    "301": {"decision": "close", "note": "subsumed", "merged_prs": [1100], "comment": COMMENT},
+    "302": {"decision": "close", "note": "subsumed", "on_main": ["Foo.bar"], "comment": COMMENT},
+    "303": {"decision": "close", "note": "subsumed", "merged_prs": [1101], "comment": COMMENT},
+    "304": {"decision": "close", "note": "subsumed", "merged_prs": [1100], "comment": COMMENT},
+    "305": {"decision": "close", "note": "subsumed", "merged_prs": [1100], "comment": COMMENT},
+    "306": {"decision": "close", "note": "subsumed", "merged_prs": [1100], "comment": COMMENT},
+    "311": {"decision": "escalate", "note": "the roadmap change was declined; the owner decides"},
+}
+
+
+def agent(cwd, prompt, profile, logdir):
+    cwd = Path(cwd)
+    if (cwd / "request.json").is_file():  # roadmap-change: edit the README, describe the PR
+        readme = cwd / "repo" / "TauCetiRoadmap" / "Area" / "README.md"
+        readme.write_text(readme.read_text() + "\n5. Split: the topological part first.\n")
+        if EXTRA_FILE:
+            (cwd / "repo" / "stray.md").write_text("x")
+        (cwd / "pr.json").write_text(
+            json.dumps({"title": "Area: split item 5", "body": "This PR splits item 5 so that " * 6})
+        )
+        return 0
+    cases = json.loads((cwd / "cases.json").read_text())
+    asked["prs"] = sorted(c["pr"] for c in cases["cases"])
+    (cwd / "decisions.json").write_text(json.dumps({str(c["pr"]): ANSWERS.get(str(c["pr"])) for c in cases["cases"]}))
+    return 0
+
+
+D.run_agent_host = agent
+EXTRA_FILE = False
+for i, n in enumerate((301, 302, 303, 304, 305)):
+    live(f"fix-{n}", stage="fix", pr=n, head=f"h{n}", first_at=f"2026-09-29T01:0{i}:00Z")
+acked("fix-310", stage="fix", pr=310, head="h310", decision="wait", blocked_on_roadmap_prs=[50])
+acked("fix-311", stage="fix", pr=311, head="h311", decision="wait", blocked_on_roadmap_prs=[51])
+
+
+class RoadmapGH:
+    def pr_view(self, n, fields):
+        return {"state": {50: "MERGED", 51: "CLOSED"}.get(n, "OPEN")}
+
+    def api_jq(self, path, jq):
+        return ROADMAP_REPO
+
+    def _gh(self, args):
+        writes.append(args)
+        out = f"https://github.com/{ROADMAP_REPO}/pull/77\n" if args[:2] == ["pr", "create"] else ""
+        return sp.CompletedProcess(args, 0, stdout=out, stderr="")
+
+
+D.GitHub = lambda repo: RoadmapGH()
+OPEN2 = OPEN + [pr(n) for n in (301, 302, 303, 304, 305, 306, 310, 311)]
+w.counters.d.clear()
+D.do_decide(w, SimpleNamespace(open_prs=OPEN2), None, SimpleNamespace(), False)
+closes = [a for a in writes if a[:2] == ["pr", "close"]]
+check(
+    "a PR subsumed by a merged PR is closed with the evidence in its comment",
+    (read("fix-301", INC / "acked") or {}).get("decision") == "closed"
+    and any(a[2] == "301" and "#1100 (merged)" in a[-1] and "reopen it" in a[-1] for a in closes),
+    str(closes)[:300],
+)
+check(
+    "a PR whose declarations are on main is closed, citing where",
+    (read("fix-302", INC / "acked") or {}).get("decision") == "closed"
+    and any(a[2] == "302" and "TauCeti/Foo.lean:1" in a[-1] for a in closes),
+)
+check(
+    "a close citing an unmerged PR is escalated", "has not merged" in (read("fix-303") or {}).get("decision_note", "")
+)
+check("a close of someone else's PR is escalated", "did not open" in (read("fix-304") or {}).get("decision_note", ""))
+check(
+    "the daily cap stops the third close",
+    "cap" in (read("fix-305") or {}).get("decision_note", "") and len(closes) == 2,
+    str(len(closes)),
+)
+check(
+    "a closed PR records what subsumed it, for the curator",
+    (read("fix-301", INC / "acked") or {}).get("subsumed_by") == [1100],
+)
+r310 = read("fix-310", INC / "acked") or {}
+check(
+    "a wait on a merged roadmap change becomes a retry citing it",
+    r310.get("decision") == "retry" and f"{ROADMAP_REPO}/pull/50" in r310.get("decision_note", ""),
+    str(r310)[:200],
+)
+r311 = read("fix-311") or {}
+check(
+    "a wait on a roadmap change closed unmerged is ruled again",
+    r311.get("decision") == "escalate" and any(h.get("decision") == "wait" for h in r311.get("history", [])),
+)
+os.environ.pop("TAUCETI_DECIDE_CLOSE")
+live("fix-306", stage="fix", pr=306, head="h306")
+w.counters.d.clear()
+D.do_decide(w, SimpleNamespace(open_prs=OPEN2), None, SimpleNamespace(), False)
+check(
+    "with closing off, a close ruling is escalated",
+    "closing is off" in (read("fix-306") or {}).get("decision_note", ""),
+)
+
+# ---- filing a roadmap proposal: prepare shows the diff, open pushes to the fork and parks the PR
+origin, fork = TMP / "rm-origin", TMP / "rm-fork.git"
+(origin / "TauCetiRoadmap" / "Area").mkdir(parents=True)
+(origin / "TauCetiRoadmap" / "Area" / "README.md").write_text("# Area\n\n4. First.\n")
+for cmd in (
+    ["init", "-q", "-b", "main"],
+    ["add", "."],
+    ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "r"],
+):
+    sp.run(["git", "-C", str(origin), *cmd], check=True)
+sp.run(["git", "init", "-q", "--bare", str(fork)], check=True)
+git_calls = []
+
+
+def fake_gated_git(argv, *, op, target, kind=None, **kw):
+    git_calls.append((op, target, kind))
+    argv = [
+        a.replace("https://github.com/me/TauCetiRoadmap.git", str(fork)).replace(
+            f"https://github.com/{ROADMAP_REPO}", str(origin)
+        )
+        for a in argv
+    ]
+    kw.pop("capture_output", None)
+    return sp.run(argv, capture_output=True, text=True, **kw)
+
+
+D.gate_mod.gated_git = fake_gated_git
+prop = TMP / "decisions" / "roadmap-320.md"
+prop.parent.mkdir(parents=True, exist_ok=True)
+prop.write_text("# Proposed roadmap change\n\nSplit Area item 5.\n")
+live("fix-320", stage="fix", pr=320, head="h320", decision="roadmap", proposal=str(prop), decision_note="split it")
+D.roadmap_change_prepare(320)
+shown = D.roadmap_change_show(320)
+check(
+    "prepare commits the README edit on a branch and shows it",
+    "Title: Area: split item 5" in shown and "+5. Split: the topological part first." in shown,
+    shown[-300:],
+)
+EXTRA_FILE = True
+try:
+    D.roadmap_change_prepare(320)
+    check("a change touching more than the README is refused", False)
+except D.Die:
+    check("a change touching more than the README is refused", True)
+EXTRA_FILE = False
+D.roadmap_change_prepare(320)
+url = D.roadmap_change_open(320)
+r320 = read("fix-320", INC / "acked") or {}
+branches = sp.run(["git", "-C", str(fork), "branch", "--list"], capture_output=True, text=True).stdout
+check(
+    "open pushes the branch to the fork through the gate",
+    "decide/tauceti-320" in branches and ("push", "https://github.com/me/TauCetiRoadmap", "git_push") in git_calls,
+)
+check(
+    "open files the PR and labels it",
+    any(a[:2] == ["pr", "create"] and "me:decide/tauceti-320" in a for a in writes)
+    and any(a[:2] == ["pr", "edit"] and "awaiting-review" in a for a in writes),
+)
+check(
+    "the TauCeti PR then waits on the roadmap PR",
+    url.endswith("/pull/77") and r320.get("decision") == "wait" and r320.get("blocked_on_roadmap_prs") == [77],
+    str(r320)[:200],
 )
 
 sys.exit(1 if fails else 0)

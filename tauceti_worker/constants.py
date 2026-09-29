@@ -332,13 +332,16 @@ SANDBOX_DEFAULT["progress"] = False
 # `curate` likewise: it edits the operator's target list and reads a shallow clone of main; the model
 # is handed excerpts and answers with a verdict file. No untrusted checkout is executed.
 SANDBOX_DEFAULT["curate"] = False
-# `decide` too: host-side reads and a verdict file, like curate. It writes only local incident records
-# and the operator's target list; it makes no write to TauCeti.
+# `decide` too: host-side reads and a verdict file, like curate. Its one TauCeti write, closing one of
+# the account's own PRs that the evidence shows is subsumed, is made by the worker's code through the
+# gate after checking that evidence, never by the model.
 SANDBOX_DEFAULT["decide"] = False
 # The decide stage: at most this often on its own, and at most this many declines put to the model in
-# one round.
+# one round. Closing a PR happens only while TAUCETI_DECIDE_CLOSE is 1 (the operator's choice; the
+# fleet sets it from `decide.close`), and at most this many times per UTC day.
 DECIDE_GAP = int(os.environ.get("TAUCETI_DECIDE_GAP", "600"))
 DECIDE_MAX_CASES = int(os.environ.get("TAUCETI_DECIDE_MAX_CASES", "6"))
+DECIDE_MAX_CLOSES_PER_DAY = int(os.environ.get("TAUCETI_DECIDE_MAX_CLOSES_PER_DAY", "3"))
 # The curator's cadence: how long after an attempt before the target list is looked at again, and how
 # long a cheap "due" verdict is cached.
 CURATE_GAP = int(os.environ.get("TAUCETI_CURATE_GAP", "21600"))  # 6 h

@@ -166,9 +166,10 @@ def declined_at(stage: str) -> set[tuple[int, str]]:
 # ---- decisions: what happens to a decline once someone (the decide stage, or the owner) has ruled ----
 
 RETRY, WAIT, ROADMAP, ESCALATE, STALE, NOTED = "retry", "wait", "roadmap", "escalate", "stale", "noted"
+# The decide stage closed the PR itself (the owner allowed it, 2026-09-29), on evidence its code checked.
+CLOSED = "closed"
 # Decisions that still need the owner: the record stays in the live folder, so the fleet's attention
 # list keeps showing it, now with the decision's analysis or drafted proposal beside the agent's words.
-# Closing a PR is always the owner's: a decision that recommends it is an `escalate` naming its evidence.
 OWNER_DECISIONS = (ROADMAP, ESCALATE)
 _PR_STAGES = ("fix", "fix-ci", "rebase")
 _HISTORY_KEYS = ("decision", "head", "decided_at", "decision_note")
