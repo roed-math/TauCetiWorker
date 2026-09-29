@@ -744,7 +744,9 @@ def _state(pr: int) -> dict:
     try:
         return json.loads((decisions_dir() / f"roadmap-{pr}" / "state.json").read_text())
     except (OSError, ValueError):
-        raise Die(f"#{pr}: nothing prepared (run `roadmap-change prepare {pr}` first)") from None
+        raise Die(
+            f"#{pr}: nothing prepared yet; prepare it and read the diff with `tauceti-fleet attention --file-roadmap {pr}` (or `tauceti roadmap-change prepare {pr}`)"
+        ) from None
 
 
 def roadmap_change_show(pr: int) -> str:
