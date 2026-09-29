@@ -297,9 +297,14 @@ class Survey:
 
     def mine_needs_fix(self) -> int:
         """How many of my open PRs a fix worker has work on: `awaiting-author` (the fix stage) or
-        `ci-failed` (fix-ci). This is the number a fleet reconciler sizes fixers by; counting
-        `awaiting-author` alone hid every red build from it."""
-        return sum(1 for p in self._mine_open_prs if {"awaiting-author", "ci-failed"} & set(p.labels))
+        `ci-failed` (fix-ci), less those a fixer already declined at their current head, which no
+        fixer will pick up again until the head moves or a decision lifts the decline. This is the
+        number a fleet reconciler sizes fixers by; counting `awaiting-author` alone hid every red
+        build from it, and counting declined PRs asked for fixers that would have nothing to do."""
+        declined = declined_at("fix") | declined_at("fix-ci") | declined_at("rebase")
+        return sum(1 for p in self._mine_open_prs
+                   if {"awaiting-author", "ci-failed"} & set(p.labels)
+                   and (getattr(p, "number", None), getattr(p, "head_oid", "")) not in declined)
 
     def status_label_line(self) -> str:
         """One-line breakdown of open non-draft PRs by status label: 'N label (M mine), N label (M),

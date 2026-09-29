@@ -49,16 +49,22 @@ os.environ["TAUCETI_ROUND_DONE_CMD"] = ""
 L._round_done_hook(0, "gq2-c1")
 check("no hook configured: nothing runs", marker.read_text().splitlines() == lines)
 
+from tauceti_worker import interaction  # noqa: E402
+
+interaction.incidents_dir = lambda: tmp / "incidents"
 sv = S.Survey(worker_id="t")
 sv._mine_open_prs = [
-    SimpleNamespace(labels=("awaiting-author",)),
-    SimpleNamespace(labels=("awaiting-review",)),
-    SimpleNamespace(labels=("awaiting-author", "roadmap/X")),
-    SimpleNamespace(labels=("ci-failed",)),
-    SimpleNamespace(labels=("ci-failed", "awaiting-author")),
+    SimpleNamespace(number=1, head_oid="a1", labels=("awaiting-author",)),
+    SimpleNamespace(number=2, head_oid="b2", labels=("awaiting-review",)),
+    SimpleNamespace(number=3, head_oid="c3", labels=("awaiting-author", "roadmap/X")),
+    SimpleNamespace(number=4, head_oid="d4", labels=("ci-failed",)),
+    SimpleNamespace(number=5, head_oid="e5", labels=("ci-failed", "awaiting-author")),
 ]
 check("survey counts my awaiting-author PRs", sv.mine_awaiting_author() == 3)
 check("the fix backlog adds ci-failed, counting each PR once", sv.mine_needs_fix() == 4)
+interaction.record_incident("declined", "fix-3", stage="fix", pr=3, head="c3")
+interaction.record_incident("declined", "fix-ci-4", stage="fix-ci", pr=4, head="old")
+check("a PR declined at its current head leaves the fix backlog", sv.mine_needs_fix() == 3)
 
 if failures:
     print("round_done_hook: FAILED", failures)
