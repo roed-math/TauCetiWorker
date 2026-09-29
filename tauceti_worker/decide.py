@@ -55,7 +55,13 @@ from types import SimpleNamespace
 
 from . import gate as gate_mod
 from . import interaction
-from .agents import fetch_ref, resolve_authoring_profile, run_agent_host
+from .agents import (
+    TAUCETI_CACHE_ARTIFACT_URL,
+    TAUCETI_CACHE_REVISION_URL,
+    fetch_ref,
+    resolve_authoring_profile,
+    run_agent_host,
+)
 from .attention import (
     CLOSED,
     ESCALATE,
@@ -547,14 +553,20 @@ def _check_item(item, pr: int, targets, refs: Path, taken: list[str]) -> tuple[s
 
 # ---- filing a roadmap proposal, on the owner's say-so ----------------------------------------------------
 #
-# `tauceti roadmap-change prepare PR` has an agent apply a `roadmap` ruling's proposal to the roadmap's
-# README on a branch of a fresh TauCetiRoadmap clone, and prints the diff. `tauceti roadmap-change open PR`
-# pushes that branch to the account's TauCetiRoadmap fork and opens the pull request, then parks the
-# TauCeti PR on it (a `wait` whose blocker is the roadmap PR; see _recheck_wait). The two steps are
-# separate so the owner reads the change before it is posted, as TauCetiRoadmap's CONTRIBUTING.md asks;
-# the fleet's `tauceti-fleet attention --file-roadmap PR` runs both with a confirmation between them.
+# `tauceti roadmap-change prepare PR` has an agent apply a `roadmap` ruling's proposal to that roadmap's
+# README, and to its Suggested.lean when the change adds, splits or restates a milestone the file
+# prototypes, on a branch of the fleet's TauCetiRoadmap clone; a changed Suggested.lean is then built
+# the way TauCetiRoadmap's CI builds it. The diff is printed. `tauceti roadmap-change open PR` pushes the
+# branch to the account's TauCetiRoadmap fork and opens the pull request, then parks the TauCeti PR on
+# it (a `wait` whose blocker is the roadmap PR; see _recheck_wait). The two steps are separate so the
+# owner reads the change before it is posted, as TauCetiRoadmap's CONTRIBUTING.md asks; the fleet's
+# `tauceti-fleet attention --file-roadmap PR` runs both with a confirmation between them.
+#
+# One clone serves every proposal, each on its own branch, so its `.lake` (Mathlib and the Tau Ceti
+# dependency, several GB) is fetched once rather than per proposal. Callers hold the fleet's periodic
+# lock, so two preparations never share it at once.
 
-_README_RE = re.compile(r"TauCetiRoadmap/([A-Za-z0-9_-]+)/README\.md")
+_ROADMAP_FILE_RE = re.compile(r"TauCetiRoadmap/([A-Za-z0-9_-]+)/(README\.md|Suggested\.lean)")
 
 
 def _roadmap_record(pr: int) -> tuple[Path, dict]:
@@ -576,24 +588,87 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return p.stdout
 
 
+def roadmap_repo() -> Path:
+    return decisions_dir() / "roadmap-repo"
+
+
+def _fresh_branch(branch: str) -> Path:
+    """The shared TauCetiRoadmap clone, on `branch` reset to upstream main, its tree clean but its
+    `.lake` kept. Cloned on first use."""
+    repo = roadmap_repo()
+    url = f"https://github.com/{ROADMAP_REPO}"
+    if not (repo / ".git").is_dir():
+        shutil.rmtree(repo, ignore_errors=True)
+        p = gate_mod.gated_git(
+            ["git", "clone", "-q", "--filter=blob:none", url, str(repo)],
+            op="clone",
+            target=ROADMAP_REPO,
+            capture_output=True,
+        )
+    else:
+        p = gate_mod.gated_git(
+            ["git", "-C", str(repo), "fetch", "-q", url, "+refs/heads/main:refs/remotes/origin/main"],
+            op="fetch",
+            target=ROADMAP_REPO,
+            capture_output=True,
+        )
+    if p.returncode != 0:
+        raise Die(f"{ROADMAP_REPO}: {(p.stderr or p.stdout).strip()[-300:]}")
+    _git(repo, "checkout", "-q", "-f", "-B", branch, "origin/main")
+    _git(repo, "clean", "-fdq", "-e", ".lake")
+    return repo
+
+
+def _build_env(repo: Path) -> dict[str, str]:
+    """TauCetiRoadmap CI's cache setup: Tau Ceti's public Lake artifact service, read-only."""
+    cfg = repo / ".lake" / "tauceti-lake-cache.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        'cache.defaultService = "tauceti-public"\n[[cache.service]]\nname = "tauceti-public"\nkind = "s3"\n'
+        f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\nrevisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
+    )
+    return {**os.environ, "LAKE_CONFIG": str(cfg), "LAKE_CACHE_DIR": str(repo / ".lake" / "cache")}
+
+
+def build_suggested(repo: Path, area: str) -> tuple[bool, str]:
+    """Build one roadmap's Suggested.lean as TauCetiRoadmap's CI does: Mathlib's cache, Tau Ceti's cache
+    map (artifacts fetched lazily), then `lake build` of that module. (ok, the tail of the output)."""
+    env = _build_env(repo)
+    steps = [
+        ["lake", "exe", "cache", "get"],
+        [
+            "lake",
+            "cache",
+            "get",
+            "--package=TauCeti",
+            "--service=tauceti-public",
+            "--repo=TauCetiProject/TauCeti",
+            "--mappings-only",
+            "--max-revs=20",
+        ],
+        ["lake", "build", f"TauCetiRoadmap.{area}.Suggested"],
+    ]
+    out = ""
+    for i, argv in enumerate(steps):
+        log(f"roadmap-change: {' '.join(argv)}")
+        p = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True, timeout=3 * 3600)
+        out = ((p.stdout or "") + (p.stderr or ""))[-4000:]
+        if p.returncode != 0 and i != 1:  # a cache-map miss only means building Tau Ceti modules from source
+            return False, out
+    return True, out
+
+
 def roadmap_change_prepare(pr: int) -> Path:
-    """Apply the proposal on a branch of a fresh clone and commit it; returns the work directory."""
+    """Apply the proposal on a branch of the shared clone, build a changed Suggested.lean, commit;
+    returns the proposal's work directory (request, agent logs, pr.json, state.json)."""
     path, rec = _roadmap_record(pr)
     proposal = Path(rec["proposal"]).read_text()
     work = decisions_dir() / f"roadmap-{pr}"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    repo = work / "repo"
-    p = gate_mod.gated_git(
-        ["git", "clone", "-q", "--filter=blob:none", f"https://github.com/{ROADMAP_REPO}", str(repo)],
-        op="clone",
-        target=ROADMAP_REPO,
-        capture_output=True,
-    )
-    if p.returncode != 0:
-        raise Die(f"clone {ROADMAP_REPO}: {(p.stderr or p.stdout).strip()[-300:]}")
     branch = f"decide/tauceti-{pr}"
-    _git(repo, "checkout", "-q", "-b", branch)
+    repo = _fresh_branch(branch)
+    (work / "repo").symlink_to(repo, target_is_directory=True)
     (work / "request.json").write_text(
         json.dumps(
             {
@@ -608,14 +683,25 @@ def roadmap_change_prepare(pr: int) -> Path:
         )
     )
     profile = resolve_authoring_profile("claude")
+    # The agent builds a Suggested.lean it changes with the same cache setup the check below uses.
+    os.environ.update({k: v for k, v in _build_env(repo).items() if k.startswith("LAKE_")})
     log(f"roadmap-change: #{pr}: asking {profile.model or 'the model'} to apply the proposal in {repo}")
     rc = run_agent_host(work, (HERE / "prompts" / "roadmap-change.md").read_text(), profile, work / "logs")
     if rc != 0:
         raise Die(f"roadmap-change: the agent exited {rc}; see {work / 'logs'}")
-    changed = [ln[3:] for ln in _git(repo, "status", "--porcelain").splitlines() if ln.strip()]
-    readmes = [c for c in changed if _README_RE.fullmatch(c)]
-    if len(changed) != 1 or len(readmes) != 1 or not _git(repo, "diff", "--name-only").strip():
-        raise Die(f"roadmap-change: the change must edit exactly one existing roadmap README; it touched {changed}")
+    # `.lake` holds the build (and our cache config); the upstream repository ignores it anyway.
+    changed = [
+        ln[3:]
+        for ln in _git(repo, "status", "--porcelain", "--untracked-files=all", "--", ".", ":!.lake").splitlines()
+        if ln.strip()
+    ]
+    matched = [_ROADMAP_FILE_RE.fullmatch(c) for c in changed]
+    areas = {m.group(1) for m in matched if m}
+    if not changed or not all(matched) or len(areas) != 1:
+        raise Die(
+            f"roadmap-change: the change may edit only one roadmap's README.md and Suggested.lean; it touched {changed}"
+        )
+    area = areas.pop()
     try:
         meta = json.loads((work / "pr.json").read_text())
         title, body = str(meta["title"]).strip(), str(meta["body"]).strip()
@@ -623,11 +709,18 @@ def roadmap_change_prepare(pr: int) -> Path:
         raise Die("roadmap-change: the agent wrote no usable pr.json (title and body)") from None
     if not (5 <= len(title) <= 100) or len(body) < 100:
         raise Die("roadmap-change: pr.json's title or body is too short (or the title too long)")
-    area = _README_RE.fullmatch(readmes[0]).group(1)
+    if any(m.group(2) == "Suggested.lean" for m in matched):
+        ok, tail = build_suggested(repo, area)
+        (work / "build.log").write_text(tail)
+        if not ok:
+            raise Die(
+                f"roadmap-change: TauCetiRoadmap.{area}.Suggested does not build; see {work / 'build.log'}:\n{tail[-1500:]}"
+            )
     name = _git(repo, "config", "user.name", check=False).strip() or os.environ.get("TAUCETI_EXPECT_LOGIN", "") or me()
     email = _git(repo, "config", "user.email", check=False).strip() or f"{name}@users.noreply.github.com"
     msg = f"{title}\n\nFor {TAUCETI}#{pr}.\n\nCo-Authored-By: {profile.model or 'Claude'} <noreply@anthropic.com>\n"
-    _git(repo, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-q", "-a", "-m", msg)
+    _git(repo, "add", "-A", "--", f"TauCetiRoadmap/{area}")
+    _git(repo, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-q", "-m", msg)
     (work / "state.json").write_text(
         json.dumps(
             {
@@ -636,6 +729,7 @@ def roadmap_change_prepare(pr: int) -> Path:
                 "area": area,
                 "title": title,
                 "body": body,
+                "files": sorted(changed),
                 "head": _git(repo, "rev-parse", "HEAD").strip(),
                 "model": profile.model or "",
                 "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -646,28 +740,28 @@ def roadmap_change_prepare(pr: int) -> Path:
     return work
 
 
-def roadmap_change_show(pr: int) -> str:
-    """The prepared change as the owner should read it: title, description, and the diff."""
-    work = decisions_dir() / f"roadmap-{pr}"
+def _state(pr: int) -> dict:
     try:
-        st = json.loads((work / "state.json").read_text())
+        return json.loads((decisions_dir() / f"roadmap-{pr}" / "state.json").read_text())
     except (OSError, ValueError):
         raise Die(f"#{pr}: nothing prepared (run `roadmap-change prepare {pr}` first)") from None
-    diff = _git(work / "repo", "show", "--format=", st["head"])
-    return f"Title: {st['title']}\n\n{st['body']}\n\n--- diff ({st['area']}/README.md) ---\n{diff}"
+
+
+def roadmap_change_show(pr: int) -> str:
+    """The prepared change as the owner should read it: title, description, and the diff."""
+    st = _state(pr)
+    diff = _git(roadmap_repo(), "show", "--format=", st["head"])
+    return f"Title: {st['title']}\n\n{st['body']}\n\n--- diff ({', '.join(st['files'])}) ---\n{diff}"
 
 
 def roadmap_change_open(pr: int) -> str:
     """Push the prepared branch to the account's TauCetiRoadmap fork and open the PR; park the TauCeti
     PR on it. Returns the new PR's URL."""
     path, rec = _roadmap_record(pr)
-    work = decisions_dir() / f"roadmap-{pr}"
-    try:
-        st = json.loads((work / "state.json").read_text())
-    except (OSError, ValueError):
-        raise Die(f"#{pr}: nothing prepared (run `roadmap-change prepare {pr}` first)") from None
-    repo = work / "repo"
-    if _git(repo, "rev-parse", "HEAD").strip() != st["head"]:
+    st = _state(pr)
+    repo = roadmap_repo()
+    ref = f"refs/heads/{st['branch']}"
+    if _git(repo, "rev-parse", ref, check=False).strip() != st["head"]:
         raise Die(f"#{pr}: the prepared branch changed since it was shown; prepare it again")
     login = os.environ.get("TAUCETI_EXPECT_LOGIN", "").strip() or me()
     fork = os.environ.get("TAUCETI_ROADMAP_FORK", "").strip() or f"{login}/TauCetiRoadmap"
@@ -692,7 +786,7 @@ def roadmap_change_open(pr: int) -> str:
             "push",
             "-q",
             f"{url}.git",
-            f"HEAD:refs/heads/{st['branch']}",
+            f"{ref}:{ref}",
         ],
         op="push",
         target=url,
@@ -744,14 +838,19 @@ def roadmap_change_main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="tauceti roadmap-change", description="File a decide-stage roadmap proposal as a TauCetiRoadmap PR."
     )
-    ap.add_argument("action", choices=("prepare", "show", "open"))
-    ap.add_argument("pr", type=int, help="the TauCeti PR the proposal unblocks")
+    ap.add_argument("action", choices=("prepare", "show", "open", "build"))
+    ap.add_argument("target", help="the TauCeti PR the proposal unblocks (for `build`: a roadmap area)")
     a = ap.parse_args(argv)
+    if a.action == "build":  # warm or check the shared clone's build of one roadmap, on upstream main
+        ok, tail = build_suggested(_fresh_branch("decide/warm"), a.target)
+        print(tail)
+        return 0 if ok else 1
+    pr = int(a.target)
     if a.action == "prepare":
-        roadmap_change_prepare(a.pr)
-        print(roadmap_change_show(a.pr))
+        roadmap_change_prepare(pr)
+        print(roadmap_change_show(pr))
     elif a.action == "show":
-        print(roadmap_change_show(a.pr))
+        print(roadmap_change_show(pr))
     else:
-        print(roadmap_change_open(a.pr))
+        print(roadmap_change_open(pr))
     return 0

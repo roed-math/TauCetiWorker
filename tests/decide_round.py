@@ -481,8 +481,10 @@ check(
 
 # ---- filing a roadmap proposal: prepare shows the diff, open pushes to the fork and parks the PR
 origin, fork = TMP / "rm-origin", TMP / "rm-fork.git"
-(origin / "TauCetiRoadmap" / "Area").mkdir(parents=True)
-(origin / "TauCetiRoadmap" / "Area" / "README.md").write_text("# Area\n\n4. First.\n")
+for area in ("Area", "Other"):
+    (origin / "TauCetiRoadmap" / area).mkdir(parents=True)
+    (origin / "TauCetiRoadmap" / area / "README.md").write_text(f"# {area}\n\n4. First.\n")
+    (origin / "TauCetiRoadmap" / area / "Suggested.lean").write_text("theorem first : True := sorry\n")
 for cmd in (
     ["init", "-q", "-b", "main"],
     ["add", "."],
@@ -490,7 +492,9 @@ for cmd in (
 ):
     sp.run(["git", "-C", str(origin), *cmd], check=True)
 sp.run(["git", "init", "-q", "--bare", str(fork)], check=True)
-git_calls = []
+git_calls, builds = [], []
+BUILD_OK = True
+D.build_suggested = lambda repo, area: builds.append(area) or (BUILD_OK, "build output")
 
 
 def fake_gated_git(argv, *, op, target, kind=None, **kw):
@@ -506,6 +510,38 @@ def fake_gated_git(argv, *, op, target, kind=None, **kw):
 
 
 D.gate_mod.gated_git = fake_gated_git
+EDITS = {"README": True, "SUGGESTED": False, "OTHER_AREA": False}
+
+
+def roadmap_agent(cwd, prompt, profile, logdir):
+    repo = Path(cwd) / "repo" / "TauCetiRoadmap"
+    if EDITS["README"]:
+        (repo / "Area" / "README.md").write_text(
+            (repo / "Area" / "README.md").read_text() + "\n5. Split: the topological part first.\n"
+        )
+    if EDITS["SUGGESTED"]:
+        (repo / "Area" / "Suggested.lean").write_text(
+            (repo / "Area" / "Suggested.lean").read_text() + "theorem split : True := sorry\n"
+        )
+    if EDITS["OTHER_AREA"]:
+        (repo / "Other" / "README.md").write_text("changed\n")
+    if EXTRA_FILE:
+        (Path(cwd) / "repo" / "stray.md").write_text("x")
+    (Path(cwd) / "pr.json").write_text(
+        json.dumps({"title": "Area: split item 5", "body": "This PR splits item 5 so that " * 6})
+    )
+    return 0
+
+
+def dispatch(cwd, prompt, profile, logdir):
+    return (
+        roadmap_agent(cwd, prompt, profile, logdir)
+        if (Path(cwd) / "request.json").is_file()
+        else agent(cwd, prompt, profile, logdir)
+    )
+
+
+D.run_agent_host = dispatch
 prop = TMP / "decisions" / "roadmap-320.md"
 prop.parent.mkdir(parents=True, exist_ok=True)
 prop.write_text("# Proposed roadmap change\n\nSplit Area item 5.\n")
@@ -514,17 +550,39 @@ D.roadmap_change_prepare(320)
 shown = D.roadmap_change_show(320)
 check(
     "prepare commits the README edit on a branch and shows it",
-    "Title: Area: split item 5" in shown and "+5. Split: the topological part first." in shown,
+    "Title: Area: split item 5" in shown and "+5. Split: the topological part first." in shown and not builds,
     shown[-300:],
 )
+
+
+def refused(name, **edits):
+    EDITS.update(edits)
+    try:
+        D.roadmap_change_prepare(320)
+        check(name, False)
+    except D.Die:
+        check(name, True)
+    EDITS.update(README=True, SUGGESTED=False, OTHER_AREA=False)
+
+
 EXTRA_FILE = True
-try:
-    D.roadmap_change_prepare(320)
-    check("a change touching more than the README is refused", False)
-except D.Die:
-    check("a change touching more than the README is refused", True)
+refused("a change touching a file outside the roadmap is refused")
 EXTRA_FILE = False
+refused("a change touching two roadmaps is refused", OTHER_AREA=True)
+BUILD_OK = False
+refused("a Suggested.lean that does not build is refused", SUGGESTED=True)
+BUILD_OK = True
+EDITS["SUGGESTED"] = True
+builds.clear()
 D.roadmap_change_prepare(320)
+shown = D.roadmap_change_show(320)
+check(
+    "a Suggested.lean change is built, then shown with the README change",
+    builds == ["Area"]
+    and "+theorem split" in shown
+    and "Suggested.lean" in shown.split("--- diff", 1)[1].splitlines()[0],
+)
+EDITS["SUGGESTED"] = False
 url = D.roadmap_change_open(320)
 r320 = read("fix-320", INC / "acked") or {}
 branches = sp.run(["git", "-C", str(fork), "branch", "--list"], capture_output=True, text=True).stdout
@@ -541,6 +599,10 @@ check(
     "the TauCeti PR then waits on the roadmap PR",
     url.endswith("/pull/77") and r320.get("decision") == "wait" and r320.get("blocked_on_roadmap_prs") == [77],
     str(r320)[:200],
+)
+check(
+    "one clone serves every proposal",
+    (TMP / "decisions" / "roadmap-repo" / ".git").is_dir() and sum(1 for c in git_calls if c[0] == "clone") == 1,
 )
 
 sys.exit(1 if fails else 0)
