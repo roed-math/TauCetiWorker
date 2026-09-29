@@ -32,12 +32,18 @@ lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   
 lake build
 lake exe axioms
 lake exe module-system
-bash scripts/lint-env.sh
+git fetch -q origin main; base_ref="$(git merge-base origin/main HEAD)"
+{ git diff --name-only --diff-filter=d "$base_ref" -- 'TauCeti/*.lean'; git ls-files --others --exclude-standard -- 'TauCeti/*.lean'; } \
+  | sort -u | sed 's/\.lean$//; s#/#.#g' > "${TMPDIR:-/tmp}/lint-modules.txt"
+LINT_ONLY_MODULES="${TMPDIR:-/tmp}/lint-modules.txt" bash scripts/lint-env.sh   # as CI runs it: only the modules this branch changes
 ```
 Iterate until green. Never push red. A green `lake build` alone is NOT enough: CI's `build` check
 also fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring, or a
-`@[simp]` lemma whose left-hand side `simp` already rewrites). If `lint-env` flags a declaration that
-is NOT in your diff, your branch is likely behind main: merge `main` into the branch and re-check.
+`@[simp]` lemma whose left-hand side `simp` already rewrites).
+`lint-env` runs here as CI runs it, on the modules your branch changes (its docstring scan stays
+library-wide). A violation in a declaration you added or changed is yours: fix it. One that is only
+in declarations outside your diff is lint debt on `main` (a `lint-repair/` PR repairs it): do not
+fix it here and do not stop over it; if your branch is behind main, merge `main` and re-check first.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

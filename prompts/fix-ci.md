@@ -19,10 +19,14 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   lake build
   lake exe axioms
   lake exe module-system
-  bash scripts/lint-env.sh
+  { git diff --name-only --diff-filter=d "$base_ref" -- 'TauCeti/*.lean'; git ls-files --others --exclude-standard -- 'TauCeti/*.lean'; } \
+    | sort -u | sed 's/\.lean$//; s#/#.#g' > "${TMPDIR:-/tmp}/lint-modules.txt"
+  LINT_ONLY_MODULES="${TMPDIR:-/tmp}/lint-modules.txt" bash scripts/lint-env.sh   # as CI runs it: only the modules this branch changes
   ```
-  If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
-  overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
+  `lint-env` runs here as CI runs it, on the modules your branch changes (its docstring scan stays
+  library-wide). A violation in a declaration you added or changed is yours: fix it. One that is only
+  in declarations outside your diff is lint debt on `main` (a `lint-repair/` PR repairs it): do not
+  fix it here and do not stop over it; if your branch is behind main, merge `main` and re-check first.
 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
@@ -50,7 +54,9 @@ rm -f "$base_shims"; rm -rf "$base_root"
 lake build
 lake exe axioms
 lake exe module-system
-bash scripts/lint-env.sh
+{ git diff --name-only --diff-filter=d "$base_ref" -- 'TauCeti/*.lean'; git ls-files --others --exclude-standard -- 'TauCeti/*.lean'; } \
+  | sort -u | sed 's/\.lean$//; s#/#.#g' > "${TMPDIR:-/tmp}/lint-modules.txt"
+LINT_ONLY_MODULES="${TMPDIR:-/tmp}/lint-modules.txt" bash scripts/lint-env.sh   # as CI runs it: only the modules this branch changes
 ```
 Iterate until every one is green. A green `lake build` alone is NOT enough — the `build` check also
 fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). Never push red.
