@@ -118,7 +118,7 @@ def _do_decide_inner(w, sv, opts) -> int | None:
     cases: list[tuple[Path, dict]] = []
     for path, rec in undecided_declines():
         pr = rec.get("pr")
-        if not isinstance(pr, int):
+        if not (isinstance(pr, int) and pr > 0):  # an authoring round records pr 0
             gist = _clip((rec.get("summary") or "").split("\n", 1)[0], 200)
             record_decision(path, NOTED, decision_note=f"an authoring round declined without a target: {gist}")
             ruled.append(f"{path.name}: noted (authoring decline without a target)")

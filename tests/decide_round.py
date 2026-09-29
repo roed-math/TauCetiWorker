@@ -73,7 +73,7 @@ def read(name, folder=INC):
 
 live("fix-101", stage="fix", pr=101, head="h101")
 live("fix-102", stage="fix", pr=102, head="h102")
-live("roadmap-unknown", stage="roadmap", summary="The Foo roadmap has no milestone left.\nDetails.")
+live("roadmap-unknown", stage="roadmap", pr=0, summary="The Foo roadmap has no milestone left.\nDetails.")  # as recorded: pr 0
 live("roadmap-Area-pre-thing", stage="roadmap", target="Area/pre-thing")
 live("fix-103", stage="fix", pr=103, head="h103")
 live("fix-104", stage="fix", pr=104, head="h104")
