@@ -766,10 +766,12 @@ def roadmap_change_open(pr: int) -> str:
     login = os.environ.get("TAUCETI_EXPECT_LOGIN", "").strip() or me()
     fork = os.environ.get("TAUCETI_ROADMAP_FORK", "").strip() or f"{login}/TauCetiRoadmap"
     parent = GitHub(fork).api_jq(f"repos/{fork}", ".parent.full_name")
-    if (parent or "").strip() != ROADMAP_REPO:
+    if parent is None:
+        raise Die(f"could not read {fork} to check it is a fork of {ROADMAP_REPO} (see the gate's refusal above)")
+    if parent.strip() != ROADMAP_REPO:
         raise Die(
-            f"{fork} is not a fork of {ROADMAP_REPO} (create one with `gh repo fork {ROADMAP_REPO} --clone=false`,"
-            " or name yours in TAUCETI_ROADMAP_FORK)"
+            f"{fork} is not a fork of {ROADMAP_REPO} (it reports parent {parent.strip() or 'none'}); create one with "
+            f"`gh repo fork {ROADMAP_REPO} --clone=false`, or name yours in TAUCETI_ROADMAP_FORK"
         )
     url = f"https://github.com/{fork}"
     os.environ["TAUCETI_PUSH_REMOTE"] = url  # the gate's push allowlist: this fork, op `push`, this process only
@@ -841,6 +843,13 @@ def roadmap_change_main(argv: list[str]) -> int:
     ap.add_argument("action", choices=("prepare", "show", "open", "build"))
     ap.add_argument("target", help="the TauCeti PR the proposal unblocks (for `build`: a roadmap area)")
     a = ap.parse_args(argv)
+    if a.action in ("prepare", "open"):
+        # The identity gate a round runs at its start: confirm the account before any GitHub read or
+        # write, and cache it, which is also what lets the gate admit a read of the account's own fork.
+        from .identity import gate as identity_gate
+
+        wid = os.environ.get("TAUCETI_WORKER_ID", "").strip() or "default"
+        identity_gate(HERE / "state" / wid, wid, where=f"roadmap-change {a.action}")
     if a.action == "build":  # warm or check the shared clone's build of one roadmap, on upstream main
         ok, tail = build_suggested(_fresh_branch("decide/warm"), a.target)
         print(tail)

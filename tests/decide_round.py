@@ -583,6 +583,13 @@ check(
     and "Suggested.lean" in shown.split("--- diff", 1)[1].splitlines()[0],
 )
 EDITS["SUGGESTED"] = False
+RoadmapGH.api_jq = lambda self, path, jq: None  # the gate refused the read, or it failed
+try:
+    D.roadmap_change_open(320)
+    check("a fork that cannot be read is reported as unreadable, not as no fork", False)
+except D.Die as e:
+    check("a fork that cannot be read is reported as unreadable, not as no fork", "could not read" in str(e), str(e))
+RoadmapGH.api_jq = lambda self, path, jq: ROADMAP_REPO
 url = D.roadmap_change_open(320)
 r320 = read("fix-320", INC / "acked") or {}
 branches = sp.run(["git", "-C", str(fork), "branch", "--list"], capture_output=True, text=True).stdout
