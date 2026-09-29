@@ -293,7 +293,7 @@ CODEX_REFRESH_SKEW_S = int(os.environ.get("TAUCETI_CODEX_REFRESH_SKEW", str(48 *
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "curate"]
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "curate", "decide"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
@@ -304,8 +304,9 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # keeps a stuck or rejected progress report from burning every round. `curate` comes last: it is about
 # the operator's target list, not a PR, and its own attempt gap keeps it to a cadence; the fleet
 # runs it under `--only curate` on a timer (2026-09-21: a periodic round found "no eligible work"
-# because the stage was surveyed but never dispatched).
-AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review", "curate")
+# because the stage was surveyed but never dispatched). `decide` is last for the same reason: it rules
+# on declined rounds (decide.py), and the fleet runs it under `--only decide` when one is recorded.
+AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review", "curate", "decide")
 
 # The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
 # left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
@@ -331,6 +332,13 @@ SANDBOX_DEFAULT["progress"] = False
 # `curate` likewise: it edits the operator's target list and reads a shallow clone of main; the model
 # is handed excerpts and answers with a verdict file. No untrusted checkout is executed.
 SANDBOX_DEFAULT["curate"] = False
+# `decide` too: host-side reads and a verdict file, like curate. It writes only local incident records
+# and the operator's target list; it makes no write to TauCeti.
+SANDBOX_DEFAULT["decide"] = False
+# The decide stage: at most this often on its own, and at most this many declines put to the model in
+# one round.
+DECIDE_GAP = int(os.environ.get("TAUCETI_DECIDE_GAP", "600"))
+DECIDE_MAX_CASES = int(os.environ.get("TAUCETI_DECIDE_MAX_CASES", "6"))
 # The curator's cadence: how long after an attempt before the target list is looked at again, and how
 # long a cheap "due" verdict is cached.
 CURATE_GAP = int(os.environ.get("TAUCETI_CURATE_GAP", "21600"))  # 6 h

@@ -29,7 +29,7 @@ checks = [
         "single shared auto order",
         tc.AUTO_STAGES,
         # curate is last: it is about the operator's target list, not a PR, and keeps its own cadence.
-        ("rebase", "bump", "progress", "fix-ci", "fix", "review", "curate"),
+        ("rebase", "bump", "progress", "fix-ci", "fix", "review", "curate", "decide"),
     ),
 ]
 if "TAUCETI_PROGRESS_GAP" not in os.environ:

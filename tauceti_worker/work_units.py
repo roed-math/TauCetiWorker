@@ -37,7 +37,7 @@ from .agents import (
     validate_kiro_model_access,
     wrapper_bin,
 )
-from .attention import record_declined_round
+from .attention import decision_note_for, record_declined_round
 from .config import (
     Config,
     Die,
@@ -73,6 +73,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
+from .decide import do_decide
 from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
 from .intentions import administrative_hold_avoid_list, claimed_avoid_list
 from .interaction import contest_max_exchanges, record_incident
@@ -830,6 +831,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "progress": do_progress,
         "roadmap": do_roadmap,
         "curate": do_curate,
+        "decide": do_decide,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
     # with which agent and sandbox — the same line for every stage.
@@ -842,6 +844,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         what = c.reason or "roadmap progress report"
     elif stage == "curate":
         what = c.reason or "target list curation"
+    elif stage == "decide":
+        what = c.reason or "declined rounds"
     else:
         what = c.reason or (c.head[:12] if c.head else "")
     if stage == "review":
@@ -1176,6 +1180,14 @@ def _do_fixlike(
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
+    # A round at this head was declined before and then ruled `retry` (decide.py): the ruling says what
+    # changed since, which the declining round did not know. Appended, not a placeholder: most rounds
+    # have no ruling, and an agent told nothing is the normal case.
+    ruling = decision_note_for(pr, head)
+    if ruling:
+        prompt += "\n\n## A ruling about this PR\n\nAn earlier round at this head stopped without a change, and "
+        prompt += f"the fleet has since ruled that it should be tried again. The ruling says:\n\n{ruling}\n"
+        log(f"  {label} #{pr}: carrying a retry ruling to the agent")
     pub_kind = pub_mod.KIND_REBASE if label == "rebase" else pub_mod.KIND_FIX
     pub_id = ""
     if bubble:
@@ -1634,13 +1646,15 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     return 0
 
 
-def _commit_targets(path: Path, applied: list[str]) -> None:
-    """Commit the curated file when it is tracked in a git repository, then push (see _push_targets)."""
+def _commit_targets(path: Path, applied: list[str], prefix: str = "curate") -> None:
+    """Commit the curated file when it is tracked in a git repository, then push (see _push_targets).
+    `prefix` names the stage that changed it (curate, or decide adding a prerequisite)."""
     repo = path.parent
     p = subprocess.run(["git", "-C", str(repo), "ls-files", "--error-unmatch", path.name], capture_output=True, text=True)
     if p.returncode != 0:
         return
-    msg = "curate: " + "; ".join(applied)[:300] + "\n\nWritten by the fleet's curator from the PRs' states and main."
+    who = "curator" if prefix == "curate" else f"{prefix} stage"
+    msg = f"{prefix}: " + "; ".join(applied)[:300] + f"\n\nWritten by the fleet's {who} from the PRs' states and main."
     p = subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", msg, "--", path.name], capture_output=True, text=True)
     if p.returncode != 0:
         log(f"curate: commit failed ({(p.stderr or p.stdout).strip()[:160]}) — the file is written, not committed")
@@ -2144,9 +2158,9 @@ def _without_declined(candidates: list[tuple[str, TargetItem]]) -> list[tuple[st
 
 
 def _author_only(opts) -> bool:
-    """A round restricted to authoring and/or curating: nothing in it reads review state."""
+    """A round restricted to authoring, curating and/or deciding: nothing in it reads review state."""
     only = set(getattr(opts, "only", None) or [])
-    return bool(only) and only <= {"roadmap", "curate"}
+    return bool(only) and only <= {"roadmap", "curate", "decide"}
 
 
 from . import constants as _constants  # noqa: E402 - ROUND_TIMEOUT for the fallback slots' expiry

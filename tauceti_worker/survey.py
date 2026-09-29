@@ -20,6 +20,7 @@ from .constants import (
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
     CURATE_GAP,
+    DECIDE_GAP,
     EX_NOPROGRESS,
     MAX_BUMP_ATTEMPTS,
     MAX_BUMP_PR_ATTEMPTS,
@@ -232,6 +233,7 @@ class Survey:
     bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
     progress: WorkKind = field(default_factory=lambda: WorkKind("progress"))  # a roadmap report is due
     curate: WorkKind = field(default_factory=lambda: WorkKind("curate"))  # the target list needs a look
+    decide: WorkKind = field(default_factory=lambda: WorkKind("decide"))  # a declined round needs a ruling
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -282,6 +284,7 @@ class Survey:
             "bump": self.bump,
             "progress": self.progress,
             "curate": self.curate,
+            "decide": self.decide,
         }[name]
 
     def rescope_roadmap(self) -> None:
@@ -542,6 +545,21 @@ def curate_due(counters: Counters) -> tuple[bool, str]:
     if last and (time.time() - last) < CURATE_GAP:
         return False, f"the target list was curated {(time.time() - last) / 3600:.1f}h ago; waiting out the gap"
     return True, "target list curation is due"
+
+
+def decide_due(counters: Counters) -> tuple[bool, str]:
+    """Is a decide round due? Local only: a decline nobody has ruled on, or a `wait` ruling to look at
+    again, and the attempt gap passed. The fleet starts the round when a decline is recorded; this is
+    the second line of defence against running it back to back."""
+    from .attention import decided_waits, undecided_declines
+
+    last = counters.read("decide-attempt-ts")
+    if last and (time.time() - last) < DECIDE_GAP:
+        return False, f"declines were ruled on {(time.time() - last) / 60:.0f} min ago; waiting out the gap"
+    pending, waits = len(undecided_declines()), len(decided_waits())
+    if not (pending or waits):
+        return False, "no declined round awaits a ruling"
+    return True, f"{pending} decline(s) to rule on, {waits} waiting ruling(s) to re-check"
 
 
 def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
@@ -887,6 +905,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     due, reason = curate_due(counters)
     c = Candidate(0, "", reason or "target list curation")
     (sv.curate.actionable if due else sv.curate.suppressed).append(c)
+    # 8) decide: a declined round's record (local) awaits a ruling. No network here either.
+    due, reason = decide_due(counters)
+    c = Candidate(0, "", reason or "declined rounds")
+    (sv.decide.actionable if due else sv.decide.suppressed).append(c)
 
     sv.next_auto_stage = _next_auto_stage(sv)
     return sv

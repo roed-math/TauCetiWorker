@@ -148,7 +148,8 @@ check("a not-landed verdict is remembered while main is unchanged", asked == {},
 # AUTO_STAGES: a stage that is surveyed but not listed there is never dispatched (2026-09-21).
 from tauceti_worker.constants import AUTO_STAGES as _AUTO
 
-check("curate is the last stage of the cascade", "curate" in _AUTO and _AUTO[-1] == "curate", str(_AUTO))
+check("curate comes after every PR stage of the cascade, with only decide after it",
+      "curate" in _AUTO and _AUTO[_AUTO.index("curate") + 1:] == ("decide",), str(_AUTO))
 
 # The gate's push allowlist: the curator may push to the operator's target-list repository and
 # nowhere else; never canonical; no other op inherits the permission.

@@ -368,3 +368,26 @@ def mark_merged(text: str, slug: str, pr: int) -> tuple[str, bool]:
             done = True
         out.append(line)
     return "".join(out), done
+
+
+def insert_items(text: str, area: str, lines: list[str]) -> tuple[str, bool]:
+    """Add item lines at the TOP of `area`'s items, so an author takes them before the area's other
+    open items (the ordering rule is file order): the decide stage adds a roadmap prerequisite that a
+    blocked PR of ours waits on, and unblocking work already written beats starting new work. An area
+    the file does not have yet gets its own section, placed before the Gaps section. Pure."""
+    if not lines:
+        return text, False
+    block = [ln.rstrip("\n") + "\n" for ln in lines]
+    out = text.splitlines(keepends=True)
+    for i, raw in enumerate(out):
+        h = _HEADING_RE.match(raw.rstrip("\n"))
+        if h and h.group(1) == area:
+            return "".join(out[: i + 1] + block + out[i + 1 :]), True
+    section = [f"## {area}\n", *block, "\n"]
+    for i, raw in enumerate(out):
+        h = _HEADING_RE.match(raw.rstrip("\n"))
+        if h and h.group(1).lower().startswith("gaps"):
+            return "".join(out[:i] + section + out[i:]), True
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    return "".join(out + ["\n", *section]).rstrip("\n") + "\n", True
