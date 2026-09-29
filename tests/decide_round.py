@@ -558,7 +558,7 @@ check(
 def refused(name, **edits):
     EDITS.update(edits)
     try:
-        D.roadmap_change_prepare(320)
+        D.roadmap_change_prepare(320, fresh=True)
         check(name, False)
     except D.Die:
         check(name, True)
@@ -574,7 +574,7 @@ refused("a Suggested.lean that does not build is refused", SUGGESTED=True)
 BUILD_OK = True
 EDITS["SUGGESTED"] = True
 builds.clear()
-D.roadmap_change_prepare(320)
+D.roadmap_change_prepare(320, fresh=True)
 shown = D.roadmap_change_show(320)
 check(
     "a Suggested.lean change is built, then shown with the README change",
@@ -583,6 +583,37 @@ check(
     and "Suggested.lean" in shown.split("--- diff", 1)[1].splitlines()[0],
 )
 EDITS["SUGGESTED"] = False
+
+# a preparation stopped by a check after the agent's round is finished on the next run, not redone
+agent_rounds = []
+LONG_BODY = "This PR splits item 5 so that " * 6
+
+
+def long_title_agent(cwd, prompt, profile, logdir):
+    agent_rounds.append(1)
+    rc = roadmap_agent(cwd, prompt, profile, logdir)
+    (Path(cwd) / "pr.json").write_text(json.dumps({"title": "Area: " + "x" * 250, "body": LONG_BODY}))
+    return rc
+
+
+D.run_agent_host = lambda cwd, *a: (
+    long_title_agent(cwd, *a) if (Path(cwd) / "request.json").is_file() else agent(cwd, *a)
+)
+try:
+    D.roadmap_change_prepare(320, fresh=True)
+    check("a title over 200 characters is refused, naming the file to fix", False)
+except D.Die as e:
+    check("a title over 200 characters is refused, naming the file to fix", "pr.json" in str(e), str(e))
+(TMP / "decisions" / "roadmap-320" / "pr.json").write_text(
+    json.dumps({"title": "Area: split item 5", "body": LONG_BODY})
+)
+D.roadmap_change_prepare(320)
+check(
+    "running again after fixing pr.json finishes without another agent round",
+    len(agent_rounds) == 1 and "Title: Area: split item 5" in D.roadmap_change_show(320),
+    str(agent_rounds),
+)
+D.run_agent_host = dispatch
 RoadmapGH.api_jq = lambda self, path, jq: None  # the gate refused the read, or it failed
 try:
     D.roadmap_change_open(320)

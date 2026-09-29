@@ -658,37 +658,55 @@ def build_suggested(repo: Path, area: str) -> tuple[bool, str]:
     return True, out
 
 
-def roadmap_change_prepare(pr: int) -> Path:
-    """Apply the proposal on a branch of the shared clone, build a changed Suggested.lean, commit;
-    returns the proposal's work directory (request, agent logs, pr.json, state.json)."""
-    path, rec = _roadmap_record(pr)
-    proposal = Path(rec["proposal"]).read_text()
-    work = decisions_dir() / f"roadmap-{pr}"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
-    branch = f"decide/tauceti-{pr}"
-    repo = _fresh_branch(branch)
-    (work / "repo").symlink_to(repo, target_is_directory=True)
-    (work / "request.json").write_text(
-        json.dumps(
-            {
-                "tauceti_pr": pr,
-                "tauceti_pr_url": f"https://github.com/{TAUCETI}/pull/{pr}",
-                "proposal": proposal,
-                "ruling": rec.get("decision_note") or "",
-                "fixer_account": rec.get("summary") or "",
-                "checkout": "repo",
-            },
-            indent=1,
-        )
+def _unfinished(pr: int, work: Path) -> bool:
+    """An earlier `prepare` of this PR stopped after its agent round (a check refused pr.json, a build
+    failed): the agent's edits are still on the PR's branch, uncommitted, with its pr.json beside them."""
+    repo = roadmap_repo()
+    return (
+        (work / "pr.json").is_file()
+        and not (work / "state.json").is_file()
+        and (repo / ".git").is_dir()
+        and _git(repo, "branch", "--show-current", check=False).strip() == f"decide/tauceti-{pr}"
+        and bool(_git(repo, "status", "--porcelain", "--", ".", ":!.lake", check=False).strip())
     )
+
+
+def roadmap_change_prepare(pr: int, *, fresh: bool = False) -> Path:
+    """Apply the proposal on a branch of the shared clone, build a changed Suggested.lean, commit;
+    returns the proposal's work directory (request, agent logs, pr.json, state.json). An earlier
+    preparation that stopped after its agent round is finished rather than redone, unless `fresh`:
+    a check that refused it may have been ours to fix, and the agent's round is the expensive part."""
+    path, rec = _roadmap_record(pr)
+    work = decisions_dir() / f"roadmap-{pr}"
+    branch = f"decide/tauceti-{pr}"
     profile = resolve_authoring_profile("claude")
-    # The agent builds a Suggested.lean it changes with the same cache setup the check below uses.
-    os.environ.update({k: v for k, v in _build_env(repo).items() if k.startswith("LAKE_")})
-    log(f"roadmap-change: #{pr}: asking {profile.model or 'the model'} to apply the proposal in {repo}")
-    rc = run_agent_host(work, (HERE / "prompts" / "roadmap-change.md").read_text(), profile, work / "logs")
-    if rc != 0:
-        raise Die(f"roadmap-change: the agent exited {rc}; see {work / 'logs'}")
+    if not fresh and _unfinished(pr, work):
+        repo = roadmap_repo()
+        log(f"roadmap-change: #{pr}: finishing the earlier preparation (its edits are on {branch}; --fresh redoes it)")
+    else:
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        repo = _fresh_branch(branch)
+        (work / "repo").symlink_to(repo, target_is_directory=True)
+        (work / "request.json").write_text(
+            json.dumps(
+                {
+                    "tauceti_pr": pr,
+                    "tauceti_pr_url": f"https://github.com/{TAUCETI}/pull/{pr}",
+                    "proposal": Path(rec["proposal"]).read_text(),
+                    "ruling": rec.get("decision_note") or "",
+                    "fixer_account": rec.get("summary") or "",
+                    "checkout": "repo",
+                },
+                indent=1,
+            )
+        )
+        # The agent builds a Suggested.lean it changes with the same cache setup the check below uses.
+        os.environ.update({k: v for k, v in _build_env(repo).items() if k.startswith("LAKE_")})
+        log(f"roadmap-change: #{pr}: asking {profile.model or 'the model'} to apply the proposal in {repo}")
+        rc = run_agent_host(work, (HERE / "prompts" / "roadmap-change.md").read_text(), profile, work / "logs")
+        if rc != 0:
+            raise Die(f"roadmap-change: the agent exited {rc}; see {work / 'logs'}")
     # `.lake` holds the build (and our cache config); the upstream repository ignores it anyway.
     changed = [
         ln[3:]
@@ -700,21 +718,29 @@ def roadmap_change_prepare(pr: int) -> Path:
     if not changed or not all(matched) or len(areas) != 1:
         raise Die(
             f"roadmap-change: the change may edit only one roadmap's README.md and Suggested.lean; it touched {changed}"
+            " (run again with --fresh to redo it)"
         )
     area = areas.pop()
     try:
         meta = json.loads((work / "pr.json").read_text())
         title, body = str(meta["title"]).strip(), str(meta["body"]).strip()
     except (OSError, ValueError, KeyError, TypeError):
-        raise Die("roadmap-change: the agent wrote no usable pr.json (title and body)") from None
-    if not (5 <= len(title) <= 100) or len(body) < 100:
-        raise Die("roadmap-change: pr.json's title or body is too short (or the title too long)")
+        raise Die(f"roadmap-change: no usable {work / 'pr.json'} (a title and a body)") from None
+    if not (5 <= len(title) <= 200):
+        raise Die(
+            f"roadmap-change: the PR title is {len(title)} characters; fix it in {work / 'pr.json'} and run again"
+        )
+    if len(body) < 100:
+        raise Die(
+            f"roadmap-change: the PR body is only {len(body)} characters; fix it in {work / 'pr.json'} and run again"
+        )
     if any(m.group(2) == "Suggested.lean" for m in matched):
         ok, tail = build_suggested(repo, area)
         (work / "build.log").write_text(tail)
         if not ok:
             raise Die(
-                f"roadmap-change: TauCetiRoadmap.{area}.Suggested does not build; see {work / 'build.log'}:\n{tail[-1500:]}"
+                f"roadmap-change: TauCetiRoadmap.{area}.Suggested does not build; see {work / 'build.log'} "
+                f"(run again to retry the build, or with --fresh to redo the change):\n{tail[-1500:]}"
             )
     name = _git(repo, "config", "user.name", check=False).strip() or os.environ.get("TAUCETI_EXPECT_LOGIN", "") or me()
     email = _git(repo, "config", "user.email", check=False).strip() or f"{name}@users.noreply.github.com"
@@ -844,6 +870,9 @@ def roadmap_change_main(argv: list[str]) -> int:
     )
     ap.add_argument("action", choices=("prepare", "show", "open", "build"))
     ap.add_argument("target", help="the TauCeti PR the proposal unblocks (for `build`: a roadmap area)")
+    ap.add_argument(
+        "--fresh", action="store_true", help="prepare: redo the change even if an earlier attempt stopped part-way"
+    )
     a = ap.parse_args(argv)
     if a.action in ("prepare", "open"):
         # The identity gate a round runs at its start: confirm the account before any GitHub read or
@@ -858,7 +887,7 @@ def roadmap_change_main(argv: list[str]) -> int:
         return 0 if ok else 1
     pr = int(a.target)
     if a.action == "prepare":
-        roadmap_change_prepare(pr)
+        roadmap_change_prepare(pr, fresh=a.fresh)
         print(roadmap_change_show(pr))
     elif a.action == "show":
         print(roadmap_change_show(pr))
