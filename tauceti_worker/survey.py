@@ -291,9 +291,15 @@ class Survey:
         self.next_auto_stage = _next_auto_stage(self)
 
     def mine_awaiting_author(self) -> int:
-        """How many of my open PRs carry `awaiting-author`: the backlog a fix worker exists to clear,
-        and the number a fleet reconciler sizes fixers by. Read off the survey, so it costs nothing."""
+        """How many of my open PRs carry `awaiting-author`: the review findings a fix worker exists to
+        clear. Read off the survey, so it costs nothing."""
         return sum(1 for p in self._mine_open_prs if "awaiting-author" in p.labels)
+
+    def mine_needs_fix(self) -> int:
+        """How many of my open PRs a fix worker has work on: `awaiting-author` (the fix stage) or
+        `ci-failed` (fix-ci). This is the number a fleet reconciler sizes fixers by; counting
+        `awaiting-author` alone hid every red build from it."""
+        return sum(1 for p in self._mine_open_prs if {"awaiting-author", "ci-failed"} & set(p.labels))
 
     def status_label_line(self) -> str:
         """One-line breakdown of open non-draft PRs by status label: 'N label (M mine), N label (M),

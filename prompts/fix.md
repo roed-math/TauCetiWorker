@@ -25,14 +25,19 @@ For each finding, judge whether it is actually correct:
 - **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If a finding means the PR's target is not on any roadmap, say so in your report and stop.
 - Must stay green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force a change through — that is itself a reason to push back on the finding.
 
-## Verify before pushing (all three MUST pass)
+## Verify before pushing (all of these MUST pass)
 ```
 lake exe cache get
 lake cache get --service tauceti-public --repo TauCetiProject/TauCeti || true   # TauCeti's own artifacts for the modules `main` changed since your branch's base (Lake backtracks to the newest revision the service holds, so a fresh merge commit is fine); without this, `lake build` recompiles all of them from source
 lake build
 lake exe axioms
+lake exe module-system
+bash scripts/lint-env.sh
 ```
-Iterate until green. Never push red.
+Iterate until green. Never push red. A green `lake build` alone is NOT enough: CI's `build` check
+also fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring, or a
+`@[simp]` lemma whose left-hand side `simp` already rewrites). If `lint-env` flags a declaration that
+is NOT in your diff, your branch is likely behind main: merge `main` into the branch and re-check.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

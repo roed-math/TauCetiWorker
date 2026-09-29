@@ -54,8 +54,11 @@ sv._mine_open_prs = [
     SimpleNamespace(labels=("awaiting-author",)),
     SimpleNamespace(labels=("awaiting-review",)),
     SimpleNamespace(labels=("awaiting-author", "roadmap/X")),
+    SimpleNamespace(labels=("ci-failed",)),
+    SimpleNamespace(labels=("ci-failed", "awaiting-author")),
 ]
-check("survey counts my awaiting-author PRs", sv.mine_awaiting_author() == 2)
+check("survey counts my awaiting-author PRs", sv.mine_awaiting_author() == 3)
+check("the fix backlog adds ci-failed, counting each PR once", sv.mine_needs_fix() == 4)
 
 if failures:
     print("round_done_hook: FAILED", failures)
