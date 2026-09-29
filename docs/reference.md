@@ -36,6 +36,9 @@ list is in `tauceti work -h`. For persistent workers, see
 
 ## Roadmap backpressure
 
+Authoring stops while you have 8 open PRs in the selected roadmap scope;
+`TAUCETI_MAX_OPEN_PRS` changes that number.
+
 The open-PR backpressure limit follows the roadmap scope you select. A pinned
 area counts only your open PRs identified for that area; an all-areas or
 automatic run counts roadmap PRs in every non-skipped area. Drafts, non-roadmap

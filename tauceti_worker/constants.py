@@ -106,8 +106,8 @@ MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across head
 BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
-# are open.
-MAX_OPEN_PRS = 8
+# are open. An operator may override the project's default with $TAUCETI_MAX_OPEN_PRS.
+MAX_OPEN_PRS = int(os.environ.get("TAUCETI_MAX_OPEN_PRS", "8"))
 
 # The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
 # The survey counts open PRs into these buckets for the per-round "open PRs" line, in lifecycle order
