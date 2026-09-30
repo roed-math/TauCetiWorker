@@ -13,6 +13,10 @@ Some candidates also carry `author_account`: an authoring agent was assigned the
 stopped, saying `main` already has it; the identifiers and hits for those candidates are the
 declarations that account names. Treat the account as a lead, not a verdict: check it against the
 milestone text as strictly as any other candidate.
+When the account names a merged PR, the declarations that PR added and main still has are among
+the hits too, keyed `(#N) name` and listed in `merged_prs_named`: that PR was not written against
+this item (it carries another target marker, or none), so check its declarations against the
+milestone as strictly as the rest.
 
 A hit that begins `Mathlib:` is in the checkout of the Mathlib commit TauCeti's `main` pins, at
 `mathlib_checkout`. A milestone Mathlib already provides in the stated generality has landed too:

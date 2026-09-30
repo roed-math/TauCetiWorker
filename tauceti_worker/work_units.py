@@ -1326,11 +1326,13 @@ def _curate_main_checkout(w) -> Path | None:
 _BLOCKED_RE = re.compile(r"\bblocked\b|overlapping open|open work|after (it|that PR|#\d+) merges|waits? (for|on) #?\d+", re.I)
 
 
-def _declined_by_named_prs(w, rec: dict, area: str, slug: str) -> tuple[str, int]:
+def _declined_by_named_prs(w, rec: dict, area: str, slug: str, leads: list[int] | None = None) -> tuple[str, int]:
     """What the PRs a declining author named say about its target: ("merged", N) when #N is merged
     and carries this item's marker; ("blocked", N) when #N is still open (the author stopped to avoid
     overlapping it); ("unblocked", N) when the PR a previous pass found blocking is no longer open;
-    else ("", 0). At most five gated reads."""
+    else ("", 0). At most five gated reads. A named PR that merged under some other marker, or none,
+    is appended to `leads`: its declarations are evidence to weigh, not a verdict (2026-09-30: #9928
+    proved `lcs-graded-spanning` under its own id, and the item waited for the owner)."""
     named = [int(n) for n in list(rec.get("subsumed_by") or []) + list(rec.get("mentions") or []) if str(n).isdigit()]
     blocked_on = rec.get("blocked_on")
     open_pr = 0
@@ -1339,6 +1341,8 @@ def _declined_by_named_prs(w, rec: dict, area: str, slug: str) -> tuple[str, int
         state = str(d.get("state") or "")
         if state == "MERGED" and (area, slug) in set(target_marker_ids(d.get("body") or "")):
             return "merged", n
+        if state == "MERGED" and leads is not None:
+            leads.append(n)
         if state == "OPEN" and not open_pr:
             open_pr = n
     if open_pr:
@@ -1350,6 +1354,33 @@ def _declined_by_named_prs(w, rec: dict, area: str, slug: str) -> tuple[str, int
     if named and _BLOCKED_RE.search(str(rec.get("summary") or "")):
         return "unblocked", named[0]
     return "", 0
+
+
+_ADDED_DECL_RE = re.compile(
+    r"^\+\s*(?:@\[[^\]]*\]\s*)?(?:(?:protected|private|noncomputable|scoped)\s+)*"
+    r"(?:theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)\s+([^\s(:{\[]+)"
+)
+
+
+def _pr_added_declarations(w, pr: int, limit: int = 40) -> list[str]:
+    """The declarations a PR's diff adds to `TauCeti/` Lean files, by name (one gated read of its
+    file list, patches included). Empty on a failed read or a diff GitHub would not render."""
+    p = w.gh._gh(["api", "--paginate", f"/repos/{TAUCETI}/pulls/{pr}/files?per_page=100"])
+    if p.returncode != 0:
+        return []
+    try:
+        files = json.loads(p.stdout or "[]")
+    except ValueError:
+        return []
+    names: list[str] = []
+    for f in files if isinstance(files, list) else []:
+        if not str(f.get("filename", "")).startswith("TauCeti/") or not str(f.get("filename", "")).endswith(".lean"):
+            continue
+        for line in str(f.get("patch") or "").splitlines():
+            m = _ADDED_DECL_RE.match(line)
+            if m and m.group(1) not in names:
+                names.append(m.group(1))
+    return names[:limit]
 
 
 def _mark_merged_markers(text: str, merged: list[dict]) -> tuple[str, list[str]]:
@@ -1521,7 +1552,8 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             rec = declined[it.slug]
             # The PRs the agent named settle most declines outright: one merged with this item's marker
             # means done; one still open means the target is blocked, not done, and waits for it.
-            verdict, pr_no = _declined_by_named_prs(w, rec, area, it.slug)
+            leads: list[int] = []
+            verdict, pr_no = _declined_by_named_prs(w, rec, area, it.slug, leads)
             if verdict == "merged":
                 new_text, ok = mark_merged(new_text, it.slug, pr_no)
                 if ok:
@@ -1554,6 +1586,12 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             account = str(rec.get("summary") or "")
             named = lean_identifiers(account)
             hits = {ident: h for ident in named if (h := _grep_declarations(clone, ident))}
+            # A merged PR the author named, under another marker or none: what it added, where main
+            # still declares it, marked with the PR so the model knows where the lead came from.
+            for n in leads[:3]:
+                for ident in _pr_added_declarations(w, n):
+                    if h := _grep_declarations(clone, ident):
+                        hits.setdefault(f"(#{n}) {ident}", h)
             if not hits:
                 # An account may cite locations instead of names ("…/Cohomology.lean:544"): each cited
                 # file that exists on main, with the cited line, is evidence of the same kind.
@@ -1567,6 +1605,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             if hits:
                 with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
                                       "identifiers": list(hits), "hits": hits, "author_account": account[:2000],
+                                      **({"merged_prs_named": leads[:3]} if leads else {}),
                                       "declined_incident": rec.get("path", ""),
                                       "handed_back": int(rec.get("handed_back") or 0)})
             else:

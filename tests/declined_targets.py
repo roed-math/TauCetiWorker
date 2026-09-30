@@ -47,6 +47,9 @@ ACCOUNTS = {
     "late-unblock": "No PR: the target is blocked by overlapping open work in PR #9050; compose after it merges.",
     "relation-rank": "Stopped: blocked by overlapping open work in PR #9043; compose after it merges.",
     "directed-inter": "Stopped: Mathlib already has `IsCompact.nonempty_iInter_of_directed_isClosed`; a copy would be a duplicate.",
+    # 2026-09-30: the account names only a merged PR, which carries its own marker id, and no declaration.
+    "graded-spanning": "Stopped without a PR because the target is already covered by merged "
+                       "[PR #9928](https://github.com/TauCetiProject/TauCeti/pull/9928). That PR proves both results.",
 }
 
 
@@ -65,18 +68,20 @@ p5 = decline("ProfiniteProPGroups", "h2-bijection")
 p6 = decline("ProfiniteCohomology", "ambient-model")
 p7 = decline("ProfiniteProPGroups", "relation-rank")
 p8 = decline("ProfiniteProPGroups", "late-unblock")
+p9 = decline("ProfiniteProPGroups", "graded-spanning")
 names = sorted(p.name for p in (TMP / "incidents").glob("declined-*.json"))
 check("one incident per declined target", names == ["declined-roadmap-ProfiniteCohomology-ambient-model.json",
                                                     "declined-roadmap-ProfiniteCohomology-transgression.json",
                                                     "declined-roadmap-ProfiniteProPGroups-compactness-lemma.json",
                                                     "declined-roadmap-ProfiniteProPGroups-directed-inter.json",
+                                                    "declined-roadmap-ProfiniteProPGroups-graded-spanning.json",
                                                     "declined-roadmap-ProfiniteProPGroups-h2-bijection.json",
                                                     "declined-roadmap-ProfiniteProPGroups-late-unblock.json",
                                                     "declined-roadmap-ProfiniteProPGroups-pro-p-frattini.json",
                                                     "declined-roadmap-ProfiniteProPGroups-relation-rank.json"], str(names))
 check("declined_targets lists them by slug",
       set(attention.declined_targets()) == {"compactness-lemma", "transgression", "pro-p-frattini", "directed-inter", "h2-bijection",
-                                            "ambient-model", "relation-rank", "late-unblock"})
+                                            "ambient-model", "relation-rank", "late-unblock", "graded-spanning"})
 
 # ---- the picker ---------------------------------------------------------------------------------------
 LIST = TMP / "targets.md"
@@ -91,6 +96,7 @@ LIST.write_text("""# t
 - [ ] `relation-rank` — L6, "The relation rank." (serves: B3; needs: none)
 - [ ] `h2-bijection` — L5, "Extensions correspond to H²." (serves: B3; needs: none)
 - [ ] `directed-inter` — L1, "A directed family of closed sets has nonempty intersection." (serves: B1; needs: none)
+- [ ] `graded-spanning` — L3, "Brackets with generators span the next graded piece." (serves: B8; needs: none)
 
 ## ProfiniteCohomology
 - [ ] `ambient-model` — L4, "The ambient model." (serves: B6; needs: none)
@@ -114,6 +120,8 @@ clone = TMP / "state" / "curate" / "TauCeti"
 (clone / "TauCeti" / "Transgression.lean").write_text("def transgressionMap : Nat := 0\n")
 (clone / "TauCeti" / "Ext").mkdir()
 (clone / "TauCeti" / "Ext" / "Cohomology.lean").write_text("-- extensions\ntheorem extClassEquivH2 : True := trivial\n")
+(clone / "TauCeti" / "Graded").mkdir()
+(clone / "TauCeti" / "Graded" / "ClosedSpan.lean").write_text("theorem exists_sum_gradedBracket_eq : True := trivial\n")
 # a fake Mathlib at the commit main pins, holding only the lemma the "directed-inter" decline names
 ML = TMP / "mathlib-origin"
 (ML / "Mathlib" / "Topology").mkdir(parents=True)
@@ -135,7 +143,8 @@ def fake_agent(cwd, prompt, profile, logdir):
     cand = json.loads((Path(cwd) / "candidates.json").read_text())["candidates"]
     asked.update({c["slug"]: c for c in cand})
     yes = {"compactness-lemma": "TauCeti/Compact.lean:1 `nonempty_iInter_of_directed_nonempty_isClosed` — the lemma",
-           "directed-inter": "Mathlib/Topology/Compact.lean:1 `IsCompact.nonempty_iInter_of_directed_isClosed` — in Mathlib"}
+           "directed-inter": "Mathlib/Topology/Compact.lean:1 `IsCompact.nonempty_iInter_of_directed_isClosed` — in Mathlib",
+           "graded-spanning": "TauCeti/Graded/ClosedSpan.lean:1 `exists_sum_gradedBracket_eq` — added by #9928"}
     v = {c["slug"]: ({"landed": True, "evidence": yes[c["slug"]]} if c["slug"] in yes
                      else {"landed": False, "evidence": "only the map, no exactness"})
          for c in cand}
@@ -147,7 +156,16 @@ PRS = {
     8192: {"state": "MERGED", "body": '<!--tauceti-target:v1 {"focus":"ProfiniteCohomology","id":"ambient-model"}-->'},
     9043: {"state": "OPEN", "body": "overlapping work"},
     9050: {"state": "MERGED", "body": "the blocking work, merged before any curator pass saw it open"},
+    9928: {"state": "MERGED", "body": '<!--tauceti-target:v1 {"focus":"ProfiniteProPGroups","id":"graded-piece-spanning"}-->'},
 }
+PR_FILES = {9928: [{"filename": "TauCeti/Graded/ClosedSpan.lean",
+                    "patch": "@@ -0,0 +1,3 @@\n+/-- the finite form -/\n+theorem exists_sum_gradedBracket_eq (n : Nat) : True := by\n+  trivial"},
+                   {"filename": "docs/notes.md", "patch": "+theorem not_lean : True"}]}
+
+
+def fake_gh(args):
+    m = next((int(a.split("/pulls/")[1].split("/")[0]) for a in args if "/pulls/" in a), None)
+    return subprocess.CompletedProcess(args, 0, stdout=json.dumps(PR_FILES.get(m, [])), stderr="")
 W.run_agent_host = fake_agent
 W._effective_authoring_profile = lambda opts: "claude"
 W._live_target_view = lambda t, path, sv, gh: (t, 0, 0)
@@ -169,7 +187,7 @@ class Counters:
         return 0
 
 
-w = SimpleNamespace(cfg=SimpleNamespace(state=TMP / "state", logdir=TMP / "logs"), gh=SimpleNamespace(pr_view=lambda n, f: PRS.get(n, {}), pr_list=lambda *a, **k: []),
+w = SimpleNamespace(cfg=SimpleNamespace(state=TMP / "state", logdir=TMP / "logs"), gh=SimpleNamespace(pr_view=lambda n, f: PRS.get(n, {}), pr_list=lambda *a, **k: [], _gh=fake_gh),
                     claims=Claims(), counters=Counters())
 rc = W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
 check("the curator round wrote a change", rc == 0, str(rc))
@@ -188,6 +206,11 @@ check("…and a confirmed one marks the item done", "- [x] `directed-inter`" in 
 check("a decline citing file:line on main goes to the model with the cited line, not the missing file",
       asked.get("h2-bijection", {}).get("hits") == {"TauCeti/Ext/Cohomology.lean": ["TauCeti/Ext/Cohomology.lean:2: theorem extClassEquivH2 : True := trivial"]},
       str(asked.get("h2-bijection", {}).get("hits")))
+check("a decline naming only a PR merged under another marker goes to the model with what that PR added",
+      "(#9928) exists_sum_gradedBracket_eq" in asked.get("graded-spanning", {}).get("hits", {})
+      and asked.get("graded-spanning", {}).get("merged_prs_named") == [9928],
+      str(asked.get("graded-spanning")))
+check("…and a confirmed one marks the item done", "- [x] `graded-spanning`" in new and "added by #9928" in new, new)
 check("an unconfirmed one stays open", "- [ ] `transgression`" in new and "- [ ] `pro-p-frattini`" in new)
 still = set(attention.declined_targets())
 check("a confirmed decline leaves the attention list",
