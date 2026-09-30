@@ -1916,7 +1916,7 @@ def _progress_roadmap_clone(w) -> Path:
     return roadmap_dir
 
 
-def _progress_tool(w, *args: str, capture: bool = False, timeout: int = 1800):
+def _progress_tool(w, *args: str, capture: bool = False, timeout: int = 1800, env: dict[str, str] | None = None):
     """Run `tauceti-progress <args>` from the pinned build.
 
     `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid byte
@@ -1930,6 +1930,7 @@ def _progress_tool(w, *args: str, capture: bool = False, timeout: int = 1800):
         text=True,
         errors="replace",
         timeout=timeout,
+        env=env,
     )
 
 
@@ -2101,12 +2102,15 @@ def _progress_plan_and_write(w, opts, acted: bool) -> int | None:
     status_body, section_body = work / "status-body.md", work / "section-body.md"
     for stale in (plan_file, facts_file, status_body, section_body):
         stale.unlink(missing_ok=True)  # never ship, or check, a previous round's files
+    rep.fresh_docs_cache(state)  # one documentation build per round, read now (see reporting.Paths)
+    denv = rep.docs_env(state)
 
     # 1) The decision, from fresh clones. Nothing qualifying is not a failure: the table says when
     #    something will, and the survey's due-check sleeps until then.
     proc = _progress_tool(
         w, "plan", "--roadmap-dir", str(roadmap_dir), "--code-dir", str(w.cfg.checkout), "--strategy", "threshold",
         "--table", str(paths.table), "--label-cache", str(paths.labels), "--out", str(plan_file), capture=True,
+        env=denv,
     )
     if proc.returncode == EX_NOPROGRESS:
         scan = rep.record_scan(state, roadmap_dir, reason=((proc.stderr or "").strip().splitlines() or [""])[-1])
@@ -2127,7 +2131,7 @@ def _progress_plan_and_write(w, opts, acted: bool) -> int | None:
     #    deploy mid-run, TauCetiProgress#18); that is a failed round, waited out, never an empty report.
     proc = _progress_tool(
         w, "facts", "--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file),
-        capture=True, timeout=3600,
+        capture=True, timeout=3600, env=denv,
     )
     if proc.returncode != 0:
         _progress_failed(w)
@@ -2140,7 +2144,7 @@ def _progress_plan_and_write(w, opts, acted: bool) -> int | None:
         state, "check", "--plan", str(plan_file), "--facts", str(facts_file), "--status-body", str(status_body),
         "--section-body", str(section_body), "--roadmap-dir", str(roadmap_dir),
     )
-    check_script = rep.write_check_script(work, check_argv)
+    check_script = rep.write_check_script(work, check_argv, {"TAUCETI_DOCS_CACHE": denv["TAUCETI_DOCS_CACHE"]})
     proc = _progress_tool(w, "prompt", "progress", capture=True)
     if proc.returncode != 0 or not proc.stdout.strip():
         _progress_failed(w)
@@ -2163,7 +2167,7 @@ def _progress_plan_and_write(w, opts, acted: bool) -> int | None:
         raise Die(f"the writing agent exited {rc}")
 
     def check():
-        return subprocess.run(check_argv, capture_output=True, text=True, errors="replace", timeout=1800)
+        return subprocess.run(check_argv, capture_output=True, text=True, errors="replace", timeout=1800, env=denv)
 
     for f in (status_body, section_body):
         if not f.is_file() or not f.read_text().strip():

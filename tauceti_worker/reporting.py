@@ -103,6 +103,25 @@ class Paths:
         self.scan = self.dir / "scan.json"  # what the last plan was made against, and what it found
         self.landing = self.dir / "landing.json"  # our open reports and what has been done for each
         self.probe = state / "cache" / "progress-probe.json"
+        # TauCetiProgress's documentation cache, private to this worker and emptied at the start of every
+        # plan. The default is one directory in /tmp for every process on the host, kept an hour per
+        # page, so a page cached by some earlier run can fix the planner's window end at the build
+        # before the one being served: on 2026-09-30 the first live round planned against 163ce80 (a
+        # probe page cached by a dry run 15 minutes earlier), read a page from dec7a58, and `facts`
+        # rightly refused the window.
+        self.docs_cache = self.dir / "docs-cache"
+
+
+def docs_env(state: Path) -> dict[str, str]:
+    """The environment for a `tauceti-progress` call: this worker's own documentation cache."""
+    return {**os.environ, "TAUCETI_DOCS_CACHE": str(Paths(state).docs_cache)}
+
+
+def fresh_docs_cache(state: Path) -> None:
+    """Empty the documentation cache, so this round reads the build being served now."""
+    import shutil
+
+    shutil.rmtree(Paths(state).docs_cache, ignore_errors=True)
 
 
 # ----------------------------------------------------------------------------- when to plan
@@ -129,7 +148,8 @@ def probe_docs(state: Path, argv_fn) -> str | None:
     if cached.get("docs_sha") and _now() - float(cached.get("docs_at") or 0) < DOCS_PROBE_TTL:
         return cached["docs_sha"]
     try:
-        proc = subprocess.run(argv_fn(state, "docs-commit"), capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(argv_fn(state, "docs-commit"), capture_output=True, text=True, timeout=300,
+                              env=docs_env(state))
     except (OSError, subprocess.SubprocessError):
         return None
     sha = (proc.stdout or "").strip().splitlines()[-1:] if proc.returncode == 0 else []
@@ -249,10 +269,12 @@ def snapshot_source(checkout: Path, sha: str, dest: Path) -> Path | None:
     return dest
 
 
-def write_check_script(work: Path, argv: list[str]) -> Path:
-    """A one-line script the writing model runs to check its two files (`tauceti-progress check`)."""
+def write_check_script(work: Path, argv: list[str], env: dict[str, str] | None = None) -> Path:
+    """A one-line script the writing model runs to check its two files (`tauceti-progress check`),
+    with `env`'s settings (the round's documentation cache) in front of it."""
     script = work / "check.sh"
-    script.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(a) for a in argv) + "\n")
+    prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in sorted((env or {}).items()))
+    script.write_text("#!/bin/sh\nexec env " + prefix + " ".join(shlex.quote(a) for a in argv) + "\n")
     script.chmod(0o755)
     return script
 

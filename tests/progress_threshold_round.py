@@ -49,7 +49,7 @@ args = sys.argv[1:]
 cmd = args[0]
 opt = lambda name: args[args.index(name) + 1] if name in args else None
 log = os.environ["FAKE_LOG"]
-open(log, "a").write(json.dumps(args) + "\n")
+open(log, "a").write(json.dumps(args + ["cache=" + os.environ.get("TAUCETI_DOCS_CACHE", "")]) + "\n")
 mode = os.environ.get("FAKE_MODE", "")
 if cmd == "plan":
     table = {"to_sha": "d" * 40, "rows": [{"area": "A", "prs": 12, "qualifies": mode != "notdue",
@@ -134,6 +134,10 @@ check("…that records the assessment for the due-check", scan["to_sha"] == "d" 
 check("…planned with the threshold strategy, a table and a label cache",
       any(c[0] == "plan" and "threshold" in c and "--table" in c and "--label-cache" in c for c in calls()), calls())
 
+cache = str(R.Paths(STATE).docs_cache)
+check("plan and facts read this worker's own documentation cache",
+      all(c[-1] == "cache=" + cache for c in calls() if c[0] in ("plan", "facts")), calls())
+
 # 2) A roadmap qualifies; the first draft fails its check and the repair pass fixes it.
 os.environ["FAKE_MODE"] = ""
 w.counters.write("progress-err", 1)
@@ -143,8 +147,11 @@ check("a qualifying roadmap is written and opened", rc == 0 and exc is None, rep
 check("the writing prompt carries the check script and the source copy",
       "check.sh" in agent_runs[0] and "/work/src" in agent_runs[0] and "Before you stop" in agent_runs[0], agent_runs[0][-600:])
 script = (STATE / "progress" / "work" / "check.sh").read_text()
-check("…and the check script runs `tauceti-progress check` on this round's files",
-      " check " in script and "--status-body" in script and "status-body.md" in script, script)
+check("…and the check script runs `tauceti-progress check` on this round's files, with its cache",
+      " check " in script and "--status-body" in script and "status-body.md" in script
+      and "TAUCETI_DOCS_CACHE=" + cache in script, script)
+check("…and the check the round runs itself uses the same cache",
+      all(c[-1] == "cache=" + cache for c in calls() if c[0] == "check"), [c for c in calls() if c[0] == "check"])
 check("a failed check gets exactly one repair pass, told what failed",
       len(agent_runs) == 2 and "900 words" in agent_runs[1], len(agent_runs))
 land = json.loads(paths.landing.read_text())
