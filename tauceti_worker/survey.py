@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
 
+from . import reporting
 from .attention import declined_at
 from .config import Config, log, roadmap_only, roadmap_skip
 from .constants import (
@@ -33,6 +34,7 @@ from .constants import (
     MAX_REVIEW_CONTESTS,
     MAX_REVIEW_CONTESTS_PER_RUBRIC,
     MAX_REVIEW_ERRORS,
+    NEXT_ELIGIBLE_COUNTER,
     PROGRESS,
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_REF,
@@ -576,6 +578,14 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     so a broken `uvx`, a GitHub hiccup or a bad exit here must read as "not due" and let the round fall
     through to review and fix work. A stage that can throw is a stage that can wedge the worker.
     """
+    if reporting.threshold_mode():
+        # Reports on demand: the planner decides per roadmap, and this only says whether anything it
+        # depends on has moved (reporting.due). When nothing has, leave the loop the time to look again.
+        due, reason, wake = reporting.due(cfg.state, counters, progress_argv)
+        if not due and wake:
+            counters.write(NEXT_ELIGIBLE_COUNTER, int(wake))
+        return due, reason
+
     cache = cfg.state / "cache" / "progress-due.json"
     try:
         if cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:
@@ -650,11 +660,14 @@ def bust_progress_cache(cfg: Config) -> None:
         pass
 
 
-def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
+def survey(
+    cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True, progress_check: bool = True
+) -> Survey:
     """Classify every open PR per work-kind. Read-only — performs no actions.
 
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
-    always uses deep=True.
+    always uses deep=True. `progress_check=False` skips the progress due-check, for a round that may
+    not write a report anyway (its `--only` leaves progress out).
     """
     _f = roadmap_only()
     # Keep sv.roadmap_only a non-None string: "auto" = unset (a round will pick a random area),
@@ -896,9 +909,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
 
     # 6) progress: a per-roadmap STATUS.md / PROGRESS.md report is due in TauCetiRoadmap. Unlike every
     #    other kind this is not about a PR of ours, so it carries a single pr=0 candidate whose reason
-    #    is the cadence verdict. Deep only: the check costs an API call, and the shallow survey exists
-    #    to be cheap. progress_due never raises.
-    if deep:
+    #    is the cadence verdict. Only for a round that may write one: a fixer or reviewer surveying every
+    #    few minutes paid for a due-check it could never act on. The busiest-first check costs an API
+    #    call, so it also wants a deep survey; the threshold one is local and cached (reporting.due), so
+    #    a round that only reports need not read any review state. progress_due never raises.
+    if progress_check and (deep or reporting.threshold_mode()):
         due, reason = progress_due(cfg, counters)
         c = Candidate(0, "", reason or "progress report")
         (sv.progress.actionable if due else sv.progress.suppressed).append(c)

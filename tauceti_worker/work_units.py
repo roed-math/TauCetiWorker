@@ -337,7 +337,12 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # fix work. A round that can only author or curate uses none of it: the open-PR list, their labels
     # and target markers come from the one listing. Skipping it roughly halved the fleet's reads while
     # four authors sat idle at the read budget (2026-09-27).
-    sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=not _author_only(opts))
+    only = set(getattr(opts, "only", None) or [])
+    from .reporting import threshold_mode
+
+    # A round that only writes on-demand progress reads no review state either (reporting.due is local).
+    light = _author_only(opts) or (only == {"progress"} and threshold_mode())
+    sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=not light, progress_check=not only or "progress" in only)
     if sv.github_failed:
         # Name the failure gh reported. The survey already captured its stderr, and the generic line
         # this used to raise ("gh pr list failed (GitHub API?)") sent an operator looking for a broken
@@ -1768,6 +1773,10 @@ def do_progress(w, sv, c, opts, bubble) -> int | None:
     # window so `apply` reconciles with whatever already exists. The claim just stops two workers paying
     # a model for the same report in the same minute, so a claim error (rc 2, logged by Claims with the
     # CLAIM_REPO hint) proceeds rather than aborting.
+    from .reporting import threshold_mode
+
+    if threshold_mode():
+        return _do_progress_threshold(w, opts)  # claims only around its plan and write
     rc_claim = w.claims.begin_global_work("progress")
     if rc_claim == 1:
         log("progress: another worker holds the progress claim — skipping (COOP dedup)")
@@ -1869,8 +1878,20 @@ def _do_progress_inner(w, opts) -> int | None:
     # round, for ever.
     w.counters.write("progress-attempt-ts", int(time.time()))
 
-    # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
-    # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
+    roadmap_dir = _progress_roadmap_clone(w)
+
+    # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
+    if not prepare_checkout(w.cfg):
+        raise Die("checkout failed")
+    return _progress_write(w, opts, roadmap_dir)
+
+
+def _progress_roadmap_clone(w) -> Path:
+    """TauCetiRoadmap at its current `main`, in a writable clone of the worker's own.
+
+    A clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes: `apply`
+    branches from origin/main and pushes, and the threshold planner reads each roadmap's report history
+    from it. The roadmap repo is small, so a full clone is cheap."""
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
     if (roadmap_dir / ".git").is_dir():
         ok = (
@@ -1892,11 +1913,28 @@ def _do_progress_inner(w, opts) -> int | None:
             ["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)], op="clone", target=ROADMAP
         ).returncode:
             raise Die(f"cloning {ROADMAP} failed")
+    return roadmap_dir
 
-    # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
-    if not prepare_checkout(w.cfg):
-        raise Die("checkout failed")
 
+def _progress_tool(w, *args: str, capture: bool = False, timeout: int = 1800):
+    """Run `tauceti-progress <args>` from the pinned build.
+
+    `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid byte
+    raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to inspect.
+    The failure would then skip the counter, the saved output and the Die path entirely, and surface
+    as a bare decode error naming nothing. Mojibake beats losing the diagnostic."""
+    log(f"  $ tauceti-progress {args[0]} …")
+    return subprocess.run(
+        progress_argv(w.cfg.state, *args),
+        capture_output=capture,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+    )
+
+
+def _progress_write(w, opts, roadmap_dir: Path) -> int | None:
+    """The busiest-first round after its clones are fresh: plan, facts, prose, apply."""
     work = w.cfg.state / "progress" / "work"
     work.mkdir(parents=True, exist_ok=True)
     plan_file = work / "plan.json"
@@ -1908,18 +1946,7 @@ def _do_progress_inner(w, opts) -> int | None:
         stale.unlink(missing_ok=True)  # never ship a previous round's prose
 
     def run_tool(*args: str, capture: bool = False):
-        # `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid
-        # byte raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to
-        # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
-        # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
-        log(f"  $ tauceti-progress {args[0]} …")
-        return subprocess.run(
-            progress_argv(w.cfg.state, *args),
-            capture_output=capture,
-            text=True,
-            errors="replace",
-            timeout=1800,
-        )
+        return _progress_tool(w, *args, capture=capture)
 
     # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
     #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
@@ -2020,6 +2047,164 @@ def _do_progress_inner(w, opts) -> int | None:
     # and open a second report before the first one merged.
     w.counters.write("progress-err", 0)
     bust_progress_cache(w.cfg)
+    return 0
+
+
+def _progress_failed(w) -> None:
+    """Count a failed progress round and when it failed; reporting.err_backoff waits it out."""
+    w.counters.incr("progress-err")
+    w.counters.write("progress-err-ts", int(time.time()))
+
+
+def _do_progress_threshold(w, opts) -> int | None:
+    """A report on demand (TauCetiProgress's `threshold` strategy; reporting.py has the why).
+
+    Our open reports first: each is brought up to date, re-gated or handed to a person as the lander
+    rules say. Then, if fewer than reporting.MAX_OPEN are still open, the planner runs and the winning
+    roadmap's report is written. The model runs `tauceti-progress check` itself and fixes what it
+    reports; the round checks again (with one repair pass) before `apply` opens the pull request.
+    """
+    from . import reporting as rep
+
+    state = w.cfg.state
+    w.counters.write("progress-attempt-ts", int(time.time()))
+    acted, open_prs, notes = rep.shepherd(state)
+    for note in notes:
+        log(f"  progress: {note}")
+    if len(open_prs) >= rep.MAX_OPEN:
+        if acted:
+            return 0
+        raise NoProgress(f"progress: {len(open_prs)} report(s) still landing; not writing another until one lands")
+    # The claim (a GitHub lease) covers choosing and writing, so two workers never write the same
+    # report; seeing reports land above needs none, and most rounds end at the plan.
+    if w.claims.begin_global_work("progress") == 1:
+        log("progress: another worker holds the progress claim — not planning (COOP dedup)")
+        return 0 if acted else None
+    try:
+        return _progress_plan_and_write(w, opts, acted)
+    finally:
+        w.claims.release()
+
+
+def _progress_plan_and_write(w, opts, acted: bool) -> int | None:
+    from . import reporting as rep
+
+    state = w.cfg.state
+    roadmap_dir = _progress_roadmap_clone(w)
+    # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
+    if not prepare_checkout(w.cfg):
+        raise Die("checkout failed")
+    paths = rep.Paths(state)
+    work = state / "progress" / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    plan_file, facts_file = work / "plan.json", work / "facts.json"
+    status_body, section_body = work / "status-body.md", work / "section-body.md"
+    for stale in (plan_file, facts_file, status_body, section_body):
+        stale.unlink(missing_ok=True)  # never ship, or check, a previous round's files
+
+    # 1) The decision, from fresh clones. Nothing qualifying is not a failure: the table says when
+    #    something will, and the survey's due-check sleeps until then.
+    proc = _progress_tool(
+        w, "plan", "--roadmap-dir", str(roadmap_dir), "--code-dir", str(w.cfg.checkout), "--strategy", "threshold",
+        "--table", str(paths.table), "--label-cache", str(paths.labels), "--out", str(plan_file), capture=True,
+    )
+    if proc.returncode == EX_NOPROGRESS:
+        scan = rep.record_scan(state, roadmap_dir, reason=((proc.stderr or "").strip().splitlines() or [""])[-1])
+        w.counters.write("progress-err", 0)
+        log(f"progress: {scan['summary']}")
+        if acted:
+            return 0
+        raise NoProgress(f"progress: {scan['summary']}")
+    if proc.returncode != 0:
+        _progress_failed(w)
+        raise Die(_progress_tool_failed(w, "plan", proc))
+    plan = json.loads(plan_file.read_text())
+    rep.record_scan(state, roadmap_dir, reason=plan.get("reason") or "")
+    log(f"progress: {plan.get('reason')}")
+    log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
+
+    # 2) Ground truth. `facts` refuses a window whose declarations it could not read (a documentation
+    #    deploy mid-run, TauCetiProgress#18); that is a failed round, waited out, never an empty report.
+    proc = _progress_tool(
+        w, "facts", "--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file),
+        capture=True, timeout=3600,
+    )
+    if proc.returncode != 0:
+        _progress_failed(w)
+        raise Die(_progress_tool_failed(w, "facts", proc))
+
+    # 3) The prose. TauCetiProgress's prompt, plus this worker's two additions: the library's source at
+    #    the window's end to check a layer against, and the check to run before stopping.
+    source = rep.snapshot_source(w.cfg.checkout, plan["to_sha"], work / "src")
+    check_argv = progress_argv(
+        state, "check", "--plan", str(plan_file), "--facts", str(facts_file), "--status-body", str(status_body),
+        "--section-body", str(section_body), "--roadmap-dir", str(roadmap_dir),
+    )
+    check_script = rep.write_check_script(work, check_argv)
+    proc = _progress_tool(w, "prompt", "progress", capture=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        _progress_failed(w)
+        raise Die(_progress_tool_failed(w, "prompt", proc))
+    prompt_file = work / "progress-prompt.md"
+    prompt_file.write_text(proc.stdout + rep.addendum(check_script, source), encoding="utf-8")
+    prompt = fill_prompt(
+        prompt_file,
+        ROADMAP=plan["roadmap"],
+        ROADMAP_DIR=str(roadmap_dir),
+        PLAN_FILE=str(plan_file),
+        FACTS_FILE=str(facts_file),
+        STATUS_OUT=str(status_body),
+        SECTION_OUT=str(section_body),
+        AGENT=opts.agent_name,
+    )
+    rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
+    if rc != 0:
+        _progress_failed(w)
+        raise Die(f"the writing agent exited {rc}")
+
+    def check():
+        return subprocess.run(check_argv, capture_output=True, text=True, errors="replace", timeout=1800)
+
+    for f in (status_body, section_body):
+        if not f.is_file() or not f.read_text().strip():
+            _progress_failed(w)
+            raise Die(f"the agent did not write {f.name}")
+    proc = check()
+    if proc.returncode != 0:
+        log("progress: the report's check failed after the writing agent; one repair pass")
+        rc = run_agent_host(
+            work, rep.fixup_prompt(proc.stdout or proc.stderr or "", status_body, section_body, check_script),
+            opts.work_model, w.cfg.logdir,
+        )
+        proc = check() if rc == 0 else proc
+    if proc.returncode != 0:
+        _progress_failed(w)
+        raise Die(_progress_tool_failed(w, "check", proc))
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith(("WARN", "status prose", "section")):
+            log(f"  check: {line}")
+
+    # 4) Everything mechanical: render, validate, commit, push, open the pull request.
+    adm = gate_mod.admit_or_log("progress-apply", ROADMAP, gate_mod.API_MUTATION)
+    if adm is None:
+        raise NoProgress("progress: the fleet gate refused the report's publication; it stays due")
+    proc = _progress_tool(
+        w, "apply", "--plan", str(plan_file), "--status-body", str(status_body), "--section-body",
+        str(section_body), "--roadmap-dir", str(roadmap_dir), "--version", PROGRESS_REF, capture=True,
+    )
+    gate_mod.current().record(adm, gate_mod.Outcome.from_process(proc, ok=proc.returncode in (0, EX_NOPROGRESS)))
+    if proc.returncode not in (0, EX_NOPROGRESS):
+        _progress_failed(w)
+        raise Die(_progress_tool_failed(w, "apply", proc))
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    log(out[:600])
+    if proc.returncode == EX_NOPROGRESS:
+        raise NoProgress("progress: this window is already in flight or already landed")
+    urls = re.findall(rf"https://github\.com/{re.escape(ROADMAP)}/pull/(\d+)", out)
+    if urls:
+        n = int(urls[-1])
+        rep.record_opened(state, n, plan, f"https://github.com/{ROADMAP}/pull/{n}")
+    w.counters.write("progress-err", 0)
     return 0
 
 

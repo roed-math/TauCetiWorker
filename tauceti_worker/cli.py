@@ -91,7 +91,8 @@ WORK_EPILOG = """\
 the cascade (priority order; a round does the first that applies):
   rebase    bring our open PRs up to date with their base branch
   bump      adapt a red bump-mathlib PR (the worker never authors one)
-  progress  write a roadmap's STATUS.md / PROGRESS.md report (globally paced at 8h)
+  progress  write a roadmap's STATUS.md / PROGRESS.md report (globally paced at 8h; on demand per
+            roadmap with TAUCETI_PROGRESS_STRATEGY=threshold)
   fix-ci    fix red CI on one of our PRs
   fix       address review feedback on one of our PRs
   review    review an open PR (runs the tauceti-review engine)
