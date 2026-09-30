@@ -714,9 +714,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         if p.mergeable != "CONFLICTING":
             if "needs-rebase" not in labels:
                 continue
-            if not gh.rebase_requested(p.number, p.head_oid):
+            # Our own PR the sweep flagged for a maintainer after queue evictions is ours to update
+            # (see GitHub.rebase_requested); a bot PR keeps waiting for the explicit handoff.
+            if not gh.rebase_requested(p.number, p.head_oid, accept_stalled=p.author == me_login):
                 continue
-            reason = "merge-sweep requested branch reconciliation"
+            reason = "merge-sweep requested branch reconciliation, or the merge queue stalled on this head"
         c = Candidate(p.number, p.head_oid, reason)
         c.attempts = counters.read(f"rebase-pr-{p.number}")
         c.budget = MAX_REBASE_ATTEMPTS

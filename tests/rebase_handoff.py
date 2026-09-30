@@ -19,6 +19,12 @@ def request(head=HEAD, author="tauceti-review-bot[bot]"):
     return {"author": author, "body": f"Merge-queue recovery for head `{head[:7]}`.\n\n<!--tauceti-rebase:v1 {head}-->"}
 
 
+def stalled(head=HEAD):
+    return {"author": "tauceti-review-bot[bot]",
+            "body": f"Merge-queue recovery for head `{head[:7]}`: repeated queue evictions, but this branch already "
+                    f"includes current `main`.\n\n<!--tauceti-merge-stalled:v1 {head}-->"}
+
+
 def test_trusted_paginated_comments():
     gh = GitHub()
     response = SimpleNamespace(returncode=0, stdout="")
@@ -44,6 +50,14 @@ def test_trusted_paginated_comments():
         call.reset_mock()
         assert not gh.rebase_requested(1, "invalid")
         call.assert_not_called()
+        # the sweep's "flagged for a maintainer" verdict counts only when asked for (our own PRs)
+        response.returncode = 0
+        response.stdout = json.dumps(stalled())
+        assert not gh.rebase_requested(1, HEAD)
+        assert gh.rebase_requested(1, HEAD, accept_stalled=True)
+        assert not gh.rebase_requested(1, "b" * 40, accept_stalled=True)
+        response.stdout = json.dumps({**stalled(), "author": "peer"})
+        assert not gh.rebase_requested(1, HEAD, accept_stalled=True)
 
 
 def pr(number, *, author="me", labels=("needs-rebase",), head=HEAD, conflicting=False):
@@ -87,7 +101,24 @@ def test_survey_ownership_head_pause_and_budget():
     assert calls.call_count == 3  # only our labelled, unpaused PRs need comment reads
 
 
+def test_survey_takes_our_own_stalled_pr():
+    """#9857 (2026-09-29): ours, ready to merge, evicted twice, flagged `needs-rebase` with a stalled marker."""
+    gh = GitHub()
+    response = SimpleNamespace(returncode=0, stdout=json.dumps(stalled()))
+    counters = SimpleNamespace(read=lambda name: 0)
+    with (
+        patch.object(survey_mod, "me", return_value="me"),
+        patch.object(survey_mod, "can_push", side_effect=AssertionError("no canonical bot PRs")),
+        patch.object(gh, "open_prs", return_value=[pr(1, labels=("ready-to-merge", "needs-rebase"))]),
+        patch.object(gh, "_gh", return_value=response),
+    ):
+        sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False)
+    assert [c.pr for c in sv.rebaseable.actionable] == [1], sv.rebaseable
+    assert "stalled" in sv.rebaseable.actionable[0].reason
+
+
 if __name__ == "__main__":
     test_trusted_paginated_comments()
     test_survey_ownership_head_pause_and_budget()
-    print("PASS: trusted fork handoff, ownership, stale heads, pause labels and retry cap")
+    test_survey_takes_our_own_stalled_pr()
+    print("PASS: trusted fork handoff, ownership, stale heads, pause labels, retry cap and our own stalled PRs")

@@ -748,8 +748,15 @@ class GitHub:
         except Exception:
             pass
 
-    def rebase_requested(self, pr: int, head: str) -> bool:
-        """A trusted sweep handoff for this exact head; stale requests spend no attempts."""
+    def rebase_requested(self, pr: int, head: str, *, accept_stalled: bool = False) -> bool:
+        """A trusted sweep handoff for this exact head; stale requests spend no attempts.
+
+        With `accept_stalled`, the sweep's other verdict for this head counts too: the merge queue
+        evicted it repeatedly and the sweep, believing the branch already includes main, flagged it for
+        a maintainer (`tauceti-merge-stalled`). Its belief comes from the PR's recorded base, which
+        GitHub does not refresh as main moves, so the branch is usually far behind and a module it
+        imports has since moved (2026-09-29: #9384 and #9857, 281 commits behind, "includes current
+        main"). For the account's own PRs that is ordinary rebase work."""
         if not re.fullmatch(r"[0-9a-f]{40}", head):
             return False
         p = self._gh(
@@ -772,7 +779,10 @@ class GitHub:
             and c.get("author") == "tauceti-review-bot[bot]"
             and isinstance(c.get("body"), str)
             and c["body"].startswith("Merge-queue recovery for head `")
-            and f"<!--tauceti-rebase:v1 {head}-->" in (c.get("body") or "").splitlines()
+            and (
+                f"<!--tauceti-rebase:v1 {head}-->" in c["body"].splitlines()
+                or (accept_stalled and f"<!--tauceti-merge-stalled:v1 {head}-->" in c["body"].splitlines())
+            )
             for c in comments
         )
 
