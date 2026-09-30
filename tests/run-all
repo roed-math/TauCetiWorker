@@ -32,6 +32,8 @@ RUN_STDLIB=(
   curate_sync.py
   curate_round.py
   declined_targets.py
+  decide_round.py
+  safe_push_resync.py
   merged_markers.py
   review_git_shim.py
   targets_fallback.py

@@ -57,16 +57,52 @@ if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then
     fi
 fi
 
-# 2) The gate: one git_push to the head repository. A remote NAME is resolved to its URL so the target
-#    is the repository, not the alias; a refusal is final for this round (exit 75, nothing pushed).
 TARGET="$REMOTE"
 case "$REMOTE" in
     http://*|https://*|git@*|ssh://*) ;;
     *) TARGET=$("$REAL_GIT" remote get-url "$REMOTE" 2>/dev/null || echo "$REMOTE");;
 esac
+
+# 2) Where the branch really is. Normally at the head the round checked out (EXPECT). One exception is
+#    not a race: an earlier push of ours reached the branch, but GitHub never moved the pull request's
+#    head to it (2026-09-30, #10130: the branch was at 28fa8d5 while the PR still said 40be938), so every
+#    later round leased on the PR's stale head and was refused as "stale info". When HEAD already
+#    contains the branch's real tip, pushing over it loses nobody's work: lease on that tip instead. If
+#    the tip IS HEAD, git would report "Everything up-to-date" and the PR would stay behind, so an empty
+#    commit goes on top: only a new push makes GitHub update the pull request. A tip HEAD does not
+#    contain is a real race; the lease on EXPECT below refuses it as before. One gated read.
+LEASE="$EXPECT"
+if [[ -n "$EXPECT" ]]; then
+    gate_admit git_read ls-remote "$TARGET" || { echo "git-safe-push: the fleet gate refused reading the branch — nothing was pushed" >&2; exit 75; }
+    ACTUAL=$("$REAL_GIT" ls-remote "$REMOTE" "refs/heads/$REF" 2>/dev/null | cut -f1)
+    if [[ -n "$ACTUAL" ]]; then gate_record ok; else gate_record fail; fi
+    if [[ -n "$ACTUAL" && "$ACTUAL" != "$EXPECT" ]]; then
+        if ! "$REAL_GIT" cat-file -e "$ACTUAL^{commit}" 2>/dev/null; then
+            gate_admit git_read fetch "$TARGET" || exit 75
+            "$REAL_GIT" fetch -q "$REMOTE" "refs/heads/$REF" 2>/dev/null
+            gate_record ok
+        fi
+        if "$REAL_GIT" merge-base --is-ancestor "$ACTUAL" HEAD 2>/dev/null; then
+            if [[ "$ACTUAL" == "$("$REAL_GIT" rev-parse HEAD)" ]]; then
+                # The identity of the commit already on top, when git has none configured here.
+                name=$("$REAL_GIT" config user.name || "$REAL_GIT" log -1 --format=%an)
+                email=$("$REAL_GIT" config user.email || "$REAL_GIT" log -1 --format=%ae)
+                "$REAL_GIT" -c "user.name=$name" -c "user.email=$email" commit -q --allow-empty \
+                    -m "chore: re-sync the pull request's head" \
+                    -m "An earlier push of ${ACTUAL:0:12} reached the branch, but GitHub did not move the pull request's head to it. This empty commit is a new push, which does." \
+                    || die "could not make the re-sync commit — nothing was pushed"
+            fi
+            echo "git-safe-push: '$REF' is at ${ACTUAL:0:12}, not the pull request's ${EXPECT:0:12}, and HEAD already contains it (an earlier push the pull request never picked up); leasing on the branch's tip" >&2
+            LEASE="$ACTUAL"
+        fi
+    fi
+fi
+
+# 3) The gate: one git_push to the head repository (a remote NAME was resolved to its URL above, so the
+#    target is the repository, not the alias); a refusal is final for this round (exit 75, nothing pushed).
 gate_admit git_push push "$TARGET" || { echo "git-safe-push: the fleet gate refused this push — nothing was pushed" >&2; exit 75; }
 
-# 2b) The publication ledger: this push is the `push` step. The ledger revalidates the PR head (one read)
+# 3b) The publication ledger: this push is the `push` step. The ledger revalidates the PR head (one read)
 #     and refuses a step that was already sent; refused, nothing is pushed and the round yields.
 LOCAL_TIP=$("$REAL_GIT" rev-parse HEAD 2>/dev/null || echo "")
 if ! pub_begin push --sha "$LOCAL_TIP" --branch "$REF"; then
@@ -75,10 +111,10 @@ if ! pub_begin push --sha "$LOCAL_TIP" --branch "$REF"; then
     exit 75
 fi
 
-# 3) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
-echo "git-safe-push: $REMOTE HEAD:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2
+# 4) Branch-level CAS push. lease="" ⇒ create-only; else the branch must still be at that oid.
+echo "git-safe-push: $REMOTE HEAD:$REF (--force-with-lease=$REF:${LEASE:-<create-only>})" >&2
 OUT=$(mktemp)
-"$REAL_GIT" push --force-with-lease="$REF:$EXPECT" "$REMOTE" "HEAD:$REF" 2> >(tee "$OUT" >&2)
+"$REAL_GIT" push --force-with-lease="$REF:$LEASE" "$REMOTE" "HEAD:$REF" 2> >(tee "$OUT" >&2)
 rc=$?
 wait
 if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
