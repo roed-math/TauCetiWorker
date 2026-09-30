@@ -556,7 +556,11 @@ def _check_item(item, pr: int, targets, refs: Path, taken: list[str]) -> tuple[s
 # `tauceti roadmap-change prepare PR` has an agent apply a `roadmap` ruling's proposal to that roadmap's
 # README, and to its Suggested.lean when the change adds, splits or restates a milestone the file
 # prototypes, on a branch of the fleet's TauCetiRoadmap clone; a changed Suggested.lean is then built
-# the way TauCetiRoadmap's CI builds it. The diff is printed. `tauceti roadmap-change open PR` pushes the
+# the way TauCetiRoadmap's CI builds it, with every Suggested.lean that imports it. A proposal may name
+# more than one roadmap: a declaration one roadmap pins and another consumes by name (FuchsianOrbifolds'
+# `biholomorph_of_degree_eq_one`, `#check`ed by ModularForms) can only be renamed in both at once, since
+# either half alone breaks the other's build. Such a change is one pull request, and it may touch only
+# the roadmaps the proposal names. The diff is printed. `tauceti roadmap-change open PR` pushes the
 # branch to the account's TauCetiRoadmap fork and opens the pull request, then parks the TauCeti PR on
 # it (a `wait` whose blocker is the roadmap PR; see _recheck_wait). The two steps are separate so the
 # owner reads the change before it is posted, as TauCetiRoadmap's CONTRIBUTING.md asks; the fleet's
@@ -567,6 +571,34 @@ def _check_item(item, pr: int, targets, refs: Path, taken: list[str]) -> tuple[s
 # lock, so two preparations never share it at once.
 
 _ROADMAP_FILE_RE = re.compile(r"TauCetiRoadmap/([A-Za-z0-9_-]+)/(README\.md|Suggested\.lean)")
+_SUGGESTED_IMPORT_RE = re.compile(r"^import\s+(TauCetiRoadmap\.[A-Za-z0-9_]+\.Suggested)\s*$", re.M)
+MAX_ROADMAPS_PER_CHANGE = 3
+
+
+def suggested_module(area: str) -> str:
+    return f"TauCetiRoadmap.{area}.Suggested"
+
+
+def importers(repo: Path, modules: set[str]) -> set[str]:
+    """Every Suggested module in the checkout that imports one of `modules`, directly or through
+    another: each is built against the change, since a rename in a supplier breaks its consumers'
+    names (ten roadmaps import another's Suggested.lean)."""
+    files = {}
+    for f in repo.glob("**/Suggested.lean"):
+        if ".lake" in f.parts:
+            continue
+        try:
+            files[".".join(f.relative_to(repo).with_suffix("").parts)] = set(
+                _SUGGESTED_IMPORT_RE.findall(f.read_text())
+            )
+        except OSError:
+            continue
+    found, frontier = set(), set(modules)
+    while frontier:
+        new = {mod for mod, imports in files.items() if imports & frontier} - found - modules
+        found |= new
+        frontier = new
+    return found
 
 
 def _roadmap_record(pr: int) -> tuple[Path, dict]:
@@ -630,9 +662,9 @@ def _build_env(repo: Path) -> dict[str, str]:
     return {**os.environ, "LAKE_CONFIG": str(cfg), "LAKE_CACHE_DIR": str(repo / ".lake" / "cache")}
 
 
-def build_suggested(repo: Path, area: str) -> tuple[bool, str]:
-    """Build one roadmap's Suggested.lean as TauCetiRoadmap's CI does: Mathlib's cache, Tau Ceti's cache
-    map (artifacts fetched lazily), then `lake build` of that module. (ok, the tail of the output)."""
+def build_suggested(repo: Path, modules: list[str]) -> tuple[bool, str]:
+    """Build Suggested modules as TauCetiRoadmap's CI does: Mathlib's cache, Tau Ceti's cache map
+    (artifacts fetched lazily), then `lake build` of those modules. (ok, the tail of the output)."""
     env = _build_env(repo)
     steps = [
         ["lake", "exe", "cache", "get"],
@@ -646,7 +678,7 @@ def build_suggested(repo: Path, area: str) -> tuple[bool, str]:
             "--mappings-only",
             "--max-revs=20",
         ],
-        ["lake", "build", f"TauCetiRoadmap.{area}.Suggested"],
+        ["lake", "build", *modules],
     ]
     out = ""
     for i, argv in enumerate(steps):
@@ -714,13 +746,27 @@ def roadmap_change_prepare(pr: int, *, fresh: bool = False) -> Path:
         if ln.strip()
     ]
     matched = [_ROADMAP_FILE_RE.fullmatch(c) for c in changed]
-    areas = {m.group(1) for m in matched if m}
-    if not changed or not all(matched) or len(areas) != 1:
+    areas = sorted({m.group(1) for m in matched if m})
+    if not changed or not all(matched):
         raise Die(
-            f"roadmap-change: the change may edit only one roadmap's README.md and Suggested.lean; it touched {changed}"
+            f"roadmap-change: the change may edit only roadmaps' README.md and Suggested.lean; it touched {changed}"
             " (run again with --fresh to redo it)"
         )
-    area = areas.pop()
+    if len(areas) > 1:
+        # Several roadmaps only when the proposal asked for each of them: an agent must not wander
+        # into roadmaps nobody ruled on.
+        proposal = Path(rec["proposal"]).read_text()
+        unnamed = [a for a in areas if not re.search(rf"\b{re.escape(a)}\b", proposal)]
+        if unnamed or len(areas) > MAX_ROADMAPS_PER_CHANGE:
+            why = (
+                f"the proposal does not name {', '.join(unnamed)}"
+                if unnamed
+                else f"at most {MAX_ROADMAPS_PER_CHANGE} roadmaps"
+            )
+            raise Die(
+                f"roadmap-change: the change edits {', '.join(areas)}, but {why} (run again with --fresh to redo it)"
+            )
+    area = areas[0]
     try:
         meta = json.loads((work / "pr.json").read_text())
         title, body = str(meta["title"]).strip(), str(meta["body"]).strip()
@@ -734,18 +780,20 @@ def roadmap_change_prepare(pr: int, *, fresh: bool = False) -> Path:
         raise Die(
             f"roadmap-change: the PR body is only {len(body)} characters; fix it in {work / 'pr.json'} and run again"
         )
-    if any(m.group(2) == "Suggested.lean" for m in matched):
-        ok, tail = build_suggested(repo, area)
+    changed_modules = {suggested_module(m.group(1)) for m in matched if m.group(2) == "Suggested.lean"}
+    if changed_modules:
+        modules = sorted(changed_modules | importers(repo, changed_modules))
+        ok, tail = build_suggested(repo, modules)
         (work / "build.log").write_text(tail)
         if not ok:
             raise Die(
-                f"roadmap-change: TauCetiRoadmap.{area}.Suggested does not build; see {work / 'build.log'} "
+                f"roadmap-change: {', '.join(modules)} do not all build; see {work / 'build.log'} "
                 f"(run again to retry the build, or with --fresh to redo the change):\n{tail[-1500:]}"
             )
     name = _git(repo, "config", "user.name", check=False).strip() or os.environ.get("TAUCETI_EXPECT_LOGIN", "") or me()
     email = _git(repo, "config", "user.email", check=False).strip() or f"{name}@users.noreply.github.com"
     msg = f"{title}\n\nFor {TAUCETI}#{pr}.\n\nCo-Authored-By: {profile.model or 'Claude'} <noreply@anthropic.com>\n"
-    _git(repo, "add", "-A", "--", f"TauCetiRoadmap/{area}")
+    _git(repo, "add", "-A", "--", *(f"TauCetiRoadmap/{a}" for a in areas))
     _git(repo, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-q", "-m", msg)
     (work / "state.json").write_text(
         json.dumps(
@@ -753,6 +801,7 @@ def roadmap_change_prepare(pr: int, *, fresh: bool = False) -> Path:
                 "pr": pr,
                 "branch": branch,
                 "area": area,
+                "areas": areas,
                 "title": title,
                 "body": body,
                 "files": sorted(changed),
@@ -882,7 +931,7 @@ def roadmap_change_main(argv: list[str]) -> int:
         wid = os.environ.get("TAUCETI_WORKER_ID", "").strip() or "default"
         identity_gate(HERE / "state" / wid, wid, where=f"roadmap-change {a.action}")
     if a.action == "build":  # warm or check the shared clone's build of one roadmap, on upstream main
-        ok, tail = build_suggested(_fresh_branch("decide/warm"), a.target)
+        ok, tail = build_suggested(_fresh_branch("decide/warm"), [suggested_module(a.target)])
         print(tail)
         return 0 if ok else 1
     pr = int(a.target)

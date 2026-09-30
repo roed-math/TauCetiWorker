@@ -481,10 +481,16 @@ check(
 
 # ---- filing a roadmap proposal: prepare shows the diff, open pushes to the fork and parks the PR
 origin, fork = TMP / "rm-origin", TMP / "rm-fork.git"
-for area in ("Area", "Other"):
+# Other's Suggested.lean imports Area's, and Third's imports Other's: a change to Area's must build all three.
+IMPORTS = {
+    "Area": "",
+    "Other": "import TauCetiRoadmap.Area.Suggested\n",
+    "Third": "import TauCetiRoadmap.Other.Suggested\n",
+}
+for area in ("Area", "Other", "Third"):
     (origin / "TauCetiRoadmap" / area).mkdir(parents=True)
     (origin / "TauCetiRoadmap" / area / "README.md").write_text(f"# {area}\n\n4. First.\n")
-    (origin / "TauCetiRoadmap" / area / "Suggested.lean").write_text("theorem first : True := sorry\n")
+    (origin / "TauCetiRoadmap" / area / "Suggested.lean").write_text(IMPORTS[area] + "theorem first : True := sorry\n")
 for cmd in (
     ["init", "-q", "-b", "main"],
     ["add", "."],
@@ -494,7 +500,7 @@ for cmd in (
 sp.run(["git", "init", "-q", "--bare", str(fork)], check=True)
 git_calls, builds = [], []
 BUILD_OK = True
-D.build_suggested = lambda repo, area: builds.append(area) or (BUILD_OK, "build output")
+D.build_suggested = lambda repo, modules: builds.append(list(modules)) or (BUILD_OK, "build output")
 
 
 def fake_gated_git(argv, *, op, target, kind=None, **kw):
@@ -525,6 +531,7 @@ def roadmap_agent(cwd, prompt, profile, logdir):
         )
     if EDITS["OTHER_AREA"]:
         (repo / "Other" / "README.md").write_text("changed\n")
+        (repo / "Other" / "Suggested.lean").write_text(IMPORTS["Other"] + "theorem renamed : True := sorry\n")
     if EXTRA_FILE:
         (Path(cwd) / "repo" / "stray.md").write_text("x")
     (Path(cwd) / "pr.json").write_text(
@@ -568,7 +575,7 @@ def refused(name, **edits):
 EXTRA_FILE = True
 refused("a change touching a file outside the roadmap is refused")
 EXTRA_FILE = False
-refused("a change touching two roadmaps is refused", OTHER_AREA=True)
+refused("a change touching a roadmap the proposal does not name is refused", OTHER_AREA=True)
 BUILD_OK = False
 refused("a Suggested.lean that does not build is refused", SUGGESTED=True)
 BUILD_OK = True
@@ -577,12 +584,38 @@ builds.clear()
 D.roadmap_change_prepare(320, fresh=True)
 shown = D.roadmap_change_show(320)
 check(
-    "a Suggested.lean change is built, then shown with the README change",
-    builds == ["Area"]
-    and "+theorem split" in shown
-    and "Suggested.lean" in shown.split("--- diff", 1)[1].splitlines()[0],
+    "a Suggested.lean change is built with every Suggested.lean that imports it, directly or not",
+    builds == [["TauCetiRoadmap.Area.Suggested", "TauCetiRoadmap.Other.Suggested", "TauCetiRoadmap.Third.Suggested"]],
+    str(builds),
+)
+check(
+    "…then shown with the README change",
+    "+theorem split" in shown and "Suggested.lean" in shown.split("--- diff", 1)[1].splitlines()[0],
 )
 EDITS["SUGGESTED"] = False
+
+# a proposal that names two roadmaps (a name one pins and the other uses) is one change touching both
+prop.write_text("# Proposed roadmap change\n\nRename in Area/README.md and Other/Suggested.lean together.\n")
+EDITS.update(OTHER_AREA=True)
+builds.clear()
+D.roadmap_change_prepare(320, fresh=True)
+st = json.loads((TMP / "decisions" / "roadmap-320" / "state.json").read_text())
+shown = D.roadmap_change_show(320)
+check(
+    "a change to two roadmaps the proposal names is prepared as one commit touching both",
+    st["areas"] == ["Area", "Other"]
+    and "TauCetiRoadmap/Other/README.md" in st["files"]
+    and "+theorem renamed" in shown
+    and "+5. Split" in shown,
+    str(st.get("areas")),
+)
+check(
+    "…building the changed Suggested.lean with its importers",
+    builds == [["TauCetiRoadmap.Other.Suggested", "TauCetiRoadmap.Third.Suggested"]],
+    str(builds),
+)
+EDITS.update(OTHER_AREA=False)
+prop.write_text("# Proposed roadmap change\n\nSplit Area item 5.\n")
 
 # a preparation stopped by a check after the agent's round is finished on the next run, not redone
 agent_rounds = []
