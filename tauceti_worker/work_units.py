@@ -1729,8 +1729,10 @@ def _git_targets(path: Path, *args: str) -> subprocess.CompletedProcess:
     treated as untracked, never committed or pushed."""
     p = subprocess.run(["git", "-C", str(path.parent), *args], capture_output=True, text=True)
     if p.returncode != 0 and "dubious ownership" in (p.stderr or ""):
-        log(f"targets: git refuses {path.parent}, which another user owns — as this user run "
-            f"`git config --global --add safe.directory {path.parent}`; the list is not committed or synced")
+        m = re.search(r"safe\.directory (\S+)", p.stderr)  # git names the repository's top level
+        top = m.group(1) if m else str(path.parent)
+        log(f"targets: git refuses {top}, which another user owns — as this user run "
+            f"`git config --global --add safe.directory {top}`; the list is not committed or synced")
     return p
 
 
