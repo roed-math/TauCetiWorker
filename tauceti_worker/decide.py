@@ -357,6 +357,7 @@ def _rule_with_model(w, sv, opts, cases, open_by_no, tpath, targets) -> list[str
         answers = {}
     out: list[str] = []
     text = tpath.read_text() if tpath is not None and tpath.is_file() else ""
+    base = text
     added: list[str] = []
     ctx = SimpleNamespace(
         w=w,
@@ -372,11 +373,11 @@ def _rule_with_model(w, sv, opts, cases, open_by_no, tpath, targets) -> list[str
         added += new
         out.append(line)
     if added and tpath is not None:
-        from .work_units import _commit_targets
+        from .work_units import update_targets
 
-        tpath.write_text(text)
-        _commit_targets(
-            tpath, [f"`{s}`: added as a prerequisite a blocked PR waits on" for s in added], prefix="decide"
+        # Merged with whatever changed since `base` was read (another fleet sharing the list, say).
+        update_targets(
+            tpath, base, text, [f"`{s}`: added as a prerequisite a blocked PR waits on" for s in added], prefix="decide"
         )
     return out
 

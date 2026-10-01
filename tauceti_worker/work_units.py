@@ -3,6 +3,7 @@ its work unit (review/fix/fix-ci/rebase/bump/roadmap) on the host or in a bubble
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -1489,6 +1490,10 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     path = roadmap_targets()
     if path is None:
         raise NoProgress("curate: no target list configured (--roadmap-targets) — nothing to curate")
+    # Start from the latest list: another fleet, or another host, may have curated it since.
+    with _targets_lock(path) as locked:
+        if locked:
+            _sync_targets(path)
     text = path.read_text()
     targets = parse_targets(text)
     # ---- tier A: the PRs the file names
@@ -1677,24 +1682,138 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     # ---- write, record, commit
     applied = [ln for ln in changes if "owner decides" not in ln]
     if new_text == text:
-        _push_targets(path)  # a commit an earlier run could not push (gate refused, network) goes now
+        with _targets_lock(path) as locked:
+            if locked:
+                _push_targets(path)  # a commit an earlier run could not push (gate refused, network) goes now
         raise NoProgress(
             "curate: the target list is current"
             + (f"; {len(undecided)} item(s) await the owner's decision" if undecided else "")
         )
-    path.write_text(new_text)
+    if not update_targets(path, text, new_text, applied):
+        raise NoProgress("curate: the target list was not updated (the reason is logged above)")
     record_incident("targets-updated", time.strftime("%Y%m%dT%H%M%S", time.gmtime()),
                     path=str(path), changes=applied, undecided=undecided)
     log(f"curate: {len(applied)} change(s) written to {path}")
-    _commit_targets(path, applied)
     return 0
+
+
+@contextlib.contextmanager
+def _targets_lock(path: Path):
+    """Hold the target list's lock: `.<name>.lock` beside it, taken by everything that writes the list
+    (the curate and decide stages of every fleet that shares the file, and `tauceti-fleet targets
+    --apply`). Yields False, after logging why, when the lock cannot be opened; the caller then leaves
+    the list alone rather than write it unlocked.
+
+    Several fleets on one host may point at one list in a directory their users share by group. The
+    lock file is opened read-only, which is enough for flock and works when another user created it,
+    and created group-writable."""
+    import fcntl
+
+    lock = path.parent / f".{path.name}.lock"
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_CREAT, 0o664)
+    except OSError as e:
+        log(f"targets: cannot open the lock {lock} ({e}) — leaving the list as it is")
+        yield False
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield True
+    finally:
+        os.close(fd)
+
+
+def _git_targets(path: Path, *args: str) -> subprocess.CompletedProcess:
+    """`git -C <the list's directory> ARGS`, logging git's refusal of a repository another user owns:
+    without a `safe.directory` entry every git command there fails, and the list would quietly be
+    treated as untracked, never committed or pushed."""
+    p = subprocess.run(["git", "-C", str(path.parent), *args], capture_output=True, text=True)
+    if p.returncode != 0 and "dubious ownership" in (p.stderr or ""):
+        log(f"targets: git refuses {path.parent}, which another user owns — as this user run "
+            f"`git config --global --add safe.directory {path.parent}`; the list is not committed or synced")
+    return p
+
+
+def _merge_targets(base: str, ours: str, theirs: str) -> str | None:
+    """`ours` and `theirs` are two edits of `base`: the three-way merge (`git merge-file`), or None when
+    they touch the same or adjacent lines."""
+    with tempfile.TemporaryDirectory() as d:
+        files = []
+        for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
+            f = Path(d) / name
+            f.write_text(text)
+            files.append(str(f))
+        p = subprocess.run(["git", "merge-file", "-p", "-q", *files], capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def _sync_targets(path: Path) -> None:
+    """Bring the list's clone up to its upstream, when the list is shared through its repository
+    (TAUCETI_TARGETS_PUSH=1): fetch through the gate, then rebase any local commits onto what came in.
+    Call with the lock held. A clone with uncommitted changes (an edit by hand) is left alone, and so
+    is one whose rebase stops on a conflict: that is aborted and recorded for the owner, since the two
+    copies of the list now disagree and no rule here can say which is right."""
+    from . import gate as gate_mod
+
+    if os.environ.get("TAUCETI_TARGETS_PUSH", "").strip() != "1":
+        return
+    up = _git_targets(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if up.returncode != 0 or "/" not in up.stdout:
+        return
+    remote = up.stdout.strip().split("/", 1)[0]
+    url = _git_targets(path, "remote", "get-url", remote).stdout.strip()
+    if not url:
+        return
+    q = gate_mod.gated_git(["git", "-C", str(path.parent), "fetch", "-q", remote], op="curate", target=url,
+                           kind=gate_mod.GIT_READ, capture_output=True)
+    if q.returncode != 0:
+        log(f"targets: fetch of {url} failed ({(q.stderr or q.stdout).strip()[:160]}) — working from the local list")
+        return
+    if _git_targets(path, "diff", "--quiet", "HEAD").returncode != 0:
+        log(f"targets: {path.parent} has uncommitted changes — not rebasing it onto {up.stdout.strip()}")
+        return
+    r = _git_targets(path, "rebase", "-q", "@{upstream}")
+    if r.returncode != 0:
+        _git_targets(path, "rebase", "--abort")
+        head = _git_targets(path, "rev-parse", "--short", "HEAD").stdout.strip()
+        log(f"targets: the local list and {up.stdout.strip()} edit the same lines — left diverged for the owner")
+        record_incident("targets-diverged", head or "unknown", path=str(path), upstream=up.stdout.strip(),
+                        detail=(r.stderr or r.stdout).strip()[:600],
+                        fix=f"in {path.parent}: git pull --rebase, resolve the list by hand, git push")
+
+
+def update_targets(path: Path, base: str, ours: str, applied: list[str], prefix: str = "curate") -> bool:
+    """Write `ours`, the list as a stage edited it from `base`, then commit and push it (_commit_targets).
+
+    The stage read `base` minutes ago, and meanwhile another fleet sharing the file, a curator on
+    another host, or the owner may have changed it. So under the lock the clone is first brought up to
+    its upstream (_sync_targets), then this edit is merged three ways with the list as it is now. Edits
+    to different items merge; edits to the same or adjacent lines are not written, and the next round
+    starts from the new list. True when the list was written."""
+    with _targets_lock(path) as locked:
+        if not locked:
+            return False
+        _sync_targets(path)
+        theirs = path.read_text()
+        merged = ours if theirs == base else _merge_targets(base, ours, theirs)
+        if merged is None:
+            log(f"{prefix}: the target list changed on the same lines while this round worked — not written; "
+                "the next round starts from the new list")
+            return False
+        if merged == theirs:
+            log(f"{prefix}: the target list already has these changes")
+            return False
+        path.write_text(merged)
+        _commit_targets(path, applied, prefix)
+        return True
 
 
 def _commit_targets(path: Path, applied: list[str], prefix: str = "curate") -> None:
     """Commit the curated file when it is tracked in a git repository, then push (see _push_targets).
-    `prefix` names the stage that changed it (curate, or decide adding a prerequisite)."""
+    `prefix` names the stage that changed it (curate, or decide adding a prerequisite). Call with the
+    list's lock held (update_targets)."""
     repo = path.parent
-    p = subprocess.run(["git", "-C", str(repo), "ls-files", "--error-unmatch", path.name], capture_output=True, text=True)
+    p = _git_targets(path, "ls-files", "--error-unmatch", path.name)
     if p.returncode != 0:
         return
     who = "curator" if prefix == "curate" else f"{prefix} stage"
@@ -1706,21 +1825,22 @@ def _commit_targets(path: Path, applied: list[str], prefix: str = "curate") -> N
     _push_targets(path)
 
 
-def _push_targets(path: Path) -> None:
+def _push_targets(path: Path, retried: bool = False) -> None:
     """Push the target list's branch when the operator asked for it (TAUCETI_TARGETS_PUSH=1) and it is
     ahead of its upstream: the list is shared between hosts through its repository, so a curation
     that stays local on one host is not seen by the other. The push goes through the gate like every
     git write (op `curate`, allowed only to TAUCETI_TARGETS_REPO), to the file's own `origin`, never
     anywhere else. Called after a commit and also on a round that changed nothing, so a commit an
-    earlier round could not push goes on the next."""
+    earlier round could not push goes on the next; a push rejected because the upstream moved is
+    retried once after a sync. Call with the list's lock held."""
     from . import gate as gate_mod
 
     if os.environ.get("TAUCETI_TARGETS_PUSH", "").strip() != "1":
         return
     repo = path.parent
-    if subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"], capture_output=True).returncode != 0:
+    if _git_targets(path, "rev-parse", "--is-inside-work-tree").returncode != 0:
         return
-    ahead = subprocess.run(["git", "-C", str(repo), "rev-list", "--count", "@{upstream}..HEAD"], capture_output=True, text=True)
+    ahead = _git_targets(path, "rev-list", "--count", "@{upstream}..HEAD")
     if ahead.returncode != 0 or (ahead.stdout or "0").strip() == "0":
         return
     origin = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
@@ -1732,6 +1852,11 @@ def _push_targets(path: Path) -> None:
     except Exception as e:  # noqa: BLE001 - a refused push leaves the commit for the next run
         log(f"curate: push not attempted ({e}) — the commit stays local")
         return
+    if q.returncode != 0 and not retried and re.search(r"\[rejected\]|non-fast-forward|fetch first|Updates were rejected", q.stderr or ""):
+        # Someone else pushed the list first (another fleet's curator, another host, the owner): take
+        # their commits and push once more.
+        _sync_targets(path)
+        return _push_targets(path, retried=True)
     if q.returncode != 0:
         log(f"curate: push to {origin} failed ({(q.stderr or q.stdout).strip()[:160]}) — the commit stays local")
     else:

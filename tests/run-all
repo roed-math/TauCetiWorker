@@ -31,6 +31,7 @@ RUN_STDLIB=(
   publication_observe.py
   curate_sync.py
   curate_round.py
+  targets_shared.py
   declined_targets.py
   decide_round.py
   safe_push_resync.py
