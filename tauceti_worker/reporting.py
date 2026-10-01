@@ -226,7 +226,9 @@ def record_scan(state: Path, roadmap_dir: Path, *, reason: str) -> dict:
     qualifying = [r for r in rows if r.get("qualifies")]
     waiting = [r for r in rows if not r.get("qualifies") and (r.get("prs") or 0) > 0]
     if qualifying:
-        summary = f"{len(qualifying)} roadmap(s) qualify; the most PRs: {qualifying[0]['area']} ({qualifying[0]['prs']})"
+        top = qualifying[0]
+        summary = (f"{len(qualifying)} roadmap(s) qualify; next: {top['area']} "
+                   f"(N={top['prs']}, N+T={top.get('score', top['prs'])})")
     else:
         nxt = min((r for r in waiting if r.get("qualifies_from")), key=lambda r: r["qualifies_from"], default=None)
         summary = "no roadmap qualifies" + (
