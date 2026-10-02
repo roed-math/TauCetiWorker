@@ -3,6 +3,10 @@
 # Read-only: uses the TAUCETI_TEST_* hooks, never touches GitHub. Run from the repo root.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
+# Logs in a private directory: fixed names under /tmp belong to whichever user on the host ran this
+# first, and every other user's run then failed to write them (and read the first user's logs).
+LC="$(mktemp -d)"
+trap 'rm -rf "$LC"' EXIT
 PY="${PY:-$(command -v python3)}"   # run-all injects the matrix interpreter; fall back to system python3
 WID="lifecycle-test"
 export TAUCETI_WORKER_ID="$WID"
@@ -19,24 +23,24 @@ run() { "$PY" ./tauceti "$@"; }   # plain python3 (lifecycle hooks don't need ri
 NEWSESS=("$PY" -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
 
 echo "== 1. flock: a second concurrent round dies on the lock =="
-TAUCETI_TEST_SLEEP=4 run _round >/tmp/lc1.log 2>&1 &
+TAUCETI_TEST_SLEEP=4 run _round >$LC/lc1.log 2>&1 &
 bg=$!; sleep 1
-TAUCETI_TEST_SLEEP=4 run _round >/tmp/lc2.log 2>&1; rc=$?
-grep -q "holds .*round.lock" /tmp/lc2.log && (( rc == 1 )) && ok "second round refused (rc=$rc)" || no "second round not refused (rc=$rc)"
+TAUCETI_TEST_SLEEP=4 run _round >$LC/lc2.log 2>&1; rc=$?
+grep -q "holds .*round.lock" $LC/lc2.log && (( rc == 1 )) && ok "second round refused (rc=$rc)" || no "second round not refused (rc=$rc)"
 wait $bg
 
 echo "== 2. fd-leak negative: a sleeping grandchild must NOT keep the lock =="
-TAUCETI_TEST_HOLD=30 run _round >/tmp/lc3.log 2>&1; rc=$?
+TAUCETI_TEST_HOLD=30 run _round >$LC/lc3.log 2>&1; rc=$?
 (( rc == 0 )) || no "holding round exited rc=$rc"
 # immediately try to take the lock again; the grandchild (sleep 30) is still alive but must not hold it
-TAUCETI_TEST_SLEEP=0 run _round >/tmp/lc4.log 2>&1; rc=$?
+TAUCETI_TEST_SLEEP=0 run _round >$LC/lc4.log 2>&1; rc=$?
 (( rc == 0 )) && ok "second round took the lock immediately despite live grandchild" \
-              || { no "second round blocked (rc=$rc) — grandchild leaked the lock fd"; cat /tmp/lc4.log; }
+              || { no "second round blocked (rc=$rc) — grandchild leaked the lock fd"; cat $LC/lc4.log; }
 
 echo "== 3. timeout teardown: a wedged round's process group is killed =="
 # Start a round in its own session that holds the lock and sleeps long, then kill its whole group
 # (this is what the loop driver's ROUND_TIMEOUT teardown does via os.killpg).
-TAUCETI_TEST_SLEEP=60 "${NEWSESS[@]}" "$PY" ./tauceti _round >/tmp/lc5.log 2>&1 &
+TAUCETI_TEST_SLEEP=60 "${NEWSESS[@]}" "$PY" ./tauceti _round >$LC/lc5.log 2>&1 &
 child=$!; sleep 1
 pgid=$(ps -o pgid= -p "$child" | tr -d ' ')
 self=$(ps -o pgid= -p $$ | tr -d ' ')
@@ -51,10 +55,10 @@ fi
 
 echo "== 4. signal exit codes: SIGTERM→143, SIGINT→130 =="
 # Direct PID kill (no separate group needed): RoundContext maps SIGTERM→143 / SIGINT→130 via cleanup.
-TAUCETI_TEST_SLEEP=30 "$PY" ./tauceti _round >/tmp/lc6.log 2>&1 &
+TAUCETI_TEST_SLEEP=30 "$PY" ./tauceti _round >$LC/lc6.log 2>&1 &
 c=$!; sleep 1; kill -TERM "$c"; wait "$c"; rc=$?
 (( rc == 143 )) && ok "SIGTERM → 143" || no "SIGTERM → $rc (expected 143)"
-TAUCETI_TEST_SLEEP=30 "$PY" ./tauceti _round >/tmp/lc7.log 2>&1 &
+TAUCETI_TEST_SLEEP=30 "$PY" ./tauceti _round >$LC/lc7.log 2>&1 &
 c=$!; sleep 1; kill -INT "$c"; wait "$c"; rc=$?
 (( rc == 130 )) && ok "SIGINT → 130" || no "SIGINT → $rc (expected 130)"
 

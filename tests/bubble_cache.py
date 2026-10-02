@@ -160,7 +160,10 @@ check("a network fault does not block the round", _probe_with(urllib.error.URLEr
 
 # Cache isolation is load-bearing: a failed Bubble setting command must not leave a sentinel that makes
 # later rounds assume overlay mode. Conversely, an already-verified config needs no subprocess.
-cache_home = Path(tempfile.mkdtemp())
+# Inside a private directory: the setter script below lives beside cache_home, and directly under
+# the shared /tmp it was a fixed path the first user on a host owned, failing the test for the rest.
+cache_home = Path(tempfile.mkdtemp()) / "bubble-home"
+cache_home.mkdir()
 saved_bubble_cmd = tc.agents.bubble_cmd
 old_bubble_home = os.environ.get("TAUCETI_BUBBLE_HOME")
 os.environ["TAUCETI_BUBBLE_HOME"] = str(cache_home)
