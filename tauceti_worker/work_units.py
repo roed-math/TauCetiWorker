@@ -444,6 +444,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             except Die as exc:
                 log(f"  review: {exc}; reviewer affinity disabled for this round")
         ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
+        if not getattr(opts, "prs", ()):
+            ordered = own_target_reviews_first(ordered, sv, target_list_prs(sv))
         sv.reviewable.actionable = ordered
         if deferred:
             waits = [REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at) for c in deferred if c.ready_at is not None]
@@ -542,6 +544,25 @@ def target_list_prs(sv) -> set[int]:
     prs = {pr for _area, _it, pr in inflight_prs(targets)}
     prs |= {p.number for p in sv.open_prs if any(key in items for key in p.target_ids)}
     return prs
+
+
+def own_target_reviews_first(order: list, sv, listed: set[int]) -> list:
+    """Among the account's own PRs in a reviewer's order, those serving the target list come first
+    (owner's ruling, 2026-10-02: "if reviewing our own, prioritize target list"). They take the
+    earliest of the positions the account's own PRs held; every other PR keeps its place, so how
+    often a reviewer turns to the account's own PRs, rather than other people's, is unchanged."""
+    own = {p.number for p in getattr(sv, "_mine_open_prs", None) or []}
+    slots = [i for i, c in enumerate(order) if c.pr in own]
+    mine = [order[i] for i in slots]
+    ranked = [c for c in mine if c.pr in listed] + [c for c in mine if c.pr not in listed]
+    if ranked == mine:
+        return order
+    out = list(order)
+    for i, c in zip(slots, ranked):
+        out[i] = c
+    log("  review: own target-list PRs first among our own: "
+        + ", ".join(f"#{c.pr}" for c in ranked if c.pr in listed))
+    return out
 
 
 # Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a
