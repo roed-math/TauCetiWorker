@@ -49,6 +49,11 @@ DOCS_PROBE_TTL = 600  # the documentation deploys every few hours
 ROADMAP_PROBE_TTL = 300
 SCAN_MAX_AGE = 3600  # re-plan at least this often even if neither probe answers
 REGATE_AFTER = 20 * 60  # the build finished this long ago, the report is open, and the gate is silent
+# An open report of this account that this worker did not open is another worker's to see through:
+# another fleet acting as the same account, on this host or elsewhere. Only once it has been open
+# this long with nobody landing it (a fleet stopped, a report opened by hand) does this worker adopt
+# it. The planner holds another operator's open report for the same 8 hours.
+ADOPT_AFTER = 8 * 3600
 MAX_REGATES = 2
 ERR_BACKOFF_BASE = 15 * 60
 ERR_BACKOFF_MAX = 6 * 3600
@@ -410,12 +415,18 @@ def _landed(n: int) -> bool:
 
 def shepherd(state: Path) -> tuple[bool, list[int], list[str]]:
     """One look at every open report of ours: `(acted, still_open, notes)`. Each GitHub call is gated;
-    a failed read leaves that report for the next look."""
+    a failed read leaves that report for the next look.
+
+    `still_open` is every open report of the account, since MAX_OPEN bounds what the account has in
+    the merge gate's queue. But each report has one shepherd, the worker that opened it (recorded by
+    `record_opened`): two fleets acting as one account would otherwise both update its branch, both
+    re-ask the gate (each counting only its own re-asks against MAX_REGATES) and both escalate it.
+    A report no worker here recorded is adopted after ADOPT_AFTER."""
     paths = Paths(state)
     land = _read(paths.landing)
     known = land.setdefault("prs", {})
     rows = _gh_json(["pr", "list", "--repo", ROADMAP, "--state", "open", "--author", "@me", "--limit", "50",
-                     "--json", "number,headRefName,headRefOid,url,comments"])
+                     "--json", "number,headRefName,headRefOid,url,comments,createdAt"])
     if rows is None:
         return False, [int(n) for n in known], ["could not list our open reports; will look again"]
     mine = {r["number"]: r for r in rows if (r.get("headRefName") or "").startswith("progress/")}
@@ -427,6 +438,15 @@ def shepherd(state: Path) -> tuple[bool, list[int], list[str]]:
         notes.append(f"#{key} ({rec.get('area')}) {outcome}")
     main_sha, main_red, main_ci = ("", False, "") if not mine else _main_state()
     for n, row in sorted(mine.items()):
+        if str(n) not in known:
+            area = row["headRefName"].split("/")[-1]
+            created = _ts(row.get("createdAt"))
+            age = _now() - created if created is not None else 0.0
+            if age < ADOPT_AFTER:
+                notes.append(f"#{n} ({area}): opened by another worker of this account; left to it "
+                             f"(adopted if still open {(ADOPT_AFTER - age) / 3600:.1f} h from now)")
+                continue
+            notes.append(f"#{n} ({area}): open {age / 3600:.1f} h with no worker here seeing it through; adopting it")
         rec = known.setdefault(str(n), {"area": row["headRefName"].split("/")[-1], "url": row.get("url"),
                                         "opened_at": _now()})
         rec["area"] = rec.get("area") or row["headRefName"].split("/")[-1]

@@ -171,15 +171,20 @@ def stub(prs, *, behind=0, builds=None, main_red=False, landed=()):
     return g
 
 
-def pr(n=600, head="h" * 40, comments=()):
+def pr(n=600, head="h" * 40, comments=(), created=None):
+    # Opened an hour ago unless a check says otherwise; whether the shepherd acts on it depends on
+    # whether this worker opened it (reset() records #600 as ours).
     return {"number": n, "headRefName": "progress/aaaaaaa-bbbbbbb/A", "headRefOid": head,
-            "url": f"https://github.com/x/pull/{n}", "comments": list(comments)}
+            "url": f"https://github.com/x/pull/{n}", "comments": list(comments),
+            "createdAt": created or R._iso(time.time() - 3600)}
 
 
 def reset():
+    """A fresh state in which #600, the report the lander-rule checks use, is one this worker opened."""
     paths.landing.unlink(missing_ok=True)
     for f in INC.glob("*.json"):
         f.unlink()
+    R.record_opened(STATE, 600, {"roadmap": "A"}, "https://github.com/x/pull/600")
 
 
 def ago(minutes):
@@ -263,6 +268,26 @@ acted, open_, notes = R.shepherd(STATE)
 check("reports no longer open are reported landed or closed, and forgotten",
       open_ == [] and any("#600 (A) landed" in n for n in notes) and any("#599 (B) was closed" in n for n in notes)
       and json.loads(paths.landing.read_text())["prs"] == {}, notes)
+
+# ----------------------------------------------------------------------------- one shepherd per report
+# Two fleets acting as one account (2026-10-01: gq2 and gqm on mimir) both list every open report of
+# the account. Each sees through only the reports it opened, or adopts one nobody has landed for
+# ADOPT_AFTER; the open count stays the account's, since MAX_OPEN bounds the gate's queue.
+reset()
+g = stub([pr(n=700, created=ago(5))], behind=3)
+acted, open_, notes = R.shepherd(STATE)
+check("a fresh report another worker opened is left to it", not acted and not g.writes() and open_ == [700]
+      and any("#700" in n and "left to it" in n for n in notes) and "700" not in json.loads(paths.landing.read_text())["prs"], notes)
+reset()
+R.record_opened(STATE, 701, {"roadmap": "A"}, "https://github.com/x/pull/701")
+g = stub([pr(n=701, created=ago(5))], behind=3)
+acted, open_, notes = R.shepherd(STATE)
+check("a report this worker opened is seen through at once", acted and any("PUT" in c for c in g.writes()), notes)
+reset()
+g = stub([pr(n=702, created=R._iso(time.time() - R.ADOPT_AFTER - 60))], behind=3)
+acted, open_, notes = R.shepherd(STATE)
+check("a report nobody has landed for ADOPT_AFTER is adopted", acted and any("#702" in n and "adopting it" in n for n in notes)
+      and "702" in json.loads(paths.landing.read_text())["prs"], notes)
 
 # ----------------------------------------------------------------------------- the round's survey
 
