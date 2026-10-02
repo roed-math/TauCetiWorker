@@ -645,7 +645,15 @@ def _agent_credential_dirs() -> tuple[Path | None, Path | None]:
 
     # One directory per worker, rebuilt each round (a round is a process), so nothing accumulates.
     wid = os.environ.get("TAUCETI_WORKER_ID") or f"pid-{os.getpid()}"
-    root = Path(os.environ.get("TAUCETI_DATA_HOME") or tempfile.gettempdir()) / ".cache" / "tauceti-agent-env"
+    data_home = os.environ.get("TAUCETI_DATA_HOME")
+    if data_home:
+        root = Path(data_home) / ".cache" / "tauceti-agent-env"
+    else:
+        # Not isolated (a test, a one-off command): the temp directory, but one directory per user.
+        # Another user on the host may have made a shared one first, and it holds a copy of the gh
+        # config, so it is private.
+        root = Path(tempfile.gettempdir()) / f"tauceti-agent-env-{os.getuid()}"
+        root.mkdir(mode=0o700, exist_ok=True)
     base = root / wid
     if base.exists():
         for f in base.rglob("*"):
