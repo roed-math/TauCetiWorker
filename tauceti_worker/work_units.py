@@ -108,6 +108,7 @@ from .targets import (
     Targets,
     eligible_areas,
     eligible_items,
+    inflight_prs,
     load_targets,
     open_items,
     overlay_live,
@@ -464,15 +465,34 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
     # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
+    #
+    # Target-list PRs first (owner's request, 2026-10-02): when any PR serving the operator's target
+    # list is actionable in a branch-writing stage, a first pass offers only those, in the usual stage
+    # order, so a fixer repairs a target milestone's PR before rebasing an unrelated one. The second
+    # pass is the ordinary cascade over everything not yet offered. A `--pr` round is the operator's
+    # own choice and keeps the ordinary order.
     declined: list[tuple[str, int]] = []
-    for stage in AUTO_STAGES:
-        if not want(opts.only, stage):
-            continue
-        for c in sv.kind(stage).actionable:
-            rc = dispatch(stage, w, sv, c, opts)
-            if rc is not None:
-                return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
-            declined.append((stage, c.pr))
+    offered: set[tuple[str, int]] = set()
+    first = set() if getattr(opts, "prs", ()) else target_list_prs(sv)
+    ahead = sorted(
+        {c.pr for st in AUTO_STAGES if st in BRANCH_STAGES and want(opts.only, st) for c in sv.kind(st).actionable}
+        & first
+    )
+    if ahead:
+        log("  target-list PRs first: " + ", ".join(f"#{n}" for n in ahead))
+    passes = [set(ahead), None] if ahead else [None]
+    for only_prs in passes:
+        for stage in AUTO_STAGES:
+            if not want(opts.only, stage) or (only_prs is not None and stage not in BRANCH_STAGES):
+                continue
+            for c in sv.kind(stage).actionable:
+                if (stage, c.pr) in offered or (only_prs is not None and c.pr not in only_prs):
+                    continue
+                offered.add((stage, c.pr))
+                rc = dispatch(stage, w, sv, c, opts)
+                if rc is not None:
+                    return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
+                declined.append((stage, c.pr))
     # `roadmap` authors a PR that does not exist yet, so it can never be one of the PRs `--pr` named.
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
@@ -499,6 +519,29 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             f"round ({scope}) — see the per-PR reasons above; no unrelated work was done"
         )
     raise NoProgress(f"no eligible work this round under {scope}")
+
+
+# The stages that write to a PR's branch, which the target-list pass of the cascade covers.
+BRANCH_STAGES = {"rebase", "bump", "fix-ci", "fix"}
+
+
+def target_list_prs(sv) -> set[int]:
+    """The open PRs that serve the operator's target list: a PR whose target marker names an item of
+    the list (the authors record `{"focus": <area>, "id": <slug>}`), or one the list itself marks in
+    flight (`in flight: #N`). Empty without a list, or when it cannot be read: the ordering is a
+    preference, and a fixer round must not fail over it."""
+    path = roadmap_targets()
+    if path is None:
+        return set()
+    try:
+        targets = load_targets(path)
+    except Exception as e:  # noqa: BLE001 - Die on a malformed list, OSError on a missing one
+        log(f"  target list unreadable for fix ordering ({e}); ordinary order")
+        return set()
+    items = {(area, it.slug) for area, its in targets.areas.items() for it in its}
+    prs = {pr for _area, _it, pr in inflight_prs(targets)}
+    prs |= {p.number for p in sv.open_prs if any(key in items for key in p.target_ids)}
+    return prs
 
 
 # Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a

@@ -32,6 +32,7 @@ RUN_STDLIB=(
   curate_sync.py
   curate_round.py
   targets_shared.py
+  fix_target_priority.py
   declined_targets.py
   decide_round.py
   safe_push_resync.py
