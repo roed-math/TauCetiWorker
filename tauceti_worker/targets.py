@@ -19,6 +19,9 @@ The format (`parse_targets` is lenient about whitespace, strict about nothing el
     - [x] `slug` — text (serves: B1; done: #5513)
     > note lines, and anything else, are ignored
 
+A `partial: #N, #M` clause names merged PRs that carried the item's marker without completing it;
+they never count as its landing.
+
 `[ ]` is open, `[~]` in flight, `[x]` done. The slug is the first backtick token on the line; the
 text is what follows the first ` — ` up to the trailing parenthesised metadata; `needs:` (optional)
 is a comma list of backtick slugs or `none`. A `## Gaps…` section is skipped, and a `- [` line that
@@ -281,6 +284,49 @@ def inflight_prs(targets: Targets) -> list[tuple[str, TargetItem, int]]:
     return out
 
 
+def partial_prs(it: TargetItem) -> set[int]:
+    """The merged PRs the item's `partial:` clause names: each carried its marker and did not complete it."""
+    prs: set[int] = set()
+    for clause in it.meta:
+        key, _, value = clause.partition(":")
+        if key.strip().lower() == "partial":
+            prs.update(int(n) for n in re.findall(r"#(\d+)", value))
+    return prs
+
+
+def _with_partial(line: str, pr: int) -> str | None:
+    """`line` (an item line, no newline) with #pr added to its `partial:` clause, its `in flight: #pr`
+    clause dropped, and `[~]` reopened to `[ ]` if that was the PR in flight. None when #pr is already
+    listed."""
+    meta_m = _META_RE.search(line)
+    if meta_m and re.search(rf"(?:^|;)\s*partial:[^;]*#{pr}\b", meta_m.group(1)):
+        return None
+    if re.search(rf"in flight: #{pr}\b", line):
+        line = re.sub(r"^(\s*-\s*)\[~\]", r"\1[ ]", re.sub(rf";?\s*in flight: #{pr}\b", "", line), count=1)
+        line = line.replace("(; ", "(")
+    meta_m = _META_RE.search(line)
+    if meta_m and (pm := re.search(r"((?:^|;)\s*partial:[^;]*)", meta_m.group(1))):
+        at = meta_m.start(1) + pm.end(1)
+        return line[:at] + f", #{pr}" + line[at:]
+    if meta_m:
+        return line[: meta_m.end(1)] + f"; partial: #{pr}" + line[meta_m.end(1) :]
+    return line + f" (partial: #{pr})"
+
+
+def mark_partial(text: str, slug: str, pr: int) -> tuple[str, bool]:
+    """Record that MERGED #pr carried an open or in-flight item's marker without completing it (see
+    `_with_partial`). The item stays open. Pure; False when #pr was already recorded."""
+    out, changed = [], False
+    for line in text.splitlines(keepends=True):
+        if not changed and re.match(r"- \[[ ~]\] `" + re.escape(slug) + r"`", line):
+            new = _with_partial(line.rstrip("\n"), pr)
+            if new is None:
+                return text, False
+            line, changed = new + "\n", True
+        out.append(line)
+    return "".join(out), changed
+
+
 def item_identifiers(it: TargetItem) -> list[str]:
     """The Lean-looking identifiers the item's text names in backticks; see `lean_identifiers`."""
     return lean_identifiers(it.text)
@@ -303,11 +349,15 @@ def lean_identifiers(text: str) -> list[str]:
     return seen
 
 
-def sync_inflight(text: str, states: dict[int, str], verdicts: dict[int, dict]) -> tuple[str, list[str]]:
-    """Rewrite the `[~]` lines whose PR has finished: MERGED becomes `[x]` (`landed: #N`); CLOSED with
+def sync_inflight(
+    text: str, states: dict[int, str], verdicts: dict[int, dict], partial: dict[int, str] | None = None
+) -> tuple[str, list[str]]:
+    """Rewrite the `[~]` lines whose PR has finished: MERGED becomes `[x]` (`landed: #N`), unless
+    `partial` gives a reason it did not complete the item (then `[ ]` with `partial: #N`); CLOSED with
     a recorded verdict that main subsumed the PR becomes `[x]` naming the upstream PRs (`subsumed
     by: #M; closed: #N`); CLOSED without such a verdict is left for the operator and reported; OPEN
     and unknown are left alone. Returns (new text, one line per change or open question). Pure."""
+    partial = partial or {}
     changes: list[str] = []
     out = []
     for line in text.splitlines(keepends=True):
@@ -321,7 +371,10 @@ def sync_inflight(text: str, states: dict[int, str], verdicts: dict[int, dict]) 
         by = list(v.get("subsumed_by") or []) or list(v.get("mentions") or [])
         words = " ".join(str(v.get("summary") or "").split()).lower()
         subsumed = bool(v) and ("subsum" in words or bool(v.get("subsumed_by")))
-        if state == "MERGED":
+        if state == "MERGED" and pr in partial:
+            line = (_with_partial(line.rstrip("\n"), pr) or line.rstrip("\n")) + "\n"
+            changes.append(f"`{slug}`: #{pr} merged without completing it ({partial[pr]}) — reopened")
+        elif state == "MERGED":
             line = line.replace("- [~]", "- [x]", 1).replace(f"in flight: #{pr}", f"landed: #{pr}")
             changes.append(f"`{slug}`: done — #{pr} merged")
         elif state == "CLOSED" and subsumed:

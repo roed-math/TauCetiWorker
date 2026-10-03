@@ -85,7 +85,11 @@ to the first `## ` heading is shown to the agent verbatim.
   `<!--tauceti-target:v1 {"focus":"<Area>","id":"<slug>"}-->` for a listed item
   puts it in flight; a merged PR carrying the marker marks it done (one
   `gh pr list --state merged` per round; if that call fails, the file's marks
-  stand). An item is *eligible* when it is open under this view and every
+  stand), unless the marker adds `"partial":true` or the item's `partial: #N`
+  clause names the PR. The curator writes merges into the file the same way, and
+  also records a merge as partial when an identifier the item names is missing
+  on main: a plain name must be declared under `TauCeti/`, a dotted or
+  capitalised one need only occur there. An item is *eligible* when it is open under this view and every
   `needs` slug is done under it (a slug the file never defines counts as done,
   with a warning, so a typo cannot stall a fleet).
 - Selection: with no `--roadmap-only` (auto or all areas) the areas with an

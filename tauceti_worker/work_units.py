@@ -100,6 +100,7 @@ from .survey import (
     prioritize_review_candidates,
     progress_argv,
     spread_candidates,
+    partial_marker_ids,
     survey,
     target_marker_ids,
 )
@@ -113,6 +114,7 @@ from .targets import (
     open_items,
     overlay_live,
     parse_targets,
+    partial_prs,
     render_area_block,
 )
 
@@ -1409,7 +1411,8 @@ def _declined_by_named_prs(w, rec: dict, area: str, slug: str, leads: list[int] 
     for n in list(dict.fromkeys(named))[:5]:
         d = w.gh.pr_view(n, ["state", "body"]) or {}
         state = str(d.get("state") or "")
-        if state == "MERGED" and (area, slug) in set(target_marker_ids(d.get("body") or "")):
+        body = d.get("body") or ""
+        if state == "MERGED" and (area, slug) in set(target_marker_ids(body)) and (area, slug) not in partial_marker_ids(body):
             return "merged", n
         if state == "MERGED" and leads is not None:
             leads.append(n)
@@ -1453,22 +1456,66 @@ def _pr_added_declarations(w, pr: int, limit: int = 40) -> list[str]:
     return names[:limit]
 
 
-def _mark_merged_markers(text: str, merged: list[dict]) -> tuple[str, list[str]]:
-    """Mark done every listed item that is not yet done and whose marker a merged PR carries. Pure
-    apart from parsing: `merged` is `[{number, body}]`."""
-    from .targets import mark_merged
+def _mark_merged_markers(text: str, merged: list[dict], missing=None) -> tuple[str, list[str]]:
+    """Mark done every listed item that is not yet done and whose marker a merged PR carries, unless
+    the PR did not complete it: its marker says `"partial": true`, the item already lists it under
+    `partial:`, or `missing(item)` names identifiers main lacks. Those PRs go into the item's
+    `partial:` clause and the item stays open. `missing` returning None defers the PR to a later run.
+    Pure apart from parsing and `missing`: `merged` is `[{number, body}]`.
+
+    Authors put the claimed item's marker on every PR, prerequisites included, and until 2026-10-03
+    each merge marked its item done: about half of 92 such items were not, and in ClassFieldTheory
+    authors were then sent to items whose suppliers did not exist."""
+    from .targets import mark_merged, mark_partial
 
     listed = parse_targets(text)
-    status = {(area, it.slug): it.status for area, items in listed.areas.items() for it in items}
+    items = {(area, it.slug): it for area, its in listed.areas.items() for it in its}
+    status = {key: it.status for key, it in items.items()}
+    recorded = {key: partial_prs(it) for key, it in items.items()}
     changes = []
     for d in sorted(merged, key=lambda d: int(d.get("number") or 0)):
-        for key in target_marker_ids(d.get("body") or ""):
-            if status.get(key) in ("open", "inflight"):
-                text, ok = mark_merged(text, key[1], int(d["number"]))
+        pr, body = int(d["number"]), d.get("body") or ""
+        flagged = partial_marker_ids(body)
+        for key in target_marker_ids(body):
+            if status.get(key) not in ("open", "inflight") or pr in recorded[key]:
+                continue
+            if key in flagged:
+                why = "its marker says partial"
+            else:
+                lacking = missing(items[key]) if missing is not None else []
+                if lacking is None:
+                    continue
+                why = "main lacks " + ", ".join(f"`{i}`" for i in lacking[:4]) if lacking else ""
+            if why:
+                text, ok = mark_partial(text, key[1], pr)
                 if ok:
-                    status[key] = "done"
-                    changes.append(f"`{key[1]}`: done — landed: #{d['number']} (merged with its marker)")
+                    recorded[key].add(pr)
+                    changes.append(f"`{key[1]}`: still open — #{pr} carried its marker but did not complete it ({why}); partial: #{pr}")
+                continue
+            text, ok = mark_merged(text, key[1], pr)
+            if ok:
+                status[key] = "done"
+                changes.append(f"`{key[1]}`: done — landed: #{pr} (merged with its marker)")
     return text, changes
+
+
+def _missing_on_main(clone: Path, it: TargetItem) -> list[str]:
+    """The identifiers an item names that main does not provide. A plain name must be declared under
+    `TauCeti/`; a dotted or capitalised one (usually a Mathlib type or namespace the item consumes)
+    need only occur there. Name-only, so a same-named declaration elsewhere still counts as present."""
+    from .targets import item_identifiers
+
+    lacking = []
+    for ident in item_identifiers(it):
+        if _grep_declarations(clone, ident):
+            continue
+        if "." in ident or ident[:1].isupper():
+            p = subprocess.run(["git", "-C", str(clone), "grep", "-qwF", ident, "--", "TauCeti/"],
+                               capture_output=True, timeout=120)
+            if p.returncode == 0:
+                continue
+        lacking.append(ident)
+    return lacking
 
 
 def _grep_declarations(clone: Path, ident: str, subdir: str = "TauCeti/", *, ignore_case: bool = False) -> list[str]:
@@ -1548,6 +1595,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         lean_identifiers,
         mark_landed_elsewhere,
         mark_merged,
+        mark_partial,
         sync_inflight,
     )
 
@@ -1560,13 +1608,36 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             _sync_targets(path)
     text = path.read_text()
     targets = parse_targets(text)
+    clone_box: list[Path | None] = []
+
+    def main_clone() -> Path | None:
+        if not clone_box:
+            clone_box.append(_curate_main_checkout(w))
+        return clone_box[0]
+
+    def missing(it: TargetItem) -> list[str] | None:
+        clone = main_clone()
+        return None if clone is None else _missing_on_main(clone, it)
+
     # ---- tier A: the PRs the file names
     states: dict[int, str] = {}
-    for _area, _it, pr in inflight_prs(targets):
-        d = w.gh.pr_view(pr, ["state"])
-        if d and d.get("state"):
-            states[pr] = str(d["state"])
-    new_text, changes = sync_inflight(text, states, verdicts_by_pr())
+    partial: dict[int, str] = {}
+    for area, it, pr in inflight_prs(targets):
+        d = w.gh.pr_view(pr, ["state", "body"])
+        if not (d and d.get("state")):
+            continue
+        state = str(d["state"])
+        if state == "MERGED":
+            if (area, it.slug) in partial_marker_ids(d.get("body") or ""):
+                partial[pr] = "its marker says partial"
+            else:
+                lacking = missing(it)
+                if lacking is None:
+                    continue  # no checkout of main to verify against: decide next run
+                if lacking:
+                    partial[pr] = "main lacks " + ", ".join(f"`{i}`" for i in lacking[:4])
+        states[pr] = state
+    new_text, changes = sync_inflight(text, states, verdicts_by_pr(), partial)
     # ---- tier A': merged PRs carrying a listed item's marker, whoever opened them. The live view sees
     # these only while they are recent; writing them into the file keeps them.
     try:
@@ -1575,7 +1646,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     except (GitHubError, TypeError) as e:
         merged = []
         log(f"curate: could not list merged PRs with target markers ({e})")
-    new_text, more = _mark_merged_markers(new_text, merged)
+    new_text, more = _mark_merged_markers(new_text, merged, missing)
     changes += more
     undecided = [ln for ln in changes if "owner decides" in ln]
     for ln in changes:
@@ -1594,7 +1665,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     declined_cands = [(area, it) for area, items in live.areas.items() for it in items
                       if it.status == "open" and it.slug in declined][:CURATE_MAX_CANDIDATES]
     candidates = [(a, it) for a, it in candidates if it.slug not in declined][:CURATE_MAX_CANDIDATES]
-    clone = _curate_main_checkout(w) if (candidates or declined_cands) else None
+    clone = main_clone() if (candidates or declined_cands) else None
     with_evidence = []
     main_sha = ""
     memo_path = w.cfg.state / "curate" / "verdicts-memo.json"
@@ -1629,12 +1700,19 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             leads: list[int] = []
             verdict, pr_no = _declined_by_named_prs(w, rec, area, it.slug, leads)
             if verdict == "merged":
-                new_text, ok = mark_merged(new_text, it.slug, pr_no)
+                lacking = ["(listed as partial)"] if pr_no in partial_prs(it) else _missing_on_main(clone, it)
+                if not lacking:
+                    new_text, ok = mark_merged(new_text, it.slug, pr_no)
+                    if ok:
+                        changes.append(f"`{it.slug}`: done — landed: #{pr_no} (merged with its marker, named by the declining author)")
+                        log(f"curate: `{it.slug}` marked done — #{pr_no} merged with its marker")
+                    mark_declined_target(rec.get("path", ""), curator="landed", curator_evidence=f"#{pr_no} merged with its marker")
+                    continue
+                new_text, ok = mark_partial(new_text, it.slug, pr_no)
                 if ok:
-                    changes.append(f"`{it.slug}`: done — landed: #{pr_no} (merged with its marker, named by the declining author)")
-                    log(f"curate: `{it.slug}` marked done — #{pr_no} merged with its marker")
-                mark_declined_target(rec.get("path", ""), curator="landed", curator_evidence=f"#{pr_no} merged with its marker")
-                continue
+                    changes.append(f"`{it.slug}`: still open — #{pr_no}, named by the declining author, carried its marker "
+                                   f"but main lacks {', '.join(lacking[:4])}; partial: #{pr_no}")
+                leads.append(pr_no)  # its declarations are still evidence for the pass below
             if verdict == "blocked":
                 log(f"curate: `{it.slug}` is blocked on open #{pr_no}, not done — skipped until that PR closes")
                 mark_declined_target(rec.get("path", ""), blocked_on=pr_no)
@@ -2467,8 +2545,8 @@ CURATE_MERGED_LIMIT = 1000  # the curator's look-back: several days of marker-be
 
 def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, int, int]:
     """The operator's list under the live PR overlay (see targets.overlay_live): an open PR whose
-    target marker names a listed (area, slug) puts that item in flight; a merged one marks it done.
-    The open side is the survey the round already ran; the merged side is one `gh pr list` per round,
+    target marker names a listed (area, slug) puts that item in flight; a merged one marks it done,
+    unless the marker says `"partial": true` or the item's `partial:` clause names the PR. The open side is the survey the round already ran; the merged side is one `gh pr list` per round,
     and if that call fails the file's marks stand — cooperative, fail-open, like every claim. Returns
     the overlaid list and how many listed items the two live sources touched."""
     listed = {(area, it.slug) for area, items in targets.areas.items() for it in items}
@@ -2476,10 +2554,14 @@ def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, in
     for p in sv.open_prs if sv is not None else []:
         inflight.update(p.target_ids)
     done: set[tuple[str, str]] = set()
+    recorded = {(area, it.slug): partial_prs(it) for area, items in targets.areas.items() for it in items}
     if gh is not None:
         try:
             for d in gh.pr_list(["number", "body"], state="merged", search=MERGED_MARKER_SEARCH):
-                done.update(target_marker_ids(d.get("body") or ""))
+                body = d.get("body") or ""
+                flagged = partial_marker_ids(body)
+                done.update(key for key in target_marker_ids(body)
+                            if key not in flagged and int(d.get("number") or 0) not in recorded.get(key, ()))
         except GitHubError as e:
             log(f"roadmap: could not list merged PRs for the live target view ({e}) — using the marks in {path}")
     inflight &= listed

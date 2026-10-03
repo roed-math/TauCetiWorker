@@ -121,6 +121,22 @@ def target_marker_ids(body: str) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(ids))
 
 
+def partial_marker_ids(body: str) -> frozenset[tuple[str, str]]:
+    """The (focus, id) pairs whose marker carries `"partial": true`: the PR lands a part or a
+    prerequisite of that item, so merging it does not complete the item."""
+    ids: set[tuple[str, str]] = set()
+    for match in TARGET_MARKER_RE.finditer(body):
+        try:
+            data = json.loads(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("partial") is True:
+            focus, ident = data.get("focus"), data.get("id")
+            if isinstance(focus, str) and focus and isinstance(ident, str) and ident:
+                ids.add((focus, ident))
+    return frozenset(ids)
+
+
 @dataclass(frozen=True)
 class PRInfo:
     number: int

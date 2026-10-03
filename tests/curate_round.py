@@ -53,6 +53,7 @@ clone = TMP / "state" / "curate" / "TauCeti"
 (clone / "TauCeti" / "Teich.lean").write_text("theorem Teich.omega : True := trivial\n\ndef residueMap : Nat := 0\n")
 (clone / "TauCeti" / "Frob.lean").write_text("def frobeniusAlgEquiv : Nat := 0\n")
 (clone / "TauCeti" / "Half.lean").write_text("def alsoGone : Nat := 0\n")  # `Gone.thing` is missing: not fully evidenced
+(clone / "TauCeti" / "Foo.lean").write_text("class IsFoo (K : Type) : Prop\n")  # what merged #101 provides
 subprocess.run(["git", "-C", str(clone), "init", "-q"], check=True)
 subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
 subprocess.run(["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main"], check=True)
