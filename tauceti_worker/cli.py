@@ -132,6 +132,8 @@ environment (flags win; full reference linked below):
   TAUCETI_ROADMAP_TARGETS  markdown target list restricting authoring to listed milestones
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
+  TAUCETI_PACE_CLAUDE    pacing curve for Claude's windows only (else TAUCETI_PACE)
+  TAUCETI_PACE_CODEX     pacing curve for Codex's windows only (else TAUCETI_PACE)
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
@@ -651,6 +653,13 @@ def resolve_pace(cmd: str | None, args) -> None:
             parse_pace_curve(spec)
         except ValueError as e:
             raise Die(f"{source}: {e}") from None
+    for provider in ("CLAUDE", "CODEX"):
+        var = f"TAUCETI_PACE_{provider}"
+        if os.environ.get(var):
+            try:
+                parse_pace_curve(os.environ[var])
+            except ValueError as e:
+                raise Die(f"${var}: {e}") from None
     if override is not None:
         os.environ["TAUCETI_PACE"] = override
 

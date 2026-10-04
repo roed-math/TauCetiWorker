@@ -333,6 +333,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_CODEX_REFRESH_SKEW` | `172800` | Seconds before its expiry at which `--auto-refresh` rotates the operator's Codex access token (a ~10-day JWT). |
 | `TAUCETI_CLAUDE_WARM` | _(unset)_ | macOS only. `1` lets the worker renew an expired Claude Keychain token by running one `claude -p` Haiku turn against the operator's config dir (Claude Code stays the only Keychain writer; host-wide lock; at most one attempt per ten minutes). See [quota and pacing](quota.md#macos-and-the-login-keychain). |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
+| `TAUCETI_PACE_CLAUDE` / `TAUCETI_PACE_CODEX` | _(unset)_ | Pacing curve for that provider's windows only; unset = `TAUCETI_PACE`. An `auto` worker paces each provider on its own curve. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, shared by every worker: an install takes a lock and lands by rename. |

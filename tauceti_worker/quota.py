@@ -171,9 +171,13 @@ def parse_pace_curve(spec: str | None) -> list[tuple[float, float]]:
     return sorted(pts.items())
 
 
-def pace_curve() -> list[tuple[float, float]]:
-    """The active pacing curve from $TAUCETI_PACE (read live so --pace / the TUI and loop children all
-    see it; parse cached per raw spec).
+PACE_PROVIDERS = ("claude", "codex")
+
+
+def pace_curve(provider: str | None = None) -> list[tuple[float, float]]:
+    """The active pacing curve: $TAUCETI_PACE_CLAUDE / $TAUCETI_PACE_CODEX for that provider's windows
+    when set, else $TAUCETI_PACE (read live so --pace / the TUI and loop children all see it; parse
+    cached per raw spec).
 
     A malformed spec cannot reach here through a sanctioned path: the CLI rejects $TAUCETI_PACE for every
     subcommand and --pace in cmd_work, and a worker's `pace` from workers.toml arrives as --pace. This
@@ -181,7 +185,8 @@ def pace_curve() -> list[tuple[float, float]]:
     substitutes the DEFAULT curve — stricter than the identity line the pacer used to fall back on, but
     not provably stricter than whatever the operator was reaching for. That is the trade: pace on a known
     curve rather than crash the pacer, and let validation stay the thing that catches typos."""
-    raw = os.environ.get("TAUCETI_PACE", "") or ""
+    raw = (os.environ.get(f"TAUCETI_PACE_{provider.upper()}", "") if provider in PACE_PROVIDERS else "") \
+        or os.environ.get("TAUCETI_PACE", "") or ""
     if raw not in _PACE_CACHE:
         try:
             _PACE_CACHE[raw] = parse_pace_curve(raw)
@@ -287,7 +292,7 @@ def _idle_init_block(curve: list[tuple[float, float]] | None = None) -> str | No
     not opened, so there is no clock saying when τ₀% of it will have elapsed. It stays blocked until
     something else initializes the window, the operator changes the curve, or real telemetry appears.
     We do NOT quietly initialize the window to manufacture a clock."""
-    tau0 = pace_zero_plateau(pace_curve() if curve is None else curve)
+    tau0 = pace_zero_plateau(pace_curve("claude") if curve is None else curve)
     if tau0 <= 0:
         return None
     return f"pace budget stays 0% through {tau0:g}% of the window"
@@ -370,6 +375,7 @@ class Window:
     status: str  # under-pace | over-pace | exhausted | idle | absent | malformed | unknown
     budget: float | None = None  # pace budget (max allowed used%) at this window's elapsed%, if computed
     detail: str | None = None  # why a non-pacing status happened, phrased to follow the window name
+    provider: str | None = None  # whose pace curve applies (claude | codex)
 
 
 @dataclass
@@ -399,7 +405,8 @@ def _finite_num(x: object) -> bool:
 
 
 def _classify_window(
-    name: str, used: float | None, elapsed: float | None, resets_at: float | None, limit_reached: bool
+    name: str, used: float | None, elapsed: float | None, resets_at: float | None, limit_reached: bool,
+    provider: str | None = None,
 ) -> Window:
     # Fail CLOSED on missing OR garbage data. These endpoints are reverse-engineered: a schema drift that
     # drops `used`/the reset clock, or hands us a non-number / NaN / inf, must read as 'unknown' (⇒
@@ -407,11 +414,11 @@ def _classify_window(
     # limit_reached still exhausts regardless of the elapsed value. Clamp valid percentages to [0,100].
     e = max(0.0, min(100.0, elapsed)) if _finite_num(elapsed) else None
     if limit_reached:
-        return Window(name, used, e, resets_at, STATUS_EXHAUSTED)
+        return Window(name, used, e, resets_at, STATUS_EXHAUSTED, provider=provider)
     if not _finite_num(used) or e is None:
-        return Window(name, used, e, resets_at, "unknown")
+        return Window(name, used, e, resets_at, "unknown", provider=provider)
     u = max(0.0, min(100.0, used))
-    thr = pace_budget(pace_curve(), e)  # max allowed used% at this elapsed%, per the operator's curve
+    thr = pace_budget(pace_curve(provider), e)  # max allowed used% at this elapsed%, per the operator's curve
     # Strictly under the budget = headroom for another request. Exactly AT it is not: the next request
     # costs something, so starting one would put us over. (Equality is not an edge case — the default
     # curve's budget is 0 at elapsed 0, so a fresh window sits exactly on its budget.)
@@ -423,7 +430,7 @@ def _classify_window(
         st = STATUS_AT_BUDGET
     else:
         st = STATUS_OVER_PACE
-    return Window(name, used, e, resets_at, st, thr)
+    return Window(name, used, e, resets_at, st, thr, provider=provider)
 
 
 def _pace_free_at(window: Window, now: float) -> float | None:
@@ -437,7 +444,7 @@ def _pace_free_at(window: Window, now: float) -> float | None:
     left, remaining = window.resets_at - now, 100.0 - window.elapsed
     if left <= 0 or remaining <= 0:  # rolling over right now; the reset is the answer
         return None
-    free = pace_recovery(pace_curve(), window.used, window.elapsed)
+    free = pace_recovery(pace_curve(window.provider), window.used, window.elapsed)
     if free is None:
         return None
     start, end = free
@@ -716,13 +723,13 @@ def _window_from_reading(r: Reading, note: str | None = None, now: float | None 
     if r.state == STATE_ACTIVE:
         window_s = _WINDOW_S[r.window]
         elapsed = (window_s - (r.resets_at - (time.time() if now is None else now))) / window_s * 100
-        return _classify_window(r.window, r.used, elapsed, r.resets_at, False)
+        return _classify_window(r.window, r.used, elapsed, r.resets_at, False, "claude")
     detail = note or (_idle_phrase(r) if r.state == STATE_IDLE else r.detail)
     # An idle window is interpreted for PACING as the synthetic reading used=0 at elapsed=0 — recorded
     # on the Window so the status output and the bootstrap policy agree about what budget applies. The
     # STATE stays `idle`: this is a policy interpretation, not telemetry we were given.
-    budget = pace_budget(pace_curve(), 0.0) if r.state == STATE_IDLE else None
-    return Window(r.window, r.used, 0.0 if r.state == STATE_IDLE else None, r.resets_at, r.state, budget, detail)
+    budget = pace_budget(pace_curve("claude"), 0.0) if r.state == STATE_IDLE else None
+    return Window(r.window, r.used, 0.0 if r.state == STATE_IDLE else None, r.resets_at, r.state, budget, detail, "claude")
 
 
 def _tail_detail(out: str | None, limit: int = 120) -> str:
@@ -1734,7 +1741,7 @@ class Quota:
             # carries the ~5h vs the ~7d window, and a positional label would call a weekly window 'session'.
             raw_lim = w.get("limit_window_seconds")
             name = "session" if _finite_num(raw_lim) and raw_lim <= 24 * 3600 else "weekly"
-            wins.append(_classify_window(name, w.get("used_percent"), elapsed, resets, limit_reached))
+            wins.append(_classify_window(name, w.get("used_percent"), elapsed, resets, limit_reached, "codex"))
         # No usable window at all ⇒ fail-closed (unavailable), never fail-OPEN on an empty all(...) that
         # is vacuously True.
         avail = bool(wins) and all(x.status == "under-pace" for x in wins) and not limit_reached
