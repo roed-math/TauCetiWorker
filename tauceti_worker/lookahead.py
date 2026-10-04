@@ -34,6 +34,9 @@ HOLD_HOURS_ENV = "TAUCETI_LOOKAHEAD_HOLD_HOURS"
 # Exported for a lookahead session only: git-safe-push then pushes nothing but this branch, and
 # gh-safe-pr-create refuses outright.
 BRANCH_ENV = "TAUCETI_LOOKAHEAD_BRANCH"
+# An operator's one-off round (`tauceti-fleet lookahead SLUG`): only this list item, as a session
+# while it is blocked or as a port once it is eligible, and never anything else instead.
+TARGET_ONLY_ENV = "TAUCETI_TARGET_ONLY"
 PREFIX = "lookahead/"
 DEFAULT_MAX_BRANCHES = 4
 STALE_DAYS = 7
@@ -58,6 +61,10 @@ def _env_number(name: str, default: float) -> float:
     except ValueError:
         log(f"{name}={raw!r} is not a number; using {default:g}")
         return default
+
+
+def target_only() -> str:
+    return os.environ.get(TARGET_ONLY_ENV, "").strip()
 
 
 def max_branches() -> int:

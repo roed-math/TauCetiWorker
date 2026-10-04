@@ -2828,6 +2828,8 @@ def _claim_lookahead(w, live: Targets, view: _LookaheadView, only: str, skip: li
               if it.status == "open" and lookahead.failed_recently(area, it.slug)}
     cands = lookahead.candidates(live, only=only, skip=skip, declined=set(declined_targets()), branches=view.branches,
                                  headers=view.headers, failed=failed)
+    if lookahead.target_only():
+        cands = [c for c in cands if c.item.slug == lookahead.target_only()]
     building = len(view.branches) + _live_slots(w, LOOKAHEAD_SLOTS)
     cap = lookahead.max_branches()
     if building >= cap and any(not c.resume for c in cands):
@@ -2864,6 +2866,7 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
     live, n_inflight, n_merged = _live_target_view(targets, path, sv, w.gh)
     view = _lookahead_view(w, sv, live)
     on = view is not None and lookahead.enabled()
+    one = lookahead.target_only()
     try:
         try:
             candidates = _target_candidates(live, path, only, skip)
@@ -2874,6 +2877,10 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
         if on:
             ports = [(a, it) for a, it in view.ready if _area_ok(a, only, skip)]
             candidates = ports + [c for c in candidates if c not in ports]
+        if one:
+            candidates = [(a, it) for a, it in candidates if it.slug == one]
+            if not candidates:
+                raise NoProgress("roadmap: it cannot be authored or ported now")
         # A target an author already declined (the agent found it on main, most often) is not offered
         # again: every author would spend a round to reach the same answer. The curator weighs the
         # agent's account against main and marks it done, or hands it back.
@@ -2887,6 +2894,9 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
                 log(f"roadmap: {e} — proving `{session.item.slug}` ahead of its supplier(s) instead")
                 w.lookahead_session = (session, view)
                 return live, session.area, session.item, True, [], n_inflight, n_merged
+        if one:
+            raise NoProgress(f"`{one}` only ({lookahead.TARGET_ONLY_ENV}): {e}"
+                             + ("; no lookahead session for it either" if on else "")) from None
         # An idle author is waste: while there is room under the project's cap, it authors outside the
         # list instead (owner's ruling, 2026-09-27); the list itself is untouched.
         mine = getattr(sv, "_mine_open_prs", None)

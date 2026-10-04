@@ -33,7 +33,7 @@ from harness import gate_env, scrub_env  # noqa: E402
 
 scrub_env()
 for var in ("TAUCETI_LOOKAHEAD", "TAUCETI_LOOKAHEAD_MAX_BRANCHES", "TAUCETI_LOOKAHEAD_HOLD_HOURS",
-            "TAUCETI_LOOKAHEAD_BRANCH", "TAUCETI_ROADMAP_TARGETS"):
+            "TAUCETI_LOOKAHEAD_BRANCH", "TAUCETI_TARGET_ONLY", "TAUCETI_ROADMAP_TARGETS"):
     os.environ.pop(var, None)
 TMP = Path(tempfile.mkdtemp(prefix="lookahead-"))
 gate_env(TMP)
@@ -222,6 +222,27 @@ w = worker()
 got = W._pick_target(w, sv, FLYING_DONE, Path("t.md"), "auto", [])
 check("an in-flight item with a ready split comes first, with its plan",
       got is not None and got[2].slug == "on-flying" and w.lookahead_port[0].next.n == 2, str(got and got[2].slug))
+
+# an operator's one-off round names its item, and gets nothing else
+W._lookahead_view = lambda w, sv, live: view_for(live)
+os.environ["TAUCETI_TARGET_ONLY"] = "on-flying"
+w = worker()
+W._pick_target(w, sv, BLOCKED, Path("t.md"), "auto", [])
+check("TAUCETI_TARGET_ONLY: a session on exactly that item", w.lookahead_session is not None
+      and w.lookahead_session[0].item.slug == "on-flying", str(w.lookahead_session))
+os.environ["TAUCETI_TARGET_ONLY"] = "top2"
+try:
+    W._pick_target(worker(), sv, BLOCKED, Path("t.md"), "auto", [])
+    check("TAUCETI_TARGET_ONLY: an item with nothing to do is no progress, not other work", False)
+except NoProgress as e:
+    check("TAUCETI_TARGET_ONLY: an item with nothing to do is no progress, not other work", "top2" in str(e), str(e))
+os.environ["TAUCETI_TARGET_ONLY"] = "eligible"
+W._lookahead_view = lambda w, sv, live: view_for(live, {("Item", "eligible"): "e1"}, {"e1": fresh})
+w = worker()
+got = W._pick_target(w, sv, ELIG, Path("t.md"), "auto", [])
+check("TAUCETI_TARGET_ONLY: an eligible item with a branch is ported", got is not None and got[2].slug == "eligible"
+      and w.lookahead_port is not None)
+os.environ.pop("TAUCETI_TARGET_ONLY")
 
 os.environ.pop("TAUCETI_LOOKAHEAD")
 W._lookahead_view = lambda w, sv, live: view_for(live, {("Item", "eligible"): "e1"}, {"e1": fresh})
