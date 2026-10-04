@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import gate as gate_mod
+from . import lookahead
 from . import publications as pub_mod
 from .agents import (
     AuthoringProfile,
@@ -107,6 +108,7 @@ from .survey import (
 from .targets import (
     TargetItem,
     Targets,
+    agent_clauses,
     eligible_areas,
     eligible_items,
     inflight_prs,
@@ -173,6 +175,8 @@ class Worker:
     rc: RoundContext
     claims: Claims
     current_target: str = ""  # `Area/slug` of the target this round's authoring works on, if any
+    lookahead_port: tuple | None = None  # (PortPlan, view) when the picked target has a branch to port
+    lookahead_session: tuple | None = None  # (lookahead.Candidate, view) when this round proves one ahead
 
 
 def _bubble(stage: str, opts: RoundOpts) -> bool:
@@ -933,6 +937,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     rc = fn(w, sv, c, opts, bubble)
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
+    if stage == "roadmap" and getattr(w, "lookahead_session", None) is not None:
+        return _lookahead_outcome(w, rc)  # a session's mark on GitHub is its branch, not a PR
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
     # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
@@ -1358,7 +1364,10 @@ def do_curate(w, sv, c, opts, bubble) -> int | None:
         log("curate: another worker holds the curate claim — skipping (COOP dedup)")
         return None
     try:
-        return _do_curate_inner(w, sv, opts)
+        try:
+            return _do_curate_inner(w, sv, opts)
+        finally:
+            _lookahead_sweep(w, sv)
     finally:
         w.claims.release()
 
@@ -2543,6 +2552,11 @@ MERGED_MARKER_SEARCH = '"tauceti-target:v1" in:body sort:updated-desc'
 CURATE_MERGED_LIMIT = 1000  # the curator's look-back: several days of marker-bearing merges
 
 
+# The merged marker-bearing PRs the last live view read, kept for the lookahead port plans (their port
+# markers say which splits have merged) so the round does not list them twice.
+_merged_marker_prs: list[dict] = []
+
+
 def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, int, int]:
     """The operator's list under the live PR overlay (see targets.overlay_live): an open PR whose
     target marker names a listed (area, slug) puts that item in flight; a merged one marks it done,
@@ -2555,9 +2569,11 @@ def _live_target_view(targets: Targets, path: Path, sv, gh) -> tuple[Targets, in
         inflight.update(p.target_ids)
     done: set[tuple[str, str]] = set()
     recorded = {(area, it.slug): partial_prs(it) for area, items in targets.areas.items() for it in items}
+    _merged_marker_prs.clear()
     if gh is not None:
         try:
             for d in gh.pr_list(["number", "body"], state="merged", search=MERGED_MARKER_SEARCH):
+                _merged_marker_prs.append(d)
                 body = d.get("body") or ""
                 flagged = partial_marker_ids(body)
                 done.update(key for key in target_marker_ids(body)
@@ -2639,7 +2655,7 @@ def _render_assigned(live: Targets, it: TargetItem) -> str:
         parts.append(", ".join(f"`{s}`" for s in known) + " — all landed")
     if unknown:
         parts.append(", ".join(f"`{s}`" for s in unknown) + " — not in the list, assumed landed")
-    clauses = [*it.meta, "needs: " + ("; ".join(parts) if parts else "none")]
+    clauses = [*agent_clauses(it), "needs: " + ("; ".join(parts) if parts else "none")]
     return f"Assigned target: `{it.slug}` — {it.text} ({'; '.join(clauses)})\n  Context — the rest of this area's list:"
 
 
@@ -2667,17 +2683,22 @@ def _author_only(opts) -> bool:
 from . import constants as _constants  # noqa: E402 - ROUND_TIMEOUT for the fallback slots' expiry
 
 
-def _fallback_dir() -> Path | None:
-    """Where fleet workers record that they are authoring outside the target list: beside the shared
-    gate store, so every worker of one fleet sees every other. None outside a fleet (no gate)."""
+FALLBACK_SLOTS = "fallback-authoring"
+LOOKAHEAD_SLOTS = "lookahead-sessions"
+
+
+def _slot_dir(name: str) -> Path | None:
+    """Where fleet workers record a round in progress of one kind (authoring outside the target list,
+    a lookahead session): beside the shared gate store, so every worker of one fleet sees every other.
+    None outside a fleet (no gate)."""
     g = os.environ.get("TAUCETI_GATE_DIR", "").strip()
-    return Path(g) / "fallback-authoring" if g else None
+    return Path(g) / name if g else None
 
 
-def _fallback_slots(w) -> int:
+def _live_slots(w, name: str = FALLBACK_SLOTS) -> int:
     """Other workers' live slots (a slot outlives its round only by a crash; it expires with the
     round timeout)."""
-    d = _fallback_dir()
+    d = _slot_dir(name)
     if d is None or not d.is_dir():
         return 0
     n, now = 0, time.time()
@@ -2694,10 +2715,10 @@ def _fallback_slots(w) -> int:
     return n
 
 
-def _hold_fallback_slot(w) -> None:
+def _hold_slot(w, name: str = FALLBACK_SLOTS) -> None:
     import atexit
 
-    d = _fallback_dir()
+    d = _slot_dir(name)
     if d is None:
         return
     try:
@@ -2709,20 +2730,163 @@ def _hold_fallback_slot(w) -> None:
         pass
 
 
+@dataclass
+class _LookaheadView:
+    fork: str
+    branches: dict[tuple[str, str], str]  # (area, slug) -> branch tip
+    headers: dict[str, lookahead.Header]  # tip -> its LOOKAHEAD.md header
+    plans: dict[tuple[str, str], lookahead.PortPlan]
+    ready: list[tuple[str, TargetItem]]  # in-flight items with another split ready to port
+    open_item_prs: dict[tuple[str, str], set[int]]  # (area, slug) -> the open PRs carrying its marker
+
+
+def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView | None:
+    """The fork's lookahead branches as they bear on this round: one gated `ls-remote`, plus the
+    headers of branches not seen before (cached by tip). Without lookahead, and unless `fresh`, a
+    listing younger than lookahead.OFF_LISTING_TTL is reused instead. None without a GitHub client
+    or when the branches cannot be listed; the round then neither holds, ports nor starts a session."""
+    if w.gh is None:
+        return None
+    cached = None if (fresh or lookahead.enabled()) else lookahead.recent_snapshot(lookahead.OFF_LISTING_TTL)
+    if cached is not None:
+        fork, branches = cached
+    else:
+        try:
+            fork = ensure_fork()
+        except Die as e:
+            log(f"lookahead: no fork to list the branches on ({e})")
+            return None
+        branches = lookahead.list_branches(fork)
+        if branches is None:
+            return None
+    headers = {}
+    for sha in sorted(set(branches.values())):
+        h = lookahead.read_header(fork, sha)
+        if h is not None:
+            headers[sha] = h
+    open_ports: dict[tuple[str, int], int] = {}
+    open_item_prs: dict[tuple[str, str], set[int]] = {}
+    for p in getattr(sv, "open_prs", None) or []:
+        for key in p.lookahead_ports:
+            open_ports[key] = p.number
+        for key in p.target_ids:
+            open_item_prs.setdefault(key, set()).add(p.number)
+    merged_ports: dict[tuple[str, int], int] = {}
+    for d in _merged_marker_prs:
+        for key in lookahead.port_markers(d.get("body") or ""):
+            merged_ports[key] = int(d.get("number") or 0)
+    plans = {
+        key: lookahead.port_plan(lookahead.branch_name(*key), headers[sha], open_ports, merged_ports)
+        for key, sha in branches.items()
+        if sha in headers
+    }
+    if cached is None:
+        lookahead.write_snapshot(fork, branches, headers)
+    return _LookaheadView(fork, branches, headers, plans, lookahead.port_ready(live, plans, open_item_prs), open_item_prs)
+
+
+def _area_ok(area: str, only: str, skip: list[str]) -> bool:
+    return area == only if only not in ("auto", "any", "") else area not in skip
+
+
+def _without_held(candidates: list[tuple[str, TargetItem]], view: _LookaheadView | None) -> list[tuple[str, TargetItem]]:
+    """Without lookahead, an eligible item whose fresh lookahead branch awaits its port is left alone
+    for lookahead.hold_hours() from the first time this fleet held it, then authored fresh. Either way
+    the attention list says so (a `held`, then a `skipped` incident). NoProgress when nothing is left."""
+    if view is None or lookahead.enabled():
+        return candidates
+    kept = []
+    hours = lookahead.hold_hours()
+    for area, it in candidates:
+        sha = view.branches.get((area, it.slug))
+        h = view.headers.get(sha) if sha else None
+        branch = lookahead.branch_name(area, it.slug)
+        if sha and not (h is not None and lookahead.stale(h)):
+            held = lookahead.hold_started(area, it.slug)
+            if held is None or held < hours * 3600:
+                lookahead.record("held", area, it.slug, f"`{it.slug}` is left for a lookahead round to port {branch} "
+                                 f"(held {(held or 0) / 3600:.1f} h of {hours:g} h); turn lookahead on or delete the branch to release it")
+                log(f"target {area}/{it.slug} waits for its lookahead port ({branch}) — trying the next")
+                continue
+            lookahead.record("skipped", area, it.slug, f"no lookahead round ported {branch} within {hours:g} h; "
+                             f"`{it.slug}` is authored fresh and the branch is left for the curator")
+        kept.append((area, it))
+    if candidates and not kept:
+        raise NoProgress("roadmap: every eligible target waits for its lookahead port (" +
+                         ", ".join(sorted({it.slug for _a, it in candidates})) + ") — nothing to author")
+    return kept
+
+
+def _claim_lookahead(w, live: Targets, view: _LookaheadView, only: str, skip: list[str]) -> lookahead.Candidate | None:
+    """The blocked item this round proves ahead (lookahead.candidates), claimed under
+    `lookahead/<area>/<slug>` so it never collides with the item's author claim; None when there is
+    none. A new branch is started only while fewer than lookahead.max_branches() are live or being
+    built by this fleet's other workers; resuming a partial branch is always allowed."""
+    from .attention import declined_targets
+
+    failed = {it.slug for area, items in live.areas.items() for it in items
+              if it.status == "open" and lookahead.failed_recently(area, it.slug)}
+    cands = lookahead.candidates(live, only=only, skip=skip, declined=set(declined_targets()), branches=view.branches,
+                                 headers=view.headers, failed=failed)
+    building = len(view.branches) + _live_slots(w, LOOKAHEAD_SLOTS)
+    cap = lookahead.max_branches()
+    if building >= cap and any(not c.resume for c in cands):
+        log(f"lookahead: {building} branch(es) live or being built (cap {cap}) — only a partial branch may be resumed")
+        cands = [c for c in cands if c.resume]
+    if not cands:
+        log("lookahead: no blocked item qualifies (each waits on a supplier that is not yet in flight or eligible, "
+            "is unsettled, or already has a complete branch)")
+        return None
+    for n, c in enumerate(cands):
+        if n >= MAX_TARGET_ACQUIRES:
+            break
+        rc = w.claims.begin_global_work(f"lookahead/{c.area}/{c.item.slug}")
+        if rc == 1:
+            log(f"lookahead {c.area}/{c.item.slug} held by another worker — trying the next")
+            continue
+        _hold_slot(w, LOOKAHEAD_SLOTS)
+        return c
+    return None
+
+
 def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]):
     """The target this authoring round works on, under the live overlay, or None when the list has
     nothing to offer (every eligible item in flight, blocked, declined or claimed) and this account has
     room for a PR outside it: at most TARGETS_FALLBACK_MAX_OPEN open PRs. Without that room the reason
-    stands as NoProgress. Returns (live targets, area, item, claimed, candidates, n_inflight, n_merged)."""
+    stands as NoProgress. Returns (live targets, area, item, claimed, candidates, n_inflight, n_merged).
+
+    Under lookahead (lookahead.py) the list offers two more kinds of work: an in-flight item whose
+    branch has another split ready to port, taken before the eligible items, and, when nothing on the
+    list can be taken, a session proving a blocked item ahead, taken before authoring outside the list
+    (owner's ruling, 2026-10-04). They are handed to do_roadmap as `w.lookahead_port` (the item's
+    port plan) and `w.lookahead_session`."""
+    w.lookahead_port = w.lookahead_session = None
+    live, n_inflight, n_merged = _live_target_view(targets, path, sv, w.gh)
+    view = _lookahead_view(w, sv, live)
+    on = view is not None and lookahead.enabled()
     try:
-        live, n_inflight, n_merged = _live_target_view(targets, path, sv, w.gh)
-        candidates = _target_candidates(live, path, only, skip)
+        try:
+            candidates = _target_candidates(live, path, only, skip)
+        except NoProgress:
+            if not (on and any(_area_ok(a, only, skip) for a, _it in view.ready)):
+                raise
+            candidates = []
+        if on:
+            ports = [(a, it) for a, it in view.ready if _area_ok(a, only, skip)]
+            candidates = ports + [c for c in candidates if c not in ports]
         # A target an author already declined (the agent found it on main, most often) is not offered
         # again: every author would spend a round to reach the same answer. The curator weighs the
         # agent's account against main and marks it done, or hands it back.
         candidates = _without_declined(candidates)
+        candidates = _without_held(candidates, view)
         area, item, claimed = _claim_target(w.claims, candidates, path)
     except NoProgress as e:
+        if on:
+            session = _claim_lookahead(w, live, view, only, skip)
+            if session is not None:
+                log(f"roadmap: {e} — proving `{session.item.slug}` ahead of its supplier(s) instead")
+                w.lookahead_session = (session, view)
+                return live, session.area, session.item, True, [], n_inflight, n_merged
         # An idle author is waste: while there is room under the project's cap, it authors outside the
         # list instead (owner's ruling, 2026-09-27); the list itself is untouched.
         mine = getattr(sv, "_mine_open_prs", None)
@@ -2731,14 +2895,16 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
         n_ours = len(mine)
         # Several authors can reach this point in the same minute; each one authoring outside the list
         # holds a slot until its round ends, so together they never take the count past the cap.
-        others = _fallback_slots(w)
+        others = _live_slots(w)
         if n_ours + others >= TARGETS_FALLBACK_MAX_OPEN + 1:
             raise NoProgress(f"{e}; not authoring outside the list either ({n_ours} open PRs of ours"
                              f"{f' + {others} being authored' if others else ''} > {TARGETS_FALLBACK_MAX_OPEN})") from None
-        _hold_fallback_slot(w)
+        _hold_slot(w)
         log(f"roadmap: {e} — authoring outside the target list instead ({n_ours} open PRs of ours"
             f"{f' + {others} being authored' if others else ''} ≤ {TARGETS_FALLBACK_MAX_OPEN})")
         return None
+    if on and (plan := view.plans.get((area, item.slug))) is not None:
+        w.lookahead_port = (plan, view)
     return live, area, item, claimed, candidates, n_inflight, n_merged
 
 
@@ -2748,6 +2914,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     targets_path = roadmap_targets()
     targets = load_targets(targets_path) if targets_path is not None else None  # per round; Die on failure
     assigned_str = "Assigned target: none"
+    lookahead_str = ""
     if targets is not None:
         # The worker, not the agent, chooses and claims the target: N workers started on one file
         # settle who does what here, before any model runs, through the round's lease + heartbeat.
@@ -2756,6 +2923,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             targets, only = None, (c.reason or "any")
         else:
             targets, only, item, claimed, candidates, n_inflight, n_merged = picked
+            if getattr(w, "lookahead_session", None) is not None:
+                return _do_lookahead(w, opts, bubble, targets, *w.lookahead_session)
             w.current_target = f"{only}/{item.slug}"
             n_open = sum(len(open_items(targets, a)) for a in targets.areas)
             log(
@@ -2764,6 +2933,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 f"{n_merged} merged)"
             )
             assigned_str = _render_assigned(targets, item)
+            if getattr(w, "lookahead_port", None) is not None:
+                lookahead_str = _port_section(w, targets, only, item, *w.lookahead_port)
     if targets is None and only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         raw_areas = roadmap_areas(w.gh)
         areas = [a for a in raw_areas if a not in skip]
@@ -2839,7 +3010,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # agent runs against this id. The branch is the agent's to name; git-safe-push records it.
     pub_id = pub_mod.create_for_round(pub_mod.KIND_AUTHOR, branch="", head_sha="", remote=f"https://github.com/{fork}")
     try:
-        return _do_roadmap_agent(
+        rc = _do_roadmap_agent(
             w,
             opts,
             bubble,
@@ -2853,7 +3024,11 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             claimed_str,
             fork,
             source_guidance,
+            lookahead_str,
         )
+        if lookahead_str:
+            _after_port(w, w.lookahead_port[0])
+        return rc
     finally:
         if pub_id:
             os.environ.pop(pub_mod.ID_ENV, None)
@@ -2876,6 +3051,7 @@ def _do_roadmap_agent(
     claimed_str,
     fork,
     source_guidance,
+    lookahead_str="",
 ) -> int:
     fork_owner = fork.split("/", 1)[0]
     if bubble:
@@ -2905,6 +3081,7 @@ def _do_roadmap_agent(
                     else "/opt/review/rubrics (read every .md file in it)"
                 ),
                 SOURCE_GUIDANCE=source_guidance,
+                LOOKAHEAD=lookahead_str,
                 BIN=wrapper_bin(bubble=True),
             ),
             opts,
@@ -2927,6 +3104,263 @@ def _do_roadmap_agent(
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
+        LOOKAHEAD=lookahead_str,
         BIN=wrapper_bin(),
     )
     return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+
+
+# ---- lookahead: proving a blocked target ahead of its supplier, and porting it (lookahead.py) ----------
+
+
+def _supplier_prs(live: Targets, slug: str) -> list[int]:
+    """The merged PRs that landed a supplier item, newest first: those its `landed:`/`partial:` clauses
+    name, and those this round's merged listing shows carrying its marker."""
+    it = live.find(slug)
+    if it is None:
+        return []
+    prs = set(partial_prs(it))
+    for clause in it.meta:
+        key, _, value = clause.partition(":")
+        if key.strip().lower() == "landed":
+            prs.update(int(n) for n in re.findall(r"#(\d+)", value))
+    for d in _merged_marker_prs:
+        if (it.area, slug) in target_marker_ids(d.get("body") or ""):
+            prs.add(int(d.get("number") or 0))
+    return sorted((n for n in prs if n), reverse=True)
+
+
+def _port_section(w, live: Targets, area: str, item: TargetItem, plan: lookahead.PortPlan, view: _LookaheadView) -> str:
+    """The `__LOOKAHEAD__` text of an author round whose target has a lookahead branch: which split to
+    port, where the landed supplier declarations are, and the marker the PR carries."""
+    h = plan.header
+    url = f"https://github.com/{view.fork}"
+    stub = f"TauCeti.Lookahead.{lookahead.camel(item.slug)}.Stubs"
+    opened = ", ".join(f"split {n} (#{pr})" for n, pr in sorted(plan.opened.items())) or "none"
+    merged = ", ".join(f"split {n} (#{pr})" for n, pr in sorted(plan.merged.items())) or "none"
+    head = (f"- **This target was proved ahead of its supplier**, on the branch `{plan.branch}` of `{view.fork}`: "
+            f"a {h.status} proof against stubs in `{stub}`, with a plan of {len(h.splits)} split(s) in its "
+            f"`LOOKAHEAD.md`. Its supplier(s) have landed since, so port the branch rather than authoring "
+            f"from scratch. Splits already open: {opened}; merged: {merged}.")
+    if plan.next is None:
+        return (head + "\n  Every split of the plan is open or merged. Check on `main` what the target still lacks, "
+                "author that as usual (no port marker), and end your report with the line "
+                "`Lookahead: not used — the plan is fully ported`.")
+    nxt, final = plan.next, plan.next.n == h.last_split
+    supplied = []
+    for slug in h.suppliers or tuple(item.needs):
+        prs = _supplier_prs(live, slug)[:3]
+        if not prs:
+            continue
+        names = []
+        for pr in prs:
+            names += [n for n in _pr_added_declarations(w, pr, limit=12) if n not in names]
+        supplied.append(f"`{slug}` landed in " + ", ".join(f"#{pr}" for pr in prs)
+                        + (f", which add {', '.join(f'`{n}`' for n in names[:12])}" if names else ""))
+    marker = lookahead.port_marker(plan.branch, nxt.n)
+    return "\n".join([
+        head,
+        f"  1. `git fetch {url} {plan.branch}`, then read `git show FETCH_HEAD:LOOKAHEAD.md` in full: the stubbed "
+        "statements, where each came from, and the split plan.",
+        f"  2. Port split {nxt.n}{f' ({nxt.title})' if nxt.title else ''}: start your branch from `main` as below, bring "
+        "that split's files over from `FETCH_HEAD` (`git checkout FETCH_HEAD -- <file>` for a new file; the split's "
+        f"diff for a file main already has), replace every import of `{stub}` by the modules that now provide "
+        "those declarations, and adapt the proof wherever a landed statement differs from its stub. "
+        + ("; ".join(supplied) + "." if supplied else "Find the landed declarations on `main`."),
+        "  3. Nothing under `TauCeti/Lookahead/` and no `LOOKAHEAD.md` goes into your branch (the push wrapper refuses "
+        f"a branch that has them). The PR body carries this line beside the target marker: `{marker}`. "
+        + ("This is the plan's last split: it completes the target, so the target marker has no `\"partial\"` flag."
+           if final else "The target marker says `\"partial\":true`: the plan's last split is what completes the target."),
+        "  4. Verify and submit as below. If a landed declaration took a route the branch cannot follow, author the "
+        "target as you would have without the branch, leave the port marker out, and end your report with the line "
+        "`Lookahead: not used — <reason>`. Otherwise end it with `Lookahead: ported split "
+        f"{nxt.n}`, after listing every place a stub and the landed declaration differed and what you changed.",
+    ])
+
+
+def _after_port(w, plan: lookahead.PortPlan) -> None:
+    """Record how a port round used its branch: a `mismatch` incident when it authored without it."""
+    from .attention import final_assistant_text, newest_agent_log
+
+    area, slug = lookahead.parse_branch(plan.branch) or ("?", "?")
+    log_path = newest_agent_log(w.cfg.logdir)
+    summary = final_assistant_text(log_path, limit=4000) if log_path else ""
+    split = plan.next.n if plan.next else None
+    reason = lookahead.not_used_reason(summary)
+    if reason:
+        lookahead.record("mismatch", area, slug, f"the port round authored without {plan.branch}: {reason}", summary=summary)
+        lookahead.history("port", area, slug, split=split, outcome="not used", reason=reason)
+    else:
+        lookahead.history("port", area, slug, split=split, outcome="finished", report=summary)
+
+
+def _do_lookahead(w, opts, bubble, live: Targets, cand: lookahead.Candidate, view: _LookaheadView) -> int:
+    """One lookahead session (prompts/lookahead.md): prove `cand.item` against stubs of its unmet needs
+    on `lookahead/<area>/<slug>` of the fork and push that branch once. No publication, since nothing
+    is opened: the push is create-only for a new branch, leased on the tip for a resumed one, and the
+    wrappers refuse any other push and every PR while BRANCH_ENV is set."""
+    area, item = cand.area, cand.item
+    branch = lookahead.branch_name(area, item.slug)
+    w.current_target = f"{area}/{item.slug}"
+    log(f"→ LOOKAHEAD target: {area}/{item.slug} on {view.fork}:{branch} "
+        f"({f'resuming {cand.resume[:12]}' if cand.resume else 'new branch'}; stubbing "
+        f"{', '.join(s.slug for s in cand.stubs)})")
+    report_runtime("running", phase="lookahead", target=f"{area}/{item.slug} → {branch}")
+    refs = w.cfg.state / "refs"
+    if not fetch_ref(ROADMAP, refs / "roadmap"):
+        raise Die(f"fetch {ROADMAP} failed")
+    if not fetch_ref(REVIEW, refs / "review"):
+        raise Die(f"fetch {REVIEW} failed")
+    bundle = stage_rubrics(refs / "review", refs / "rubrics")
+    os.environ.pop("TAUCETI_REQUIRE_TARGET_MARKER", None)
+    os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{view.fork}"
+    os.environ["TAUCETI_PUSH_REF"] = branch
+    if cand.resume:
+        os.environ["TAUCETI_PUSH_EXPECT"] = cand.resume
+    else:
+        os.environ.pop("TAUCETI_PUSH_EXPECT", None)
+    os.environ[lookahead.BRANCH_ENV] = branch
+    os.environ["CLAIM_REPO"] = claims_repo()
+    suppliers = "\n".join(_render_supplier(live, s, view) for s in cand.stubs)
+    resume = (
+        f"**Resuming a partial branch.** `{branch}` already holds part of this proof (tip `{cand.resume[:12]}`). "
+        f"Continue it rather than starting over: `git fetch https://github.com/{view.fork} {branch}`, "
+        f"`git checkout -B {branch} FETCH_HEAD`, then `git merge origin/main` (keep a stub unless `main` now has its "
+        "declaration). Its `LOOKAHEAD.md` says what remains. The push leases on that tip."
+        if cand.resume else
+        f"The branch `{branch}` does not exist yet: you create it, and the push is create-only."
+    )
+    fork_owner = view.fork.split("/", 1)[0]
+    stubbed = {s.slug for s in cand.stubs}
+    needs = "; ".join(f"`{n}` " + ("— to stub" if n in stubbed else "— landed") for n in item.needs) or "none"
+    # The worker kills the round at ROUND_TIMEOUT and an unpushed branch is lost with it.
+    budget = max(1800, _constants.ROUND_TIMEOUT - 1800)
+    deadline = time.strftime("%H:%M UTC", time.gmtime(time.time() + budget))
+    subs = dict(
+        ASSIGNED=f"Target: `{item.slug}` ({area}) — {item.text} ({'; '.join([*agent_clauses(item), 'needs: ' + needs])})",
+        DEADLINE=f"{deadline} (about {budget // 3600} h {budget % 3600 // 60:02d} min from the start)",
+        SUPPLIERS=suppliers,
+        RESUME=resume,
+        BRANCH=branch,
+        AREA=area,
+        SLUG=item.slug,
+        CAMEL=lookahead.camel(item.slug),
+        FORK=fork_owner,
+        AGENT=opts.agent_name,
+    )
+    w.lookahead_started = time.time()
+    if bubble:
+        mounts = [f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"]
+        if bundle is not None:
+            mounts.append(f"{refs / 'rubrics'}:/opt/rubrics:ro")
+        prompt = fill_prompt(
+            HERE / "prompts" / "lookahead.md",
+            **subs,
+            ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
+            RUBRICS=f"/opt/rubrics/{RUBRIC_BUNDLE}" if bundle is not None else "/opt/review/rubrics (read every .md file in it)",
+            BIN=wrapper_bin(bubble=True),
+        )
+        return run_in_bubble(w, TAUCETI, prompt, opts, mounts=mounts, allow_push=view.fork)
+    if not prepare_checkout(w.cfg):
+        raise Die("checkout failed")
+    prompt = fill_prompt(
+        HERE / "prompts" / "lookahead.md",
+        **subs,
+        ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
+        RUBRICS=str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)",
+        BIN=wrapper_bin(),
+    )
+    return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
+
+
+def _render_supplier(live: Targets, it: TargetItem, view: _LookaheadView) -> str:
+    """One supplier line for the lookahead prompt: the list item, whether it is in flight (and in which
+    open PRs) or eligible, and the PRs that already landed part of it."""
+    clauses = agent_clauses(it)
+    prs = sorted(view.open_item_prs.get((it.area, it.slug), ()))
+    state = (f"in flight: open PR {', '.join(f'#{n}' for n in prs)}" if prs
+             else "in flight" if it.status == "inflight" else "eligible, not yet in flight")
+    return f"- `{it.slug}` ({it.area}; {state}) — {it.text}" + (f" ({'; '.join(clauses)})" if clauses else "")
+
+
+def _lookahead_outcome(w, rc: int) -> int:
+    """After a lookahead session: did the branch move? A session that pushed nothing leaves a `failed`
+    incident (and the item is not offered again for lookahead.FAILED_HOLD_DAYS); it is a finished
+    judgement, so the loop pauses rather than backing off."""
+    from .attention import final_assistant_text, newest_agent_log
+
+    cand, view = w.lookahead_session
+    area, slug = cand.area, cand.item.slug
+    branch = lookahead.branch_name(area, slug)
+    seconds = round(time.time() - getattr(w, "lookahead_started", time.time()))
+    if rc != 0:
+        lookahead.history("session", area, slug, rc=rc, outcome="round failed", seconds=seconds)
+        return rc
+    tips = lookahead.list_branches(view.fork)
+    if tips is None:
+        lookahead.history("session", area, slug, rc=rc, outcome="unknown (branches unreadable)", seconds=seconds)
+        return rc
+    tip = tips.get((area, slug), "")
+    if tip and tip != cand.resume:
+        h = lookahead.read_header(view.fork, tip)
+        log(f"lookahead: pushed {branch} at {tip[:12]} ({h.status if h else 'header unreadable'})")
+        lookahead.history("session", area, slug, rc=rc, outcome="pushed", tip=tip, seconds=seconds,
+                          status=h.status if h else None, resumed=cand.resume or None)
+        if h is None:
+            lookahead.record("unreadable", area, slug, f"{branch} was pushed at {tip[:12]}, but its LOOKAHEAD.md has no "
+                             "readable header: it will be neither resumed nor ported until that is fixed")
+        return rc
+    log_path = newest_agent_log(w.cfg.logdir)
+    summary = final_assistant_text(log_path) if log_path else ""
+    lookahead.record("failed", area, slug, f"the session pushed nothing to {branch}: {one_line(summary, 600) or 'no report'}",
+                     summary=summary)
+    lookahead.history("session", area, slug, rc=rc, outcome="nothing pushed", seconds=seconds)
+    raise NoProgress(f"lookahead {area}/{slug}: the agent finished but pushed nothing to {branch} — recorded for the "
+                     f"attention list; the item is not offered again for {lookahead.FAILED_HOLD_DAYS} days", declined=True)
+
+
+def _lookahead_sweep(w, sv) -> None:
+    """The curator's pass over the fork's lookahead branches, whatever the round's setting: a branch
+    whose item is done is deleted (after its last open port PR has closed), as is one whose item left
+    the list; a branch built on a main more than lookahead.STALE_DAYS old whose item is not done is
+    listed for the owner. Deletions that were not a finished port, and stale branches, are incidents;
+    every deletion is a history line. Never raises: the list's curation has already happened."""
+    path = roadmap_targets()
+    if path is None or w.gh is None:
+        return
+    try:
+        live, _n_in, _n_done = _live_target_view(load_targets(path), path, sv, w.gh)
+        view = _lookahead_view(w, sv, live, fresh=True)
+        if view is None:
+            return
+        for (area, slug), sha in sorted(view.branches.items()):
+            it = live.find(slug)
+            branch = lookahead.branch_name(area, slug)
+            plan = view.plans.get((area, slug))
+            if it is None or it.area != area:
+                if lookahead.delete_branch(view.fork, area, slug, sha):
+                    lookahead.record("abandoned", area, slug, f"{branch} was deleted: `{slug}` is no longer on the list")
+                    lookahead.history("deleted", area, slug, reason="not on the list", tip=sha)
+                continue
+            if it.status == "done":
+                if plan is not None and plan.opened:
+                    continue  # a port PR is still open; delete once it has closed
+                if lookahead.delete_branch(view.fork, area, slug, sha):
+                    if plan is not None and plan.merged:
+                        log(f"lookahead: {branch} deleted — `{slug}` is done, ported in "
+                            + ", ".join(f"#{n}" for n in sorted(plan.merged.values())))
+                        lookahead.history("deleted", area, slug, reason="ported", tip=sha,
+                                          ports=sorted(plan.merged.values()))
+                    else:
+                        lookahead.record("abandoned", area, slug,
+                                         f"{branch} was deleted unused: `{slug}` landed without any port PR")
+                        lookahead.history("deleted", area, slug, reason="landed without the port", tip=sha)
+                continue
+            h = view.headers.get(sha)
+            if h is not None and lookahead.stale(h) and not (plan is not None and (plan.opened or plan.merged)):
+                days = (time.time() - (h.built_at or time.time())) / 86400
+                lookahead.record("stale", area, slug, f"{branch} was built on a main {days:.0f} days old and `{slug}` "
+                                 f"is still {it.status}: port it, resume it, or delete the branch")
+    except Exception as e:  # noqa: BLE001 - a sweep failure must not undo the curation
+        log(f"lookahead: the branch sweep failed ({e}); the branches are left as they are")
+

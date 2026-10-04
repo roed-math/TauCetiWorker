@@ -31,6 +31,12 @@ CLAIM_SH="${TAUCETI_CLAIM_SH:-$(cd "$(dirname "$0")" && pwd)/claim.sh}"
 
 die() { echo "gh-safe-pr-create: $*" >&2; exit 1; }
 
+# 0) A lookahead round's branch carries sorry'd stubs by design and is never opened (tauceti_worker/lookahead.py).
+if [[ -n "${TAUCETI_LOOKAHEAD_BRANCH:-}" ]]; then
+    echo "gh-safe-pr-create: this is a lookahead round; its branch is never opened as a pull request — nothing was created" >&2
+    exit 75
+fi
+
 # extract the PR body from the passed `gh pr create` flags (--body/-b <s>, --body-file/-F <f>).
 pr_body_from_args() {
     local b="" prev=""

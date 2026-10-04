@@ -23,6 +23,9 @@
 #   TAUCETI_GATE_DIR / TAUCETI_GATE_REQUIRED   the fleet GitHub gate (docs/gate.md): the push is admitted
 #                        as a git_push to the head repository before git runs and recorded after
 #   TAUCETI_REAL_GIT     the git to run (the agent's PATH leads with a shim of it)
+#   TAUCETI_LOOKAHEAD_BRANCH set by a lookahead round (tauceti_worker/lookahead.py): the ONLY branch it may push.
+#                        Every other round refuses to push a lookahead/* branch, or any HEAD that carries the
+#                        stubs (TauCeti/Lookahead/ or LOOKAHEAD.md), so a stub can never reach a pull request.
 #   TAUCETI_PUBLICATION_ID   the round's publication (docs/gate.md, design §6): the push is its `push` step,
 #                        marked sent before git runs and done with the pushed tip after; a step already
 #                        sent/uncertain/done, a moved PR head (fix/rebase) or a publication that needs
@@ -48,6 +51,19 @@ claim() {
     fi
 }
 [[ -n "$REF" ]] || die "no destination branch (set TAUCETI_PUSH_REF or pass it as an argument)"
+
+LOOKAHEAD_BRANCH="${TAUCETI_LOOKAHEAD_BRANCH:-}"
+if [[ -n "$LOOKAHEAD_BRANCH" ]]; then
+    [[ "$REF" == "$LOOKAHEAD_BRANCH" ]] || {
+        echo "git-safe-push: a lookahead round pushes only '$LOOKAHEAD_BRANCH', not '$REF' — nothing was pushed" >&2; exit 75; }
+else
+    [[ "$REF" != lookahead/* ]] || {
+        echo "git-safe-push: only a lookahead round pushes a lookahead/ branch — nothing was pushed" >&2; exit 75; }
+    if [[ -n "$("$REAL_GIT" ls-tree -r --name-only HEAD -- TauCeti/Lookahead LOOKAHEAD.md 2>/dev/null)" ]]; then
+        echo "git-safe-push: HEAD carries lookahead stubs (TauCeti/Lookahead/ or LOOKAHEAD.md), which never go into a pull request branch — nothing was pushed" >&2
+        exit 75
+    fi
+fi
 
 # 1) Lease check (fail closed if we no longer hold the claim someone may have taken over).
 if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then

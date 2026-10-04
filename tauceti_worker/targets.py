@@ -234,11 +234,16 @@ def eligible_areas(targets: Targets) -> list[str]:
     return [a for a in targets.areas if eligible_items(targets, a)]
 
 
+def agent_clauses(it: TargetItem) -> list[str]:
+    """The item's metadata clauses an agent is shown: all but `lookahead:` (see lookahead.refused)."""
+    return [c for c in it.meta if c.partition(":")[0].strip().lower() != "lookahead"]
+
+
 def render_item(targets: Targets, it: TargetItem) -> str:
     """One item line for the prompt: its marker, slug and text, the metadata it carried, and every
     prerequisite with its CURRENT status resolved across all areas (`[?]` for a slug the file does
-    not define anywhere)."""
-    clauses = list(it.meta)
+    not define anywhere). A `lookahead:` clause is the scheduler's, not the agent's, and is left out."""
+    clauses = agent_clauses(it)
     if it.needs:
         resolved = []
         for slug in it.needs:

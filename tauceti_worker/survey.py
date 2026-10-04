@@ -49,6 +49,7 @@ from .constants import (
 )
 from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
 from .interaction import contest_max_exchanges
+from .lookahead import port_markers
 from .review_state import Meta, ReviewState
 
 # ============================================================================
@@ -153,6 +154,7 @@ class PRInfo:
     title: str = ""
     target_focuses: tuple[str, ...] = ()  # synchronous fallback while the derived roadmap label is pending
     target_ids: tuple[tuple[str, str], ...] = ()  # (focus, id) of every target marker in the body
+    lookahead_ports: tuple[tuple[str, int], ...] = ()  # (branch, split) of every lookahead port marker
     labels: tuple[str, ...] = ()  # label names carried by the PR (the status pipeline + roadmap area)
     # When the authoritative `build` status was posted for THIS head (epoch seconds), i.e. the instant
     # the PR became reviewable — so "awaiting review since" is exactly this, and a new push resets it
@@ -189,6 +191,7 @@ class PRInfo:
             title=d.get("title", ""),
             target_focuses=target_marker_focuses(d.get("body", "")),
             target_ids=target_marker_ids(d.get("body", "")),
+            lookahead_ports=port_markers(d.get("body", "") or ""),
             head_oid=d.get("headRefOid", ""),
             head_ref=d.get("headRefName", ""),
             head_owner=head_owner,

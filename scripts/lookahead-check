@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# lookahead-check — what a lookahead branch must satisfy before its one push (prompts/lookahead.md).
+#
+# Run in the TauCeti checkout after `lake build`. A lookahead branch carries sorry'd stubs by design,
+# so the ordinary gates cannot be used as they are; this checks the narrower contract instead:
+#   1. nothing outside TauCeti/ changed but LOOKAHEAD.md;
+#   2. `sorry`, `admit` and `warningAsError` occur in changed files only under TauCeti/Lookahead/;
+#   3. LOOKAHEAD.md opens with a `<!--tauceti-lookahead:v1 {…}-->` header that parses;
+#   4. the axiom audit of the changed modules (and their importers) finds no axiom but `sorryAx`.
+# Exit 0 = all hold; 1 = a violation (each is printed); 2 = could not check.
+#
+#   LOOKAHEAD_CHECK_AXIOMS   the audit to run (default `lake exe axioms`; the tests substitute a fake)
+set -uo pipefail
+
+AXIOMS="${LOOKAHEAD_CHECK_AXIOMS:-lake exe axioms}"
+bad=0
+say() { echo "lookahead-check: $*" >&2; }
+
+base=$(git merge-base origin/main HEAD 2>/dev/null) || { say "no merge base with origin/main (run git fetch origin main)"; exit 2; }
+changed=$( { git diff --name-only --diff-filter=d "$base"; git ls-files --others --exclude-standard; } | sort -u | sed '/^$/d')
+
+outside=$(grep -v -e '^TauCeti/' -e '^LOOKAHEAD\.md$' <<<"$changed" || true)
+if [[ -n "$outside" ]]; then
+    say "files outside TauCeti/ changed (only LOOKAHEAD.md may be):"; sed 's/^/  /' <<<"$outside" >&2; bad=1
+fi
+
+lean=$(grep -E '^TauCeti/.*\.lean$' <<<"$changed" || true)
+while IFS= read -r f; do
+    [[ -z "$f" || "$f" == TauCeti/Lookahead/* ]] && continue
+    hits=$(grep -nwE 'sorry|admit|warningAsError' "$f" || true)
+    if [[ -n "$hits" ]]; then
+        say "$f uses sorry/admit/warningAsError outside TauCeti/Lookahead/:"; sed 's/^/  /' <<<"$hits" >&2; bad=1
+    fi
+done <<<"$lean"
+
+if [[ ! -f LOOKAHEAD.md ]]; then
+    say "LOOKAHEAD.md is missing"; bad=1
+elif ! head -n 1 LOOKAHEAD.md | python3 -c '
+import json, re, sys
+m = re.search(r"<!--tauceti-lookahead:v1 (\{.*?\})-->", sys.stdin.read())
+d = json.loads(m.group(1)) if m else None
+ok = isinstance(d, dict) and all(isinstance(d.get(k), str) and d.get(k) for k in ("area", "slug", "main"))
+ok = ok and d.get("status") in ("complete", "partial") and isinstance(d.get("splits"), list) and d["splits"]
+sys.exit(0 if ok else 1)' 2>/dev/null; then
+    say "LOOKAHEAD.md's first line is not a readable <!--tauceti-lookahead:v1 {area, slug, main, status, splits}--> header"; bad=1
+fi
+
+if [[ -n "$lean" ]]; then
+    mods=$(mktemp)
+    sed 's/\.lean$//; s#/#.#g' <<<"$lean" > "$mods"
+    out=$(AXIOMS_ONLY_MODULES="$mods" $AXIOMS 2>&1)
+    rc=$?
+    rm -f "$mods"
+    offenders=$(grep -E '^  [^ ].* → \[' <<<"$out" || true)
+    others=$(grep -vE '→ \[sorryAx\]$' <<<"$offenders" | sed '/^$/d' || true)
+    if [[ -n "$others" ]]; then
+        say "the axiom audit finds axioms other than sorryAx:"; sed 's/^/  /' <<<"$others" >&2; bad=1
+    elif [[ $rc -ne 0 && -z "$offenders" ]]; then
+        say "the axiom audit failed without naming offenders:"; tail -n 20 <<<"$out" | sed 's/^/  /' >&2; exit 2
+    fi
+fi
+
+[[ $bad -eq 0 ]] && echo "lookahead-check: ok" && exit 0
+exit 1

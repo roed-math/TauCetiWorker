@@ -1542,7 +1542,7 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
 # that way, and the fleet's mutation count stayed at zero all day). The gate store does not cross into
 # the container, so gate-lib's functions are no-ops there; the push is still guarded by bubble's auth
 # proxy and the branch CAS. tests/bubble_round_scripts.py pins this list against the wrappers' sources.
-BUBBLE_ROUND_SCRIPTS = ("git-safe-push", "gh-safe-pr-create", "claim.sh", "gate-lib.sh", "tauceti-gate")
+BUBBLE_ROUND_SCRIPTS = ("git-safe-push", "gh-safe-pr-create", "claim.sh", "gate-lib.sh", "tauceti-gate", "lookahead-check")
 
 
 def pooled_toolchain_mounts() -> list[str]:
@@ -1651,6 +1651,7 @@ def run_in_bubble(
         "TAUCETI_CLAIM_HELD",
         "CLAIM_REPO",
         "TAUCETI_PUBLICATION_ID",
+        "TAUCETI_LOOKAHEAD_BRANCH",
     ):
         val = os.environ.get(var)
         if val:
