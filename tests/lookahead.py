@@ -144,6 +144,19 @@ check("not while another PR carries its marker",
       L.port_ready(LIVE2, plans, {("Item", "on-flying"): {501, 777}}) == [])
 check("not while its supplier is still in flight",
       L.port_ready(overlay_live(live, {("Item", "on-flying")}, set()), plans, {("Item", "on-flying"): {501}}) == [])
+FREE = L.parse_header(header("Item", "on-flying", suppliers=()))
+free_plans = {("Item", "on-flying"): L.port_plan(B, FREE, {}, {})}
+check("a complete branch that stubs nothing is ported now, its supplier still in flight",
+      [it.slug for _a, it in L.port_ready(live, free_plans, {})] == ["on-flying"] and FREE.stub_free)
+PART = L.parse_header(header("Item", "on-flying", status="partial", suppliers=()))
+check("…but not a partial one", L.port_ready(live, {("Item", "on-flying"): L.port_plan(B, PART, {}, {})}, {}) == [])
+text = W._port_section(SimpleNamespace(), live, "Item", live.find("on-flying"), free_plans[("Item", "on-flying")],
+                       SimpleNamespace(fork="alice/TauCeti"))
+check("its port section says it stubs nothing and asks for no stub swap", "stubs nothing" in text
+      and "replace every import" not in text and L.port_marker(B, 1) in text, text)
+assigned = W._render_assigned(live, live.find("on-flying"))
+check("and the assigned line does not claim the supplier landed", "`flying` — not complete" in assigned
+      and "`base` — all landed" in assigned, assigned)
 
 # ---- _pick_target -------------------------------------------------------------------------------------
 INCIDENTS = TMP / "incidents"

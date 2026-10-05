@@ -131,6 +131,13 @@ class Header:
     def last_split(self) -> int:
         return max(s.n for s in self.splits)
 
+    @property
+    def stub_free(self) -> bool:
+        """A complete proof that stubs nothing: what the target uses from its listed needs has all
+        landed, so it can be ported now, however coarse the list's `needs:` (the pilot's first branch,
+        2026-10-04, was one)."""
+        return self.complete and not self.suppliers
+
 
 def parse_header(text: str) -> Header | None:
     """The `<!--tauceti-lookahead:v1 {…}-->` line of a LOOKAHEAD.md, or None. A malformed split list
@@ -289,17 +296,20 @@ def port_plan(branch: str, header: Header, open_ports: dict[tuple[str, int], int
 
 def port_ready(live: Targets, plans: dict[tuple[str, str], PortPlan],
                open_item_prs: dict[tuple[str, str], set[int]]) -> list[tuple[str, TargetItem]]:
-    """In-flight items an author may port another split of now (the owner's ruling, 2026-10-04: no
-    waiting for merges between independent splits). The item's needs have all landed, every open PR
-    carrying its marker is one of this branch's port PRs, and the plan has a ready split."""
+    """Items an author may port a split of now, beyond the eligible ones the list offers anyway: an
+    in-flight item whose needs have all landed (the owner's ruling, 2026-10-04: no waiting for merges
+    between independent splits), and an open or in-flight item whose branch stubs nothing, whatever
+    its needs. Either way every open PR carrying its marker is one of this branch's port PRs, and the
+    plan has a ready split."""
     out = []
     for area, items in live.areas.items():
         for it in items:
             plan = plans.get((area, it.slug))
-            if it.status != "inflight" or plan is None or plan.next is None:
+            if plan is None or plan.next is None or it.status == "done":
                 continue
-            if any(_status(live, n) != "done" for n in it.needs):
-                continue
+            if not plan.header.stub_free:
+                if it.status != "inflight" or any(_status(live, n) != "done" for n in it.needs):
+                    continue
             if not open_item_prs.get((area, it.slug), set()) <= set(plan.opened.values()):
                 continue
             out.append((area, it))

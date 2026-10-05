@@ -2648,11 +2648,14 @@ def _render_assigned(live: Targets, it: TargetItem) -> str:
     lead-in to the area block that follows (continuation lines sit two spaces in, under the bullet).
     Every known prerequisite has landed (that is what made the item eligible); one the list never
     defines is said so, not called landed."""
-    known = [s for s in it.needs if live.find(s) is not None]
+    known = [s for s in it.needs if live.find(s) is not None and live.find(s).status == "done"]
+    pending = [s for s in it.needs if live.find(s) is not None and live.find(s).status != "done"]
     unknown = [s for s in it.needs if live.find(s) is None]
     parts = []
     if known:
         parts.append(", ".join(f"`{s}`" for s in known) + " — all landed")
+    if pending:  # only a stub-free lookahead branch is offered ahead of its listed needs
+        parts.append(", ".join(f"`{s}`" for s in pending) + " — not complete; the lookahead branch below uses only what of it has landed")
     if unknown:
         parts.append(", ".join(f"`{s}`" for s in unknown) + " — not in the list, assumed landed")
     clauses = [*agent_clauses(it), "needs: " + ("; ".join(parts) if parts else "none")]
@@ -3148,17 +3151,23 @@ def _port_section(w, live: Targets, area: str, item: TargetItem, plan: lookahead
     stub = f"TauCeti.Lookahead.{lookahead.camel(item.slug)}.Stubs"
     opened = ", ".join(f"split {n} (#{pr})" for n, pr in sorted(plan.opened.items())) or "none"
     merged = ", ".join(f"split {n} (#{pr})" for n, pr in sorted(plan.merged.items())) or "none"
-    head = (f"- **This target was proved ahead of its supplier**, on the branch `{plan.branch}` of `{view.fork}`: "
-            f"a {h.status} proof against stubs in `{stub}`, with a plan of {len(h.splits)} split(s) in its "
-            f"`LOOKAHEAD.md`. Its supplier(s) have landed since, so port the branch rather than authoring "
-            f"from scratch. Splits already open: {opened}; merged: {merged}.")
+    if h.stub_free:
+        head = (f"- **This target was proved ahead**, on the branch `{plan.branch}` of `{view.fork}`: a complete proof "
+                f"that stubs nothing, since everything it uses has landed on `main`, with a plan of {len(h.splits)} "
+                f"split(s) in its `LOOKAHEAD.md`. Port the branch rather than authoring from scratch. Splits already "
+                f"open: {opened}; merged: {merged}.")
+    else:
+        head = (f"- **This target was proved ahead of its supplier**, on the branch `{plan.branch}` of `{view.fork}`: "
+                f"a {h.status} proof against stubs in `{stub}`, with a plan of {len(h.splits)} split(s) in its "
+                f"`LOOKAHEAD.md`. Its supplier(s) have landed since, so port the branch rather than authoring "
+                f"from scratch. Splits already open: {opened}; merged: {merged}.")
     if plan.next is None:
         return (head + "\n  Every split of the plan is open or merged. Check on `main` what the target still lacks, "
                 "author that as usual (no port marker), and end your report with the line "
                 "`Lookahead: not used — the plan is fully ported`.")
     nxt, final = plan.next, plan.next.n == h.last_split
     supplied = []
-    for slug in h.suppliers or tuple(item.needs):
+    for slug in () if h.stub_free else (h.suppliers or tuple(item.needs)):
         prs = _supplier_prs(live, slug)[:3]
         if not prs:
             continue
@@ -3174,9 +3183,12 @@ def _port_section(w, live: Targets, area: str, item: TargetItem, plan: lookahead
         "statements, where each came from, and the split plan.",
         f"  2. Port split {nxt.n}{f' ({nxt.title})' if nxt.title else ''}: start your branch from `main` as below, bring "
         "that split's files over from `FETCH_HEAD` (`git checkout FETCH_HEAD -- <file>` for a new file; the split's "
-        f"diff for a file main already has), replace every import of `{stub}` by the modules that now provide "
-        "those declarations, and adapt the proof wherever a landed statement differs from its stub. "
-        + ("; ".join(supplied) + "." if supplied else "Find the landed declarations on `main`."),
+        "diff for a file main already has), "
+        + ("and check that it still builds against the `main` you are on: it was built on an older one."
+           if h.stub_free else
+           f"replace every import of `{stub}` by the modules that now provide those declarations, and adapt the "
+           "proof wherever a landed statement differs from its stub. "
+           + ("; ".join(supplied) + "." if supplied else "Find the landed declarations on `main`.")),
         "  3. Nothing under `TauCeti/Lookahead/` and no `LOOKAHEAD.md` goes into your branch (the push wrapper refuses "
         f"a branch that has them). The PR body carries this line beside the target marker: `{marker}`. "
         + ("This is the plan's last split: it completes the target, so the target marker has no `\"partial\"` flag."
