@@ -851,6 +851,9 @@ def classify_agent_failure(text: str) -> str | None:
 # and it keeps run_agent_proc's `-> int` contract intact for its several callers. Written on every
 # non-zero exit, including the bubble path, which funnels through the same function.
 _LAST_AGENT_FAILURE: str | None = None
+# What this round's agents reported spending (see AgentTranscriptRenderer.cost_usd / tokens); a round is
+# its own process, so this is per round. work_units records it with the round (round_spend).
+ROUND_SPEND: dict = {"cost_usd": None, "tokens": {}, "provider": None}
 
 
 def take_last_agent_infra_failure() -> str | None:
@@ -923,6 +926,11 @@ def run_agent_proc(
         rc = proc.wait()
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
+        if renderer.cost_usd is not None:
+            ROUND_SPEND["cost_usd"] = (ROUND_SPEND["cost_usd"] or 0.0) + renderer.cost_usd
+        for key, value in renderer.tokens.items():
+            ROUND_SPEND["tokens"][key] = ROUND_SPEND["tokens"].get(key, 0) + value
+        ROUND_SPEND["provider"] = ROUND_SPEND["provider"] or provider
         return rc
 
     def classify_rendered_failure() -> str | None:

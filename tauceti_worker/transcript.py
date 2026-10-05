@@ -184,6 +184,10 @@ class AgentTranscriptRenderer:
         self.saw_work = False
         self.terminal_failure_text: str | None = None
         self.terminal_failure_final = False
+        # What the agent reported spending: Claude's result event carries an API-equivalent cost, and
+        # each Codex turn its token counts. The fleet paces outside-list work by these (round spend).
+        self.cost_usd: float | None = None
+        self.tokens: dict[str, int] = {}
 
     def render_line(self, raw: str) -> str:
         if self.provider not in {"codex", "claude"}:
@@ -228,6 +232,9 @@ class AgentTranscriptRenderer:
         if kind == "turn.completed":
             self.active = True
             usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            for key, value in usage.items():
+                if isinstance(value, int):
+                    self.tokens[key] = self.tokens.get(key, 0) + value
             fields = [
                 f"input={usage[key]}" if key == "input_tokens" else f"{key.removesuffix('_tokens')}={usage[key]}"
                 for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
@@ -498,6 +505,14 @@ class AgentTranscriptRenderer:
             detail += f"; turns={turns}"
         if isinstance(duration, int):
             detail += f"; duration={duration}ms"
+        cost = event.get("total_cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            self.cost_usd = (self.cost_usd or 0.0) + float(cost)
+            detail += f"; cost=${cost:.2f}"
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        for key, value in usage.items():
+            if isinstance(value, int):
+                self.tokens[key] = self.tokens.get(key, 0) + value
         rendered = [_line("result", detail)]
 
         result = event.get("result")

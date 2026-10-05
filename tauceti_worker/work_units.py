@@ -934,7 +934,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
-    rc = fn(w, sv, c, opts, bubble)
+    started, rc = time.time(), None
+    try:
+        rc = fn(w, sv, c, opts, bubble)
+    finally:
+        record_round_spend(w, sv, stage, c, started, rc)
     if stage in FILE_CHANGE_STAGES and not bubble:
         log_round_file_changes(w.cfg, pre_head)
     if stage == "roadmap" and getattr(w, "lookahead_session", None) is not None:
@@ -956,6 +960,47 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             declined=inc is not None,
         )
     return rc
+
+
+# What a round spent, for the fleet's budget pacing (tauceti-fleet: fallback_max_open = "auto"). One
+# JSON line per round in state/<id>/rounds.jsonl, which the fleet reads; trimmed past ROUNDS_KEEP lines.
+ROUNDS_LOG = "rounds.jsonl"
+ROUNDS_KEEP = 2000
+
+
+def round_kind(w, sv, stage: str, c) -> str:
+    """What a round spent its budget on: `target` (the operator's list: its items, lookahead sessions
+    and ports, and the fixes and reviews of PRs that serve it), `outside` (authoring outside the list,
+    and the fixes and reviews of the account's other PRs) or `shared` (other people's PRs, reports,
+    the list's own upkeep). Outside work is what the fleet throttles when the budget runs short."""
+    if stage == "roadmap":
+        return "target" if (getattr(w, "current_target", "") or getattr(w, "lookahead_session", None)) else "outside"
+    if stage in BRANCH_STAGES and stage != "bump":
+        return "target" if c.pr in target_list_prs(sv) else "outside"
+    if stage == "review" and c.pr:
+        p = next((x for x in getattr(sv, "open_prs", None) or [] if x.number == c.pr), None)
+        if p is not None and getattr(sv, "_mine_open_prs", None) and p in sv._mine_open_prs:
+            return "target" if c.pr in target_list_prs(sv) else "outside"
+    return "shared"
+
+
+def record_round_spend(w, sv, stage: str, c, started: float, rc) -> None:
+    """Append this round's line to state/<id>/rounds.jsonl; never raises."""
+    from .agents import ROUND_SPEND
+
+    try:
+        rec = {"ended_at": round(time.time(), 1), "started_at": round(started, 1), "stage": stage,
+               "kind": round_kind(w, sv, stage, c), "pr": c.pr or None, "rc": rc,
+               "provider": ROUND_SPEND.get("provider"), "cost_usd": ROUND_SPEND.get("cost_usd"),
+               "tokens": ROUND_SPEND.get("tokens") or None}
+        path = w.cfg.state / ROUNDS_LOG
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        if path.stat().st_size > 1_000_000:
+            lines = path.read_text().splitlines()[-ROUNDS_KEEP:]
+            path.write_text("\n".join(lines) + "\n")
+    except Exception as e:  # noqa: BLE001 - a spend record must never fail the round
+        log(f"round spend record: {e}")
 
 
 # --- the work units (each runs on the host by default, or in bubble with --bubble) ---
@@ -2548,6 +2593,23 @@ MAX_TARGET_ACQUIRES = 8  # claim.sh acquires per round — each is a git push ro
 # most this many open PRs: the project's backpressure rule stops authoring at MAX_OPEN_PRS, and a list
 # item that becomes eligible should find room for its PR. Owner's ruling, 2026-09-27.
 TARGETS_FALLBACK_MAX_OPEN = int(os.environ.get("TAUCETI_TARGETS_FALLBACK_MAX_OPEN", "6"))
+# With TAUCETI_FALLBACK_AUTO=1 the fleet paces that cap by its budget and writes it here for the next
+# round to read; a file older than FALLBACK_CAP_TTL is ignored and the environment's value applies.
+FALLBACK_CAP_FILE = "fallback-cap.json"
+FALLBACK_CAP_TTL = 1800
+
+
+def fallback_cap() -> tuple[int, bool]:
+    """(the outside-list cap for this round, whether it is the fleet's budget-paced one)."""
+    g = os.environ.get("TAUCETI_GATE_DIR", "").strip()
+    if g and os.environ.get("TAUCETI_FALLBACK_AUTO", "").strip() in ("1", "true", "yes", "on"):
+        try:
+            d = json.loads((Path(g) / FALLBACK_CAP_FILE).read_text())
+            if 0 <= time.time() - float(d["at"]) < FALLBACK_CAP_TTL:
+                return int(d["cap"]), True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return TARGETS_FALLBACK_MAX_OPEN, False
 MERGED_MARKER_SEARCH = '"tauceti-target:v1" in:body sort:updated-desc'
 CURATE_MERGED_LIMIT = 1000  # the curator's look-back: several days of marker-bearing merges
 
@@ -2909,12 +2971,14 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
         # Several authors can reach this point in the same minute; each one authoring outside the list
         # holds a slot until its round ends, so together they never take the count past the cap.
         others = _live_slots(w)
-        if n_ours + others >= TARGETS_FALLBACK_MAX_OPEN + 1:
+        cap, paced = fallback_cap()
+        how = " (budget-paced)" if paced else ""
+        if n_ours + others >= cap + 1:
             raise NoProgress(f"{e}; not authoring outside the list either ({n_ours} open PRs of ours"
-                             f"{f' + {others} being authored' if others else ''} > {TARGETS_FALLBACK_MAX_OPEN})") from None
+                             f"{f' + {others} being authored' if others else ''} > {cap}{how})") from None
         _hold_slot(w)
         log(f"roadmap: {e} — authoring outside the target list instead ({n_ours} open PRs of ours"
-            f"{f' + {others} being authored' if others else ''} ≤ {TARGETS_FALLBACK_MAX_OPEN})")
+            f"{f' + {others} being authored' if others else ''} ≤ {cap}{how})")
         return None
     if on and (plan := view.plans.get((area, item.slug))) is not None:
         w.lookahead_port = (plan, view)
