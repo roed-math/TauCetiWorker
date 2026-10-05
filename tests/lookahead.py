@@ -257,7 +257,7 @@ check("TAUCETI_TARGET_ONLY: an eligible item with a branch is ported", got is no
       and w.lookahead_port is not None)
 os.environ.pop("TAUCETI_TARGET_ONLY")
 
-os.environ.pop("TAUCETI_LOOKAHEAD")
+os.environ["TAUCETI_LOOKAHEAD"] = "0"  # a fleet without lookahead: it holds, it does not port or prove
 W._lookahead_view = lambda w, sv, live: view_for(live, {("Item", "eligible"): "e1"}, {"e1": fresh})
 w = worker()
 got = W._pick_target(w, sv, ELIG, Path("t.md"), "auto", [])
@@ -344,12 +344,13 @@ W._lookahead_view = lambda w, sv, live, fresh=False: view_for(
 for p in INCIDENTS.glob("lookahead-*.json"):
     p.unlink()
 W._lookahead_sweep(SimpleNamespace(gh=object()), None)
-check("the sweep deletes the branches of done items and of items no longer listed",
-      sorted(deleted) == [("Gone", "away"), ("Item", "on-flying"), ("Item", "on-ready")], str(deleted))
+check("the sweep deletes the branches of done items",
+      sorted(deleted) == [("Item", "on-flying"), ("Item", "on-ready")], str(deleted))
 check("a done item ported by its PRs is not an incident; one landed without them is",
       not (INCIDENTS / "lookahead-abandoned-Item-on-flying.json").exists()
-      and (INCIDENTS / "lookahead-abandoned-Item-on-ready.json").exists()
-      and (INCIDENTS / "lookahead-abandoned-Gone-away.json").exists())
+      and (INCIDENTS / "lookahead-abandoned-Item-on-ready.json").exists())
+check("a branch whose item is not on the list is listed for the owner, never deleted",
+      ("Gone", "away") not in deleted and (INCIDENTS / "lookahead-orphan-Gone-away.json").exists())
 check("a stale branch of an open item is listed, not deleted",
       ("Item", "on-stub") not in deleted and (INCIDENTS / "lookahead-stale-Item-on-stub.json").exists())
 deleted.clear()
@@ -357,6 +358,27 @@ W._lookahead_view = lambda w, sv, live, fresh=False: view_for(live, {("Item", "o
                                                              open_ports={(BO, 1): 778})
 W._lookahead_sweep(SimpleNamespace(gh=object()), None)
 check("a branch whose port PR is still open is kept", deleted == [])
+
+# ---- unset, nothing reaches GitHub (2026-10-04: a test's sweep deleted a real branch) ---------------------
+real_view, real_sweep_view = W._lookahead_view, None
+importlib_reloaded = __import__("importlib").reload(W)  # the real _lookahead_view, not this file's stand-ins
+os.environ.pop("TAUCETI_LOOKAHEAD", None)
+
+
+def boom(*_a, **_k):
+    raise AssertionError("GitHub reached with TAUCETI_LOOKAHEAD unset")
+
+
+W.ensure_fork = boom
+L.list_branches = boom
+L.delete_branch = boom
+W.interaction = interaction
+try:
+    view = W._lookahead_view(worker(), sv, live)
+    W._lookahead_sweep(SimpleNamespace(gh=object()), None)
+    check("TAUCETI_LOOKAHEAD unset: no fork resolution, listing or deletion", view is None)
+except AssertionError as e:
+    check("TAUCETI_LOOKAHEAD unset: no fork resolution, listing or deletion", False, str(e))
 
 # ---- the listing a fleet without lookahead reuses ------------------------------------------------------
 L.write_snapshot("alice/TauCeti", {("Item", "x"): "t1"}, {})

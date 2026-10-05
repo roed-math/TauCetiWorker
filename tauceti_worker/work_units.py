@@ -2748,7 +2748,7 @@ def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView
     headers of branches not seen before (cached by tip). Without lookahead, and unless `fresh`, a
     listing younger than lookahead.OFF_LISTING_TTL is reused instead. None without a GitHub client
     or when the branches cannot be listed; the round then neither holds, ports nor starts a session."""
-    if w.gh is None:
+    if w.gh is None or not lookahead.active():
         return None
     cached = None if (fresh or lookahead.enabled()) else lookahead.recent_snapshot(lookahead.OFF_LISTING_TTL)
     if cached is not None:
@@ -3342,13 +3342,13 @@ def _lookahead_outcome(w, rc: int) -> int:
 
 
 def _lookahead_sweep(w, sv) -> None:
-    """The curator's pass over the fork's lookahead branches, whatever the round's setting: a branch
-    whose item is done is deleted (after its last open port PR has closed), as is one whose item left
-    the list; a branch built on a main more than lookahead.STALE_DAYS old whose item is not done is
-    listed for the owner. Deletions that were not a finished port, and stale branches, are incidents;
-    every deletion is a history line. Never raises: the list's curation has already happened."""
+    """The curator's pass over the fork's lookahead branches, lookahead on or passive: a branch whose
+    item is done is deleted (after its last open port PR has closed); one whose item is not on the list,
+    and one built on a main more than lookahead.STALE_DAYS old whose item is not done, are listed for
+    the owner. A deletion that was not a finished port, and every listed branch, is an incident; every
+    deletion is a history line. Never raises: the list's curation has already happened."""
     path = roadmap_targets()
-    if path is None or w.gh is None:
+    if path is None or w.gh is None or not lookahead.active():
         return
     try:
         live, _n_in, _n_done = _live_target_view(load_targets(path), path, sv, w.gh)
@@ -3360,9 +3360,10 @@ def _lookahead_sweep(w, sv) -> None:
             branch = lookahead.branch_name(area, slug)
             plan = view.plans.get((area, slug))
             if it is None or it.area != area:
-                if lookahead.delete_branch(view.fork, area, slug, sha):
-                    lookahead.record("abandoned", area, slug, f"{branch} was deleted: `{slug}` is no longer on the list")
-                    lookahead.history("deleted", area, slug, reason="not on the list", tip=sha)
+                # Never deleted on this ground alone: a list that is stale, or not the fleet's (a test's),
+                # would otherwise delete real work.
+                lookahead.record("orphan", area, slug, f"{branch} names an item that is not on {path}: "
+                                 "delete the branch by hand if its item was dropped")
                 continue
             if it.status == "done":
                 if plan is not None and plan.opened:

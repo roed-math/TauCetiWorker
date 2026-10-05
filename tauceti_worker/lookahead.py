@@ -51,7 +51,16 @@ NOT_USED_RE = re.compile(r"^\W*Lookahead:\W*not used\W*(.*)$", re.I | re.M)
 
 
 def enabled() -> bool:
+    """Lookahead sessions and ports: `TAUCETI_LOOKAHEAD=1`."""
     return os.environ.get(ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def active() -> bool:
+    """Any lookahead machinery at all, the fork's branches listed: `TAUCETI_LOOKAHEAD` is set, to 1, or
+    to 0 for a fleet that only holds items for their port and sweeps finished branches (the fleet tool
+    always sets one of the two). Unset, nothing here touches GitHub: a test, or a hand-run `work`,
+    once deleted a real branch through the sweep (2026-10-04)."""
+    return bool(os.environ.get(ENV, "").strip())
 
 
 def _env_number(name: str, default: float) -> float:
@@ -463,8 +472,8 @@ def history(event: str, area: str, slug: str, **fields) -> None:
 def record(what: str, area: str, slug: str, detail: str, **fields) -> Path | None:
     """A `lookahead` incident `<what>-<area>-<slug>` for the fleet's attention list: failed (a session
     pushed nothing), held (a fleet without lookahead left an item for its port), skipped (the hold ran
-    out and the item was authored fresh), mismatch (the port could not use the branch), stale and
-    abandoned (the curator's sweep)."""
+    out and the item was authored fresh), mismatch (the port could not use the branch), and the
+    curator's sweep: stale, abandoned (deleted unused) and orphan (its item is not on the list)."""
     from .interaction import record_incident  # noqa: PLC0415 - interaction imports gate at load
 
     return record_incident(INCIDENT, f"{what}-{area}-{slug}", stage="lookahead", what=what,
