@@ -18,6 +18,10 @@ the hits too, keyed `(#N) name` and listed in `merged_prs_named`: that PR was no
 this item (it carries another target marker, or none), so check its declarations against the
 milestone as strictly as the rest.
 
+A candidate with `blocked_on` is one the list still shows waiting on those prerequisites. Judge it
+the same way: if `main` states the milestone, it has landed, whatever the list says about what comes
+before it.
+
 A hit that begins `Mathlib:` is in the checkout of the Mathlib commit TauCeti's `main` pins, at
 `mathlib_checkout`. A milestone Mathlib already provides in the stated generality has landed too:
 the project reuses Mathlib rather than duplicating it. Name the Mathlib file and declaration then.

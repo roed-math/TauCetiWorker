@@ -2,8 +2,8 @@
 """The curate stage end to end, offline: a target list with a merged PR, a closed-and-subsumed PR, a
 closed PR without a verdict, and an eligible open item whose identifiers a fake `main` declares.
 GitHub is a stub (PR states), the clone of main is a local git repository, the model is a stub that
-writes `verdicts.json` (one strict yes, one no). Checks: tier A rewrites the finished PRs, tier B puts
-only the fully-evidenced items to the model and marks the confirmed one `landed elsewhere`, the
+writes `verdicts.json` (strict yeses and noes). Checks: tier A rewrites the finished PRs, tier B puts
+only the fully-evidenced items to the model (an item still blocked on the list included) and marks the confirmed one `landed elsewhere`, the
 file is written, the `targets-updated` incident lists the changes, and a second run reports the list
 as current. Exit 0 = all hold; 1 = a mismatch."""
 
@@ -44,6 +44,9 @@ targets.write_text("""# targets
 - [ ] `half-there` — L1, "Prove `Gone.thing` and `alsoGone`." (serves: B2; needs: `merged-one`)
 - [ ] `not-landed` — L1, "Prove `frobeniusAlgEquiv`." (serves: B2; needs: `merged-one`)
 - [ ] `also-gone` — L1, "A milestone described in prose only." (serves: B2; needs: `merged-one`)
+- [ ] `blocked-pre` — L2, "Define `reductionFunctor`." (serves: B2; needs: none)
+- [ ] `defect-add` — L2, "Prove `defect_add`." (serves: B2; needs: `blocked-pre`)
+- [ ] `defect-missing` — L2, "Prove `defect_gone`." (serves: B2; needs: `blocked-pre`)
 """)
 os.environ["TAUCETI_ROADMAP_TARGETS"] = str(targets)
 
@@ -54,6 +57,7 @@ clone = TMP / "state" / "curate" / "TauCeti"
 (clone / "TauCeti" / "Frob.lean").write_text("def frobeniusAlgEquiv : Nat := 0\n")
 (clone / "TauCeti" / "Half.lean").write_text("def alsoGone : Nat := 0\n")  # `Gone.thing` is missing: not fully evidenced
 (clone / "TauCeti" / "Foo.lean").write_text("class IsFoo (K : Type) : Prop\n")  # what merged #101 provides
+(clone / "TauCeti" / "Defect.lean").write_text("@[simp] theorem defect_add : True := trivial\n")  # ahead of `blocked-pre`
 subprocess.run(["git", "-C", str(clone), "init", "-q"], check=True)
 subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
 subprocess.run(["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "main"], check=True)
@@ -72,11 +76,14 @@ asked = {}
 def fake_agent(cwd, prompt, profile, logdir):
     cand = json.loads((Path(cwd) / "candidates.json").read_text())
     asked["slugs"] = [c["slug"] for c in cand["candidates"]]
+    asked["blocked_on"] = {c["slug"]: c.get("blocked_on") for c in cand["candidates"]}
     asked["prompt_names_file"] = "verdicts.json" in prompt
     verdicts = {}
     for c in cand["candidates"]:
         if c["slug"] == "landed-by-others":
             verdicts[c["slug"]] = {"landed": True, "evidence": "TauCeti/Teich.lean:1 `Teich.omega` — states the section property"}
+        elif c["slug"] == "defect-add":
+            verdicts[c["slug"]] = {"landed": True, "evidence": "TauCeti/Defect.lean:1 `defect_add` — the additivity"}
         else:
             verdicts[c["slug"]] = {"landed": False, "evidence": "only a stub"}
     (Path(cwd) / "verdicts.json").write_text(json.dumps(verdicts))
@@ -125,15 +132,21 @@ check("tier A read each in-flight PR once", sorted(GH.calls) == [101, 102, 103],
 new = targets.read_text()
 check("merged and subsumed items are done", "- [x] `merged-one`" in new and "landed: #101" in new and "- [x] `subsumed-one`" in new and "subsumed by: #900; closed: #102" in new)
 check("the closed PR without a verdict is left in flight", "- [~] `closed-quiet`" in new)
-check("only evidenced eligible items went to the model", asked.get("slugs") == ["landed-by-others", "not-landed", "also-gone"], str(asked))
+check("only evidenced items went to the model, eligible ones first",
+      asked.get("slugs") == ["landed-by-others", "not-landed", "also-gone", "defect-add"], str(asked))
+check("a blocked item reaches the model marked with what it waits on",
+      asked.get("blocked_on", {}).get("defect-add") == ["blocked-pre"]
+      and asked.get("blocked_on", {}).get("landed-by-others") is None, str(asked.get("blocked_on")))
 check("an item whose slug names a declaration on main goes to the model even with no names in its text",
       "also-gone" in asked.get("slugs", []))
 check("the prompt tells the model where to write", asked.get("prompt_names_file") is True)
 check("the confirmed item is marked landed elsewhere with its evidence", "- [x] `landed-by-others`" in new and "landed elsewhere: TauCeti/Teich.lean:1" in new)
 check("the refused and half-evidenced items stay open", "- [ ] `not-landed`" in new and "- [ ] `half-there`" in new)
+check("a blocked item main already has is marked landed elsewhere",
+      "- [x] `defect-add`" in new and "- [ ] `blocked-pre`" in new and "- [ ] `defect-missing`" in new)
 inc = list((TMP / "incidents").glob("targets-updated-*.json"))
 rec = json.loads(inc[0].read_text()) if inc else {}
-check("a targets-updated incident lists the applied changes and the open question", len(inc) == 1 and len(rec.get("changes", [])) == 3 and len(rec.get("undecided", [])) == 1, str(rec)[:200])
+check("a targets-updated incident lists the applied changes and the open question", len(inc) == 1 and len(rec.get("changes", [])) == 4 and len(rec.get("undecided", [])) == 1, str(rec)[:200])
 check("the attempt timestamp is recorded", w.counters.read("curate-attempt-ts") > 0)
 
 # second run: nothing left to do, and the model is not asked again about `not-landed` (main unchanged)

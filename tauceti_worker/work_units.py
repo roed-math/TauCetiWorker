@@ -1572,6 +1572,26 @@ def _missing_on_main(clone: Path, it: TargetItem) -> list[str]:
     return lacking
 
 
+_DECL_NAME_RE = re.compile(
+    r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:protected|private|noncomputable|scoped)\s+)*"
+    r"(?:theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)\s+([^\s(:{\[]+)"
+)
+
+
+def _declared_names(clone: Path) -> set[str]:
+    """The last name component of every declaration under `TauCeti/`, the part `_grep_declarations`
+    matches, from one `git grep` of the whole tree."""
+    p = subprocess.run(
+        ["git", "-C", str(clone), "grep", "-hE", _DECL_RE_TEMPLATE.format(name="[^[:space:]]+"), "--", "TauCeti/"],
+        capture_output=True, text=True, timeout=120,
+    )
+    out = set()
+    for ln in (p.stdout or "").splitlines():
+        if m := _DECL_NAME_RE.match(ln):
+            out.add(m.group(1).rstrip(".").rsplit(".", 1)[-1])
+    return out
+
+
 def _grep_declarations(clone: Path, ident: str, subdir: str = "TauCeti/", *, ignore_case: bool = False) -> list[str]:
     name = ident.split(".")[-1]
     p = subprocess.run(
@@ -1707,9 +1727,8 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         log(f"curate: {ln}")
     # ---- tier B: what main already provides
     live, _n_in, _n_done = _live_target_view(parse_targets(new_text), path, sv, w.gh)
-    candidates: list[tuple[str, TargetItem]] = []
-    for area in live.areas:
-        candidates += [(area, it) for it in eligible_items(live, area)]
+    eligible = [(area, it) for area in live.areas for it in eligible_items(live, area)]
+    candidates: list[tuple[str, TargetItem]] = list(eligible)
     undecided_slugs = {re.match(r"`([^`]+)`", ln).group(1) for ln in undecided if re.match(r"`([^`]+)`", ln)}
     for area, items in live.areas.items():
         candidates += [(area, it) for it in items if it.slug in undecided_slugs and (area, it) not in candidates]
@@ -1719,7 +1738,14 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     declined_cands = [(area, it) for area, items in live.areas.items() for it in items
                       if it.status == "open" and it.slug in declined][:CURATE_MAX_CANDIDATES]
     candidates = [(a, it) for a, it in candidates if it.slug not in declined][:CURATE_MAX_CANDIDATES]
-    clone = main_clone() if (candidates or declined_cands) else None
+    # Items waiting on a listed prerequisite are never eligible, so one proved ahead of it (or past this
+    # curator's "not landed" verdict on the prerequisite) would stay open for good: kim-em's #11918 and
+    # #12036 landed three `lattice-defect-*` items under their own marker ids on 2026-10-05.
+    looked_at = {it.slug for _a, it in eligible} | undecided_slugs | set(declined)
+    blocked = [(area, it) for area, items in live.areas.items() for it in items
+               if it.status == "open" and it.slug not in looked_at]
+    blocked_slugs = {it.slug for _a, it in blocked}
+    clone = main_clone() if (candidates or declined_cands or blocked) else None
     with_evidence = []
     main_sha = ""
     memo_path = w.cfg.state / "curate" / "verdicts-memo.json"
@@ -1731,7 +1757,18 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             memo = json.loads(memo_path.read_text()) if memo_path.is_file() else {}
         except ValueError:
             memo = {}
-        for area, it in candidates:
+        declared = _declared_names(clone) if blocked else set()
+        declared_lower = {n.lower() for n in declared}
+        n_blocked = 0
+        for area, it in candidates + blocked:
+            is_blocked = it.slug in blocked_slugs
+            if is_blocked:
+                if n_blocked >= CURATE_MAX_CANDIDATES:
+                    continue
+                # The evidence test below, on names alone: most blocked items fail it, at no grep each.
+                names = [i.split(".")[-1] for i in item_identifiers(it)]
+                if not ((names and declared.issuperset(names)) or it.slug.replace("-", "").lower() in declared_lower):
+                    continue
             # A "not landed" verdict holds until main moves: do not pay the model twice for it.
             prior = memo.get(it.slug) or {}
             if prior.get("landed") is False and prior.get("main_sha") == main_sha:
@@ -1744,8 +1781,12 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             if (idents and all(hits.values())) or by_slug:
                 if by_slug:
                     hits[f"(slug) {it.slug}"] = by_slug
-                with_evidence.append({"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
-                                      "identifiers": list(hits), "hits": hits})
+                cand = {"slug": it.slug, "area": area, "text": it.text, "needs": it.needs,
+                        "identifiers": list(hits), "hits": hits}
+                if is_blocked:
+                    n_blocked += 1
+                    cand["blocked_on"] = [n for n in it.needs if (d := live.find(n)) is not None and d.status != "done"]
+                with_evidence.append(cand)
         mathlib = None
         for area, it in declined_cands:
             rec = declined[it.slug]
