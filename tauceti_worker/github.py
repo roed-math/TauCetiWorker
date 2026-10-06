@@ -495,6 +495,32 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
 }"""
 
 
+BORS_MERGED_PREFIX = "[Merged by Bors] - "
+
+
+def bors_merged(d: dict) -> bool:
+    """TauCeti merges through Bors since 2026-10-06: Bors squashes the PR onto main and closes it,
+    renamed `[Merged by Bors] - <title>`, so GitHub reports it CLOSED with no `mergedAt`."""
+    return d.get("state") == "CLOSED" and str(d.get("title") or "").startswith(BORS_MERGED_PREFIX)
+
+
+def normalize_merged(d: dict) -> dict:
+    """`d` with a Bors merge reported as GitHub reports any other merge: state MERGED, and `mergedAt`
+    the close time when the caller asked for it (and for `closedAt`)."""
+    if bors_merged(d):
+        d["state"] = "MERGED"
+        if "mergedAt" in d and not d["mergedAt"]:
+            d["mergedAt"] = d.get("closedAt")
+    return d
+
+
+def _with_merge_fields(fields: list[str]) -> list[str]:
+    """`fields` plus what `normalize_merged` reads: the title beside a state, the close time beside
+    a merge time."""
+    extra = [f for f, need in (("title", "state"), ("closedAt", "mergedAt")) if need in fields and f not in fields]
+    return list(fields) + extra
+
+
 def _pr_json_from_graphql(node: dict) -> dict:
     """One GraphQL PR node in `gh pr list --json` shape, so PRInfo.from_json stays the single place
     that decides what a PR's fields MEAN.
@@ -641,15 +667,23 @@ class GitHub:
 
     def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open",
                 search: str | None = None, limit: int = 200) -> list[dict]:
-        args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", str(limit), "--json", ",".join(fields)]
+        """`gh pr list`. `state="merged"` includes Bors merges: it lists closed PRs (as a search, where
+        `closed` covers merged ones too) and keeps the merged ones, so `limit` counts the closed ones."""
+        merged = state == "merged"
+        want = _with_merge_fields(list(fields) + (["state"] if merged and "state" not in fields else []))
+        args = ["pr", "list", "--repo", self.repo, "--state", "closed" if merged else state, "--limit", str(limit),
+                "--json", ",".join(want)]
         if author:
             args += ["--author", author]
-        if search:
-            args += ["--search", search]
+        if search or merged:
+            args += ["--search", search or "sort:updated-desc"]
         p = self._gh(args)
         if p.returncode != 0:
             raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
-        return json.loads(p.stdout or "[]")
+        rows = [normalize_merged(d) for d in json.loads(p.stdout or "[]")]
+        if merged:
+            rows = [d for d in rows if d.get("state") == "MERGED"]
+        return [{k: v for k, v in d.items() if k in fields} for d in rows]
 
     def issue_list(
         self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200
@@ -666,10 +700,12 @@ class GitHub:
         return json.loads(p.stdout or "[]")
 
     def pr_view(self, pr: int, fields: list[str]) -> dict | None:
-        p = self._gh(["pr", "view", str(pr), "--repo", self.repo, "--json", ",".join(fields)])
+        """`gh pr view`, with a Bors merge's state reported as MERGED (see `normalize_merged`)."""
+        p = self._gh(["pr", "view", str(pr), "--repo", self.repo, "--json", ",".join(_with_merge_fields(fields))])
         if p.returncode != 0:
             return None
-        return json.loads(p.stdout or "{}")
+        d = normalize_merged(json.loads(p.stdout or "{}"))
+        return {k: v for k, v in d.items() if k in fields}
 
     @staticmethod
     def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
