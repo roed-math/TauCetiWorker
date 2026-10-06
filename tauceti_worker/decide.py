@@ -12,7 +12,9 @@ The decide stage makes those rulings. Two tiers, host-side like the curator:
   A. mechanical, no model. The PR merged, closed, or moved to a new head since the decline: the record
      is stale. An authoring decline that names no target is noted (one with a target is the
      curator's). A `wait` ruling whose blockers have all moved on becomes a `retry` with a note for the
-     fixer saying what changed, or goes back for a new ruling if a blocker closed unmerged.
+     fixer saying what changed, or goes back for a new ruling if a blocker closed unmerged. A `roadmap`
+     or `escalate` ruling still waiting on the owner is stale once its PR merges or closes (an
+     escalation also once the PR moves to a new head).
   B. model. Each remaining decline is put to the model with the PR, its scoreboard and review
      threads, the fixer's own account, the open PRs, the target list and the roadmap and rubric
      checkouts. It answers in `decisions.json`, one ruling per PR:
@@ -71,6 +73,7 @@ from .attention import (
     STALE,
     WAIT,
     decided_waits,
+    owner_rulings,
     record_decision,
     reopen_decision,
     undecided_declines,
@@ -137,6 +140,11 @@ def _do_decide_inner(w, sv, opts) -> int | None:
         line = _recheck_wait(w, path, rec, open_by_no, targets)
         if line:
             ruled.append(line)
+    # ---- tier A: rulings left to the owner that the facts have overtaken
+    for path, rec in owner_rulings():
+        line = _recheck_owner_ruling(w, path, rec, open_by_no)
+        if line:
+            ruled.append(line)
     # ---- tier A: declines the facts have overtaken
     cases: list[tuple[Path, dict]] = []
     for path, rec in undecided_declines():
@@ -177,6 +185,25 @@ def _do_decide_inner(w, sv, opts) -> int | None:
 
 
 # ---- tier A: waits ---------------------------------------------------------------------------------------
+
+
+def _recheck_owner_ruling(w, path: Path, rec: dict, open_by_no: dict) -> str:
+    """Look again at a `roadmap` or `escalate` ruling still on the owner's list. A merged or closed PR
+    makes it stale, and so does a new head under an escalation: the fleet takes the PR up again there.
+    A roadmap ruling outlives a new head, since no push to the PR changes the roadmap."""
+    pr = rec["pr"]
+    st = _pr_state(w, pr, open_by_no)
+    if st is None:
+        return ""
+    state, head, _labels = st
+    kind = rec.get("decision")
+    if state != "OPEN":
+        record_decision(path, STALE, decision_note=f"#{pr} is {state.lower()} (its {kind} ruling was the owner's)")
+        return f"#{pr}: stale ({state.lower()} while its {kind} ruling waited on the owner)"
+    if kind == ESCALATE and head and head != rec.get("head"):
+        record_decision(path, STALE, decision_note=f"#{pr} moved to {head[:12]} since the escalation")
+        return f"#{pr}: stale (new head {head[:12]} since the escalation)"
+    return ""
 
 
 def _recheck_wait(w, path: Path, rec: dict, open_by_no: dict, targets) -> str:

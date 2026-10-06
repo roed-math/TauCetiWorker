@@ -326,6 +326,31 @@ try:
 except W.NoProgress:
     check("a round with nothing to rule on is no-progress", "prs" not in asked)
 
+# rulings left to the owner: stale once the PR merges or closes; an escalation also at a new head
+STATES.update({401: "MERGED", 402: "CLOSED"})
+live("fix-401", stage="fix", pr=401, head="h401", decision="roadmap", proposal="/x.md")
+live("fix-402", stage="fix", pr=402, head="h402", decision="escalate")
+live("fix-403", stage="fix", pr=403, head="h403-old", decision="escalate")
+live("fix-404", stage="fix", pr=404, head="h404-old", decision="roadmap")
+w.counters.d.clear()
+asked.clear()
+try:
+    D.do_decide(w, SimpleNamespace(open_prs=OPEN + [pr(403), pr(404)]), None, SimpleNamespace(), False)
+except W.NoProgress:
+    pass
+check(
+    "a roadmap ruling on a merged PR is stale",
+    (read("fix-401", INC / "acked") or {}).get("decision") == "stale" and read("fix-401") is None,
+)
+check("an escalation on a closed PR is stale", (read("fix-402", INC / "acked") or {}).get("decision") == "stale")
+check("an escalation on a PR that moved on is stale", (read("fix-403", INC / "acked") or {}).get("decision") == "stale")
+check("a roadmap ruling outlives a new head", (read("fix-404") or {}).get("decision") == "roadmap")
+check(
+    "owner rulings on open PRs at their head stay put",
+    (read("rebase-106") or {}).get("decision") == "roadmap" and (read("fix-109") or {}).get("decision") == "escalate",
+)
+check("rechecking owner rulings asks the model nothing", "prs" not in asked)
+
 # the per-round cap: with more declines than it allows, the oldest go first and the rest wait a round
 for n in (201, 202, 203):
     live(f"fix-{n}", stage="fix", pr=n, head=f"h{n}", first_at=f"2026-09-2{n - 200}T00:00:00Z")

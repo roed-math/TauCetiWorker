@@ -223,6 +223,20 @@ def decided_waits() -> list[tuple[Path, dict]]:
     return out
 
 
+def owner_rulings() -> list[tuple[Path, dict]]:
+    """Declines ruled `roadmap` or `escalate`: still in the live folder, on the owner's list."""
+    out: list[tuple[Path, dict]] = []
+    try:
+        paths = sorted(interaction.incidents_dir().glob(f"{DECLINED}-*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        rec = _read(path)
+        if rec is not None and rec.get("decision") in OWNER_DECISIONS and isinstance(rec.get("pr"), int):
+            out.append((path, rec))
+    return out
+
+
 def record_decision(path: Path, decision: str, **fields) -> Path | None:
     """Rule on a decline: write `decision` and its fields into the record, keep the earlier rulings on
     the same PR in `history`, and file it — under `acked/` unless the decision still needs the owner.
