@@ -1343,6 +1343,26 @@ class Quota:
             entry["valid_until"] = valid_until
         (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
 
+    def _log_usage_request(self, fp: str | None, status: int | None, retry_after: float | None,
+                           forced: bool, had_cache: bool, error: str = "") -> None:
+        """One line per Claude usage-endpoint request in `<cache>/usage-requests.jsonl`. The endpoint
+        answers 429 with hour-long Retry-After on single tokens (2026-10-06) and its limit is not
+        published; these lines give each token's request count before a 429. Never raises."""
+        rec = {"at": time.time(), "worker": os.environ.get("TAUCETI_WORKER_ID", ""), "fp": fp, "status": status,
+               "retry_after": retry_after, "forced": forced, "had_cache": had_cache,
+               "cmd": sys.argv[1] if len(sys.argv) > 1 else "", "pid": os.getpid()}
+        if error:
+            rec["error"] = error[:200]
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            p = self.cache_dir / "usage-requests.jsonl"
+            with open(p, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            if p.stat().st_size > 2_000_000:
+                p.write_text("\n".join(p.read_text().splitlines()[-10000:]) + "\n")
+        except Exception:  # noqa: BLE001 - a log line must never turn into a failed quota read
+            pass
+
     def _forget_raw(self, provider: str) -> None:
         """Drop a provider's cached payload so the next read must go to the network. Used after a
         bootstrap request: whatever we hold predates the request that was meant to change it."""
@@ -2095,7 +2115,9 @@ class Quota:
         try:
             code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
             observed_at = time.time()  # ONE instant for this response: parsed, paced and stored against it
+            self._log_usage_request(fp, code, retry_after, refresh, cached is not None)
         except GitHubError as e:
+            self._log_usage_request(fp, None, None, refresh, cached is not None, error=str(e))
             # Re-read rather than reusing the tuple from before the request: a usage fetch can block for
             # its whole timeout, and an entry that was live when we set out may have passed a reset it
             # describes while we waited.
