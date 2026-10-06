@@ -38,6 +38,14 @@ SESSION_WINDOW_S = 5 * 3600
 WEEK_WINDOW_S = 7 * 24 * 3600
 
 QUOTA_TTL = {"codex": 600, "claude": 3600}
+# How old a Claude reading may be when the endpoint refuses to answer (429, 5xx, network) and the worker
+# falls back on it. The usage endpoint rate-limits per token with waits of up to an hour, and reviewers'
+# tokens hit it several times a day (2026-10-06); with Codex out, a 1-hour bound idled them for the
+# whole wait. A reading still describes only the windows it was fetched in (valid_until applies).
+CLAUDE_FALLBACK_MAX_AGE = 6 * 3600
+# Added to a 429's Retry-After before the token asks again: requests made right as a shorter wait ran
+# out were answered with a fresh 3600 s wait in all five cases logged on 2026-10-05/06.
+USAGE_RETRY_MARGIN = 120
 
 # Tolerance on a Claude reset clock that reads as already elapsed. Inside it we still treat the window
 # as live (it is about to roll); beyond it the endpoint is describing a window that has already ended,
@@ -1292,7 +1300,7 @@ class Quota:
         raw = "|".join(p for p in parts if p)
         return hashlib.sha256(raw.encode()).hexdigest()[:16] if raw else None
 
-    def _cached_entry(self, provider: str, fp: str | None) -> dict | None:
+    def _cached_entry(self, provider: str, fp: str | None, max_age: float | None = None) -> dict | None:
         """The whole validated cache entry — {payload, fetched_at, ...} — for a caller that needs to know
         WHEN the payload was true, not just what it says. See _cached_raw for the payload alone."""
         p = self.cache_dir / f"quota-{provider}.json"
@@ -1312,7 +1320,7 @@ class Quota:
         # re-fetching is cheap and always correct, and this is the guarantee that time alone never buys
         # permission, so it holds with no margin.
         at = d.get("fetched_at")
-        if not _finite_num(at) or not 0 <= time.time() - at <= QUOTA_TTL[provider]:
+        if not _finite_num(at) or not 0 <= time.time() - at <= (QUOTA_TTL[provider] if max_age is None else max_age):
             return None
         # A payload may also carry its own expiry: the point at which it stops describing the windows
         # it was fetched for (the earliest reset clock in it). The TTL is a staleness bound, NOT a
@@ -1342,6 +1350,23 @@ class Quota:
         if valid_until is not None:
             entry["valid_until"] = valid_until
         (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
+
+    def _hold_usage(self, fp: str | None, retry_after: float | None) -> None:
+        """Record a 429's Retry-After for this token, plus USAGE_RETRY_MARGIN, in `<cache>/usage-hold.json`:
+        a request before it runs out is refused again, and every worker process sharing the cache waits."""
+        until = time.time() + (retry_after if retry_after else 300) + USAGE_RETRY_MARGIN
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            (self.cache_dir / "usage-hold.json").write_text(json.dumps({"fp": fp, "until": until}))
+        except Exception:  # noqa: BLE001 - a missing hold costs one refused request, never a failed read
+            pass
+
+    def _usage_hold(self, fp: str | None) -> float:
+        """Seconds left before this token may ask the usage endpoint again, or 0."""
+        d = _read_json_file(self.cache_dir / "usage-hold.json") if getattr(self, "cache_dir", None) else None
+        if not d or d.get("fp") != fp or not _finite_num(d.get("until")):
+            return 0.0
+        return max(0.0, float(d["until"]) - time.time())
 
     def _log_usage_request(self, fp: str | None, status: int | None, retry_after: float | None,
                            forced: bool, had_cache: bool, error: str = "") -> None:
@@ -2111,6 +2136,13 @@ class Quota:
             return self._from_cached_claude(cached)
         if not tok:
             return Provider("claude", False, None, error="no claude accessToken"), None
+        hold = self._usage_hold(fp)
+        if hold > 0:  # the endpoint's last 429 for this token has not run out: asking again would extend it
+            still = self._cached_claude(fp, max_age=CLAUDE_FALLBACK_MAX_AGE)
+            if still is not None:
+                return self._from_cached_claude(still)
+            return Provider("claude", False, None, error="claude usage HTTP 429 (usage endpoint rate-limited)",
+                            retry_after=hold), None
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
         try:
             code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
@@ -2121,7 +2153,7 @@ class Quota:
             # Re-read rather than reusing the tuple from before the request: a usage fetch can block for
             # its whole timeout, and an entry that was live when we set out may have passed a reset it
             # describes while we waited.
-            still = self._cached_claude(fp)
+            still = self._cached_claude(fp, max_age=CLAUDE_FALLBACK_MAX_AGE)
             if still is not None:
                 return self._from_cached_claude(still)
             return Provider("claude", False, None, error=str(e)), None
@@ -2131,7 +2163,9 @@ class Quota:
         # survives into. Always name the status code: an auth failure, a rate-limited endpoint and a
         # server error are different problems with different fixes, and none of them is "usage unknown".
         if code != 200 or not payload:
-            still = self._cached_claude(fp) if code != 401 else None
+            if code == 429:
+                self._hold_usage(fp, retry_after)
+            still = self._cached_claude(fp, max_age=CLAUDE_FALLBACK_MAX_AGE) if code != 401 else None
             if still is not None:
                 return self._from_cached_claude(still)
             err = f"claude usage HTTP {code}"
@@ -2172,7 +2206,7 @@ class Quota:
         notes, bootstrap_recorded = self._idle_notes(readings)
         return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded, now=at), readings
 
-    def _cached_claude(self, fp: str | None) -> tuple[dict, float] | None:
+    def _cached_claude(self, fp: str | None, max_age: float | None = None) -> tuple[dict, float] | None:
         """A cached usage payload WITH the instant it describes, or None when it must not be served.
         Validity is BOTH conditions: the payload is fully and safely interpretable, and the wall clock has
         not yet reached any reset it represents. `_cached_raw` enforces the stored expiry; re-deriving it
@@ -2183,8 +2217,9 @@ class Quota:
         The fetch time comes back with it because a usage figure is a statement about a MOMENT. Read at a
         later one it is only a lower bound — usage never falls inside a window — so pacing it against the
         present would let a payload that was over pace when taken drift into `under-pace` on nothing but
-        the clock. Callers classify it at this instant instead; see _claude_pass."""
-        entry = self._cached_entry("claude", fp)
+        the clock. Callers classify it at this instant instead; see _claude_pass. `max_age` replaces the
+        staleness bound (QUOTA_TTL) for a caller falling back because the endpoint would not answer."""
+        entry = self._cached_entry("claude", fp, max_age=max_age)
         payload = None if entry is None else entry.get("payload")
         fetched_at = None if entry is None else entry.get("fetched_at")
         if payload is None or not _finite_num(fetched_at):

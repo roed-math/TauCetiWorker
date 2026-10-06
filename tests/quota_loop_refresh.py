@@ -58,7 +58,7 @@ payload = {
     "seven_day": {"utilization": 1, "resets_at": reset_weekly},
 }
 q = tc.Quota.__new__(tc.Quota)
-q._cached_claude = lambda _fp: (payload, time.time())
+q._cached_claude = lambda _fp, **_: (payload, time.time())
 q._idle_notes = lambda _readings: ({}, False)
 stores = []
 q._store_raw = lambda *args: stores.append(args)
@@ -95,7 +95,7 @@ stale = {
     "seven_day": {"utilization": 1, "resets_at": reset_weekly},
 }
 fetched_at = time.time() - 3599  # as old as the TTL allows
-q._cached_claude = lambda _fp: (stale, fetched_at)
+q._cached_claude = lambda _fp, **_: (stale, fetched_at)
 at_fetch = tc._classify_window("session", 30, 40, None, False).status
 if_reinterpreted = tc._classify_window("session", 30, 60, None, False).status
 frozen, _ = q._claude_pass("fp", "token")  # the ordinary cached read: one-shot `work`, status, dashboard
@@ -113,7 +113,7 @@ print(
     f"cached={[w.status for w in frozen.windows]!r} fallback_available={stale_fallback.available!r} "
     f"(fresh at that elapsed would be {if_reinterpreted!r})"
 )
-q._cached_claude = lambda _fp: (payload, time.time())
+q._cached_claude = lambda _fp, **_: (payload, time.time())
 
 # The fallback after a failed forced refresh must RE-READ the cache rather than reuse what it validated
 # BEFORE the request. A usage fetch can block for its whole timeout, and an entry that was live when we
@@ -123,7 +123,7 @@ reads = []
 
 
 def serving(entries):
-    def _cached(_fp):
+    def _cached(_fp, **_):
         reads.append(1)
         return entries.pop(0) if entries else None
 
@@ -136,7 +136,7 @@ expired_mid_flight, _ = q._claude_pass("fp", "token", refresh=True)
 q._cached_claude = serving([None, (payload, time.time())])  # the other order: a concurrent writer filled it
 appeared_mid_flight, _ = q._claude_pass("fp", "token", refresh=True)
 tc.quota._http_get_json = saved_http
-q._cached_claude = lambda _fp: (payload, time.time())
+q._cached_claude = lambda _fp, **_: (payload, time.time())
 race_ok = (
     len(reads) == 4  # two reads per pass: once before the request, once in the fallback
     and not expired_mid_flight.available
