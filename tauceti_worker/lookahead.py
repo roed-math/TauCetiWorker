@@ -29,7 +29,6 @@ from .config import log
 from .targets import TargetItem, Targets
 
 ENV = "TAUCETI_LOOKAHEAD"
-MAX_BRANCHES_ENV = "TAUCETI_LOOKAHEAD_MAX_BRANCHES"
 HOLD_HOURS_ENV = "TAUCETI_LOOKAHEAD_HOLD_HOURS"
 # Exported for a lookahead session only: git-safe-push then pushes nothing but this branch, and
 # gh-safe-pr-create refuses outright.
@@ -38,7 +37,6 @@ BRANCH_ENV = "TAUCETI_LOOKAHEAD_BRANCH"
 # while it is blocked or as a port once it is eligible, and never anything else instead.
 TARGET_ONLY_ENV = "TAUCETI_TARGET_ONLY"
 PREFIX = "lookahead/"
-DEFAULT_MAX_BRANCHES = 4
 STALE_DAYS = 7
 DEFAULT_HOLD_HOURS = 6
 OFF_LISTING_TTL = 1800  # see recent_snapshot
@@ -74,10 +72,6 @@ def _env_number(name: str, default: float) -> float:
 
 def target_only() -> str:
     return os.environ.get(TARGET_ONLY_ENV, "").strip()
-
-
-def max_branches() -> int:
-    return max(0, int(_env_number(MAX_BRANCHES_ENV, DEFAULT_MAX_BRANCHES)))
 
 
 def hold_hours() -> float:
@@ -292,6 +286,12 @@ class PortPlan:
     @property
     def next(self) -> Split | None:
         return self.ready[0] if self.ready else None
+
+
+def spent(plan: "PortPlan") -> bool:
+    """Every split of a complete branch has merged: it has nothing left to give, whatever its item's
+    state, and is neither offered for porting nor kept."""
+    return plan.header.complete and not plan.opened and all(s.n in plan.merged for s in plan.header.splits)
 
 
 def port_plan(branch: str, header: Header, open_ports: dict[tuple[str, int], int],

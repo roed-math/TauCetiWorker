@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import gate as gate_mod
@@ -2790,13 +2790,12 @@ from . import constants as _constants  # noqa: E402 - ROUND_TIMEOUT for the fall
 
 
 FALLBACK_SLOTS = "fallback-authoring"
-LOOKAHEAD_SLOTS = "lookahead-sessions"
 
 
 def _slot_dir(name: str) -> Path | None:
-    """Where fleet workers record a round in progress of one kind (authoring outside the target list,
-    a lookahead session): beside the shared gate store, so every worker of one fleet sees every other.
-    None outside a fleet (no gate)."""
+    """Where fleet workers record a round in progress of one kind (authoring outside the target list):
+    beside the shared gate store, so every worker of one fleet sees every other. None outside a fleet
+    (no gate)."""
     g = os.environ.get("TAUCETI_GATE_DIR", "").strip()
     return Path(g) / name if g else None
 
@@ -2844,6 +2843,7 @@ class _LookaheadView:
     plans: dict[tuple[str, str], lookahead.PortPlan]
     ready: list[tuple[str, TargetItem]]  # in-flight items with another split ready to port
     open_item_prs: dict[tuple[str, str], set[int]]  # (area, slug) -> the open PRs carrying its marker
+    spent: set = field(default_factory=set)  # (area, slug) of branches whose every split has merged
 
 
 def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView | None:
@@ -2886,9 +2886,12 @@ def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView
         for key, sha in branches.items()
         if sha in headers
     }
+    spent = {key for key, plan in plans.items() if lookahead.spent(plan)}
+    plans = {key: plan for key, plan in plans.items() if key not in spent}  # the curator deletes them
     if cached is None:
         lookahead.write_snapshot(fork, branches, headers)
-    return _LookaheadView(fork, branches, headers, plans, lookahead.port_ready(live, plans, open_item_prs), open_item_prs)
+    return _LookaheadView(fork, branches, headers, plans, lookahead.port_ready(live, plans, open_item_prs), open_item_prs,
+                          spent)
 
 
 def _area_ok(area: str, only: str, skip: list[str]) -> bool:
@@ -2926,8 +2929,7 @@ def _without_held(candidates: list[tuple[str, TargetItem]], view: _LookaheadView
 def _claim_lookahead(w, live: Targets, view: _LookaheadView, only: str, skip: list[str]) -> lookahead.Candidate | None:
     """The blocked item this round proves ahead (lookahead.candidates), claimed under
     `lookahead/<area>/<slug>` so it never collides with the item's author claim; None when there is
-    none. A new branch is started only while fewer than lookahead.max_branches() are live or being
-    built by this fleet's other workers; resuming a partial branch is always allowed."""
+    none. There is no cap on live branches (owner, 2026-10-07): the candidate rule bounds them."""
     from .attention import declined_targets
 
     failed = {it.slug for area, items in live.areas.items() for it in items
@@ -2936,11 +2938,6 @@ def _claim_lookahead(w, live: Targets, view: _LookaheadView, only: str, skip: li
                                  headers=view.headers, failed=failed)
     if lookahead.target_only():
         cands = [c for c in cands if c.item.slug == lookahead.target_only()]
-    building = len(view.branches) + _live_slots(w, LOOKAHEAD_SLOTS)
-    cap = lookahead.max_branches()
-    if building >= cap and any(not c.resume for c in cands):
-        log(f"lookahead: {building} branch(es) live or being built (cap {cap}) — only a partial branch may be resumed")
-        cands = [c for c in cands if c.resume]
     if not cands:
         log("lookahead: no blocked item qualifies (each waits on a supplier that is not yet in flight or eligible, "
             "is unsettled, or already has a complete branch)")
@@ -2952,7 +2949,6 @@ def _claim_lookahead(w, live: Targets, view: _LookaheadView, only: str, skip: li
         if rc == 1:
             log(f"lookahead {c.area}/{c.item.slug} held by another worker — trying the next")
             continue
-        _hold_slot(w, LOOKAHEAD_SLOTS)
         return c
     return None
 
@@ -3463,6 +3459,12 @@ def _lookahead_sweep(w, sv) -> None:
         for (area, slug), sha in sorted(view.branches.items()):
             it = live.find(slug)
             branch = lookahead.branch_name(area, slug)
+            if (area, slug) in view.spent:
+                # Every split merged: the branch has nothing left, whether or not its item is done.
+                if lookahead.delete_branch(view.fork, area, slug, sha):
+                    log(f"lookahead: {branch} deleted — every split of its plan has merged")
+                    lookahead.history("deleted", area, slug, reason="spent", tip=sha)
+                continue
             plan = view.plans.get((area, slug))
             if it is None or it.area != area:
                 # Never deleted on this ground alone: a list that is stale, or not the fleet's (a test's),

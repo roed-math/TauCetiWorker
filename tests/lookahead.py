@@ -9,8 +9,8 @@ when the supplier lands. Offline checks:
   * port plans: a split is ready once the splits it needs have merged, and an in-flight item is offered
     for porting only while every open PR carrying its marker is one of its port PRs (owner's ruling:
     no waiting for merges between independent splits);
-  * `_pick_target`: lookahead first when nothing on the list can be taken (owner's ruling), the branch
-    cap, the port plan handed to do_roadmap, and without lookahead the hold and its expiry;
+  * `_pick_target`: lookahead first when nothing on the list can be taken (owner's ruling), no cap on
+    live branches, the port plan handed to do_roadmap, and without lookahead the hold and its expiry;
   * a session's outcome is its branch: moved = pushed, unmoved = a `failed` incident and a pause;
   * the port section names the split, the marker and whether the target marker is partial;
   * the curator's sweep deletes the branch of a done item and reports the rest;
@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO / "tests" / "fakes"))
 from harness import gate_env, scrub_env  # noqa: E402
 
 scrub_env()
-for var in ("TAUCETI_LOOKAHEAD", "TAUCETI_LOOKAHEAD_MAX_BRANCHES", "TAUCETI_LOOKAHEAD_HOLD_HOURS",
+for var in ("TAUCETI_LOOKAHEAD", "TAUCETI_LOOKAHEAD_HOLD_HOURS",
             "TAUCETI_LOOKAHEAD_BRANCH", "TAUCETI_TARGET_ONLY", "TAUCETI_ROADMAP_TARGETS"):
     os.environ.pop(var, None)
 TMP = Path(tempfile.mkdtemp(prefix="lookahead-"))
@@ -133,6 +133,10 @@ plan = L.port_plan(B, H3, {(B, 2): 502}, {(B, 1): 501})
 check("the last split waits for every other merge", plan.ready == [])
 plan = L.port_plan(B, H3, {}, {(B, 1): 501, (B, 2): 502, ("lookahead/Other/y", 3): 9})
 check("all others merged: the last split is ready; other branches' markers are ignored", [s.n for s in plan.ready] == [3])
+check("not spent while a split is unmerged", not L.spent(plan))
+check("spent once every split has merged", L.spent(L.port_plan(B, H3, {}, {(B, 1): 501, (B, 2): 502, (B, 3): 503})))
+check("a partial branch is never spent", not L.spent(L.port_plan(B, L.parse_header(header("Item", "on-flying", status="partial")),
+                                                                 {}, {(B, 1): 501})))
 
 LIVE2 = parse_targets(TEXT.replace("- [~] `flying` — L1, \"In flight.\" (serves: B1; needs: none; in flight: #10)",
                                    "- [x] `flying` — L1, \"Landed.\" (serves: B1; needs: none; landed: #10)"))
@@ -182,8 +186,10 @@ def view_for(t, branches=None, headers=None, open_ports=None, merged_ports=None,
     branches, headers = branches or {}, headers or {}
     plans = {k: L.port_plan(L.branch_name(*k), headers[sha], open_ports or {}, merged_ports or {})
              for k, sha in branches.items() if sha in headers}
+    spent = {k for k, plan in plans.items() if L.spent(plan)}
+    plans = {k: plan for k, plan in plans.items() if k not in spent}
     return W._LookaheadView("alice/TauCeti", branches, headers, plans,
-                            L.port_ready(t, plans, open_item_prs or {}), open_item_prs or {})
+                            L.port_ready(t, plans, open_item_prs or {}), open_item_prs or {}, spent)
 
 
 def worker(claims=None, wid="gqw-c1"):
@@ -204,17 +210,12 @@ check("nothing eligible: a lookahead session before authoring outside the list",
 w = worker(Claims(held={"lookahead/Item/on-ready"}))
 W._pick_target(w, sv, BLOCKED, Path("t.md"), "auto", [])
 check("a candidate another worker holds is passed over", w.lookahead_session[0].item.slug == "blocked-sup")
-os.environ["TAUCETI_LOOKAHEAD_MAX_BRANCHES"] = "1"
-W._lookahead_view = lambda w, sv, live: view_for(live, {("Sup", "x"): "s1"}, {"s1": L.parse_header(header("Sup", "x"))})
-w = worker()
-check("at the branch cap no new session starts: outside the list instead",
-      W._pick_target(w, sv, BLOCKED, Path("t.md"), "auto", []) is None and w.lookahead_session is None)
-W._lookahead_view = lambda w, sv, live: view_for(live, {("Item", "on-flying"): "p1"}, {"p1": ph})
+W._lookahead_view = lambda w, sv, live: view_for(live, {("Sup", f"x{i}"): f"s{i}" for i in range(6)},
+                                                 {f"s{i}": L.parse_header(header("Sup", f"x{i}")) for i in range(6)})
 w = worker()
 W._pick_target(w, sv, BLOCKED, Path("t.md"), "auto", [])
-check("at the cap a partial branch may still be resumed",
-      w.lookahead_session is not None and w.lookahead_session[0].resume == "p1", str(w.lookahead_session))
-os.environ.pop("TAUCETI_LOOKAHEAD_MAX_BRANCHES")
+check("no cap on live branches: six live, a session still starts", w.lookahead_session is not None
+      and w.lookahead_session[0].item.slug == "on-ready", str(w.lookahead_session))
 
 # an eligible item with a branch: ported (lookahead on), held (off)
 ELIG = parse_targets(TEXT.replace("- [ ] `ready` —", "- [~] `ready` —").replace("- [ ] `unsettled-sup` —", "- [~] `unsettled-sup` —"))
@@ -358,6 +359,14 @@ W._lookahead_view = lambda w, sv, live, fresh=False: view_for(live, {("Item", "o
                                                              open_ports={(BO, 1): 778})
 W._lookahead_sweep(SimpleNamespace(gh=object()), None)
 check("a branch whose port PR is still open is kept", deleted == [])
+W.load_targets = lambda path: parse_targets(TEXT)  # on-stub still open
+SB = "lookahead/Item/on-stub"
+W._lookahead_view = lambda w, sv, live, fresh=False: view_for(live, {("Item", "on-stub"): "z1"}, {"z1": L.parse_header(header("Item", "on-stub"))},
+                                                             merged_ports={(SB, 1): 900})
+W._lookahead_sweep(SimpleNamespace(gh=object()), None)
+check("a spent branch is deleted though its item is still open", deleted == [("Item", "on-stub")], str(deleted))
+check("…and is offered to no port round", "on-stub" not in str(view_for(parse_targets(TEXT), {("Item", "on-stub"): "z1"},
+      {"z1": L.parse_header(header("Item", "on-stub"))}, merged_ports={(SB, 1): 900}).plans))
 
 # ---- unset, nothing reaches GitHub (2026-10-04: a test's sweep deleted a real branch) ---------------------
 real_view, real_sweep_view = W._lookahead_view, None
