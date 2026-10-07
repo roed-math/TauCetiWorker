@@ -95,6 +95,7 @@ RUN_STDLIB=(
   identity_gate.py
   ignore_quota_hardblock.py
   infra_failure_budget.py
+  setup_failure_budget.py
   inflight_review.py
   isolate_home_macos.py
   isolate_home_paths.py

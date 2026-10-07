@@ -34,6 +34,7 @@ from .constants import (
     MAX_REVIEW_CONTESTS,
     MAX_REVIEW_CONTESTS_PER_RUBRIC,
     MAX_REVIEW_ERRORS,
+    MAX_SETUP_FAILURES,
     NEXT_ELIGIBLE_COUNTER,
     PROGRESS,
     PROGRESS_ATTEMPT_GAP,
@@ -48,7 +49,7 @@ from .constants import (
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
-from .interaction import contest_max_exchanges
+from .interaction import clear_stale_budget_spent, contest_max_exchanges, note_budget_spent
 from .lookahead import port_markers
 from .review_state import Meta, ReviewState
 
@@ -712,6 +713,7 @@ def survey(
     if rs is not None:
         rs.observe(prs)
     nondraft = [p for p in prs if not p.is_draft]
+    clear_stale_budget_spent({p.number: p.head_oid for p in prs})
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
@@ -758,7 +760,16 @@ def survey(
             c.reason = "declined at this head (see the attention list); waits for a new head"
             sv.rebaseable.suppressed.append(c)
             continue
-        (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
+        if c.attempts >= c.budget:
+            sv.rebaseable.suppressed.append(c)
+            note_budget_spent("rebase", p.number, p.head_oid,
+                              f"rebase attempts are spent ({c.attempts}/{c.budget} on the PR) — needs a human")
+        elif spent := _setup_spent(counters, p):
+            c.reason = spent
+            sv.rebaseable.suppressed.append(c)
+            note_budget_spent("rebase", p.number, p.head_oid, spent)
+        else:
+            sv.rebaseable.actionable.append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
     #    or an errored round → normal review; no round budget here, CI retires a non-converging PR),
@@ -878,6 +889,11 @@ def survey(
                 continue
             if disp == "actionable" and (p.number, p.head_oid) in declined["fix"]:
                 disp, why = "exhausted", "a fixer declined at this head (see the attention list); waits for a new head"
+            elif disp == "actionable" and (spent := _setup_spent(counters, p)):
+                disp, why = "exhausted", spent
+                note_budget_spent("fix", p.number, p.head_oid, why)
+            elif disp == "exhausted":
+                note_budget_spent("fix", p.number, p.head_oid, why)
             if disp == "actionable":
                 c = Candidate(
                     p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
@@ -906,6 +922,13 @@ def survey(
             sv.red_ci.suppressed.append(c)
         elif per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
             sv.red_ci.suppressed.append(c)
+            note_budget_spent("fix-ci", p.number, p.head_oid,
+                              f"build red, but fix-ci attempts are spent ({per_head}/{MAX_CI_ATTEMPTS} at "
+                              f"this head, {per_pr}/{MAX_CI_PR_ATTEMPTS} on the PR) — needs a human")
+        elif spent := _setup_spent(counters, p):
+            c.reason = spent
+            sv.red_ci.suppressed.append(c)
+            note_budget_spent("fix-ci", p.number, p.head_oid, spent)
         else:
             sv.red_ci.actionable.append(c)
 
@@ -948,6 +971,16 @@ def survey(
 
     sv.next_auto_stage = _next_auto_stage(sv)
     return sv
+
+
+def _setup_spent(counters, p) -> str | None:
+    """Why this head is retired for rounds that died before the agent started, or None while it has
+    setup budget left (see work_units._shift_setup_failure)."""
+    n = counters.read(f"setup-{p.number}-{p.head_oid[:12]}")
+    if n < MAX_SETUP_FAILURES:
+        return None
+    return (f"{n}/{MAX_SETUP_FAILURES} rounds at this head died before the agent started (pre-agent setup; "
+            "see the agent logs) — needs a human")
 
 
 def _next_auto_stage(sv: Survey) -> str | None:

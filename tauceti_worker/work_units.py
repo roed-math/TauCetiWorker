@@ -36,6 +36,7 @@ from .agents import (
     run_in_bubble,
     run_to_logfile,
     take_last_agent_infra_failure,
+    take_last_agent_setup_failure,
     validate_kiro_model_access,
     wrapper_bin,
 )
@@ -60,6 +61,7 @@ from .constants import (
     CURATE_MAX_CANDIDATES,
     EX_NOPROGRESS,
     MAX_INFRA_REFUNDS,
+    MAX_SETUP_FAILURES,
     MAX_OPEN_PRS,
     NEXT_ELIGIBLE_COUNTER,
     OPENROUTER_MODELS,
@@ -1274,6 +1276,27 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     raise NoProgress(f"{label} #{c.pr}: {reason} — not charged to the PR, will retry after back-off")
 
 
+def _shift_setup_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
+    """A round that died in its pre-agent setup hands back every counter it charged and spends the
+    head's setup budget (MAX_SETUP_FAILURES) instead. The stage budgets stop re-running an agent on work
+    it cannot change, and this agent never saw the PR: TauCeti#11891 lost all six fixers' attempts in
+    seven hours to a Lake fetch the auth proxy refused, without one agent turn.
+
+    Unlike _refund_infra_failure this does not pause the loop. The cause may be this PR's own checkout,
+    so other PRs still get their rounds, and the survey retires this head once its setup budget is spent.
+    """
+    reason = take_last_agent_setup_failure()
+    if not reason:
+        return
+    for key in charged:
+        w.counters.write(key, max(0, w.counters.read(key) - 1))
+    n = w.counters.incr(f"setup-{c.pr}-{c.head[:12]}")
+    log(
+        f"  {label} #{c.pr}: {reason} — the agent never started, so this attempt is not charged "
+        f"(setup failure {n}/{MAX_SETUP_FAILURES} at this head)"
+    )
+
+
 def _do_fixlike(
     w: Worker,
     sv: Survey,
@@ -1358,6 +1381,7 @@ def _do_fixlike(
     if rc == 0:
         w.rs.bust(pr)
     else:
+        _shift_setup_failure(w, c, label, charged)
         _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
 

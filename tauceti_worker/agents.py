@@ -30,6 +30,7 @@ from .constants import (
     CODEX_MODEL_ACCESS_TTL,
     OPENROUTER_MODELS,
     PI_RUN,
+    PRE_AGENT_SETUP_FAILED,
     REVIEW,
     REVIEW_DAILY_CAP,
     ROADMAP,
@@ -851,6 +852,10 @@ def classify_agent_failure(text: str) -> str | None:
 # and it keeps run_agent_proc's `-> int` contract intact for its several callers. Written on every
 # non-zero exit, including the bubble path, which funnels through the same function.
 _LAST_AGENT_FAILURE: str | None = None
+# Set instead of _LAST_AGENT_FAILURE when the round died in bubble_work_cmd's pre-agent setup: the agent
+# never started, but unlike a provider outage the cause may be this PR's own checkout (TauCeti#11891 had
+# no refs/pull/N/head, so bubble prepared no Lake mirrors and every round died the same way).
+_LAST_AGENT_SETUP_FAILURE: str | None = None
 # What this round's agents reported spending (see AgentTranscriptRenderer.cost_usd / tokens); a round is
 # its own process, so this is per round. work_units records it with the round (round_spend).
 ROUND_SPEND: dict = {"cost_usd": None, "tokens": {}, "provider": None}
@@ -862,6 +867,14 @@ def take_last_agent_infra_failure() -> str | None:
     caller must not be able to spend the same one twice."""
     global _LAST_AGENT_FAILURE
     reason, _LAST_AGENT_FAILURE = _LAST_AGENT_FAILURE, None
+    return reason
+
+
+def take_last_agent_setup_failure() -> str | None:
+    """Why the last agent subprocess never started (its pre-agent setup failed), or None. Reads AND
+    CLEARS, like take_last_agent_infra_failure."""
+    global _LAST_AGENT_SETUP_FAILURE
+    reason, _LAST_AGENT_SETUP_FAILURE = _LAST_AGENT_SETUP_FAILURE, None
     return reason
 
 
@@ -880,8 +893,10 @@ def run_agent_proc(
     the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
     failures aren't silent.
     """
-    global _LAST_AGENT_FAILURE
+    global _LAST_AGENT_FAILURE, _LAST_AGENT_SETUP_FAILURE
     _LAST_AGENT_FAILURE = None
+    _LAST_AGENT_SETUP_FAILURE = None
+    setup_failed = False
     cwds = str(cwd) if cwd is not None else None
     # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
     # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
@@ -900,6 +915,7 @@ def run_agent_proc(
         tail.extend(rendered.splitlines())
 
     def run_rendered(destination) -> int:
+        nonlocal setup_failed
         proc = subprocess.Popen(
             argv,
             cwd=cwds,
@@ -914,6 +930,8 @@ def run_agent_proc(
         assert proc.stdout is not None
         try:
             for line in proc.stdout:
+                if line.strip() == PRE_AGENT_SETUP_FAILED:
+                    setup_failed = True
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
@@ -933,6 +951,14 @@ def run_agent_proc(
         ROUND_SPEND["provider"] = ROUND_SPEND["provider"] or provider
         return rc
 
+    def classify_setup_failure() -> bool:
+        # The agent's own output could quote the line, so a structured event means it ran.
+        global _LAST_AGENT_SETUP_FAILURE
+        if setup_failed and not renderer.active:
+            _LAST_AGENT_SETUP_FAILURE = "pre-agent setup failed (Mathlib cache)"
+            return True
+        return False
+
     def classify_rendered_failure() -> str | None:
         # A refund asserts that the agent never ran. Structured work events are stronger evidence
         # than transcript length, while a final structured provider diagnostic is stronger evidence
@@ -947,7 +973,7 @@ def run_agent_proc(
     if os.environ.get("TAUCETI_STREAM"):
         rc = run_rendered(sys.stdout)
         if rc != 0:
-            _LAST_AGENT_FAILURE = classify_rendered_failure()
+            _LAST_AGENT_FAILURE = None if classify_setup_failure() else classify_rendered_failure()
             report_failure(f"{label.removeprefix('agent-')} agent exited with status {rc}", code=rc)
         return rc
     logdir.mkdir(parents=True, exist_ok=True)
@@ -963,7 +989,7 @@ def run_agent_proc(
         reason = f"{label.removeprefix('agent-')} agent exited with status {rc}"
         if summary:
             reason += f": {summary}"
-        _LAST_AGENT_FAILURE = classify_rendered_failure()
+        _LAST_AGENT_FAILURE = None if classify_setup_failure() else classify_rendered_failure()
         report_failure(reason, code=rc, log_file=logf)
     return rc
 
@@ -1464,7 +1490,9 @@ def bubble_work_cmd(inner: str) -> str:
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     return (
         "set -e; "
-        "lake exe cache get || lake exe cache get; "
+        "if ! { lake exe cache get || lake exe cache get; }; then "
+        f"echo {_shq(PRE_AGENT_SETUP_FAILED)} >&2; exit 1; "
+        "fi; "
         'tc_log="$(mktemp)"; tc_hit=0; tc_cold=0; '
         # Two attempts, because a dropped connection is worth one retry, but stop immediately when
         # Lake reports the revision simply is not cached: retrying cannot change that answer.

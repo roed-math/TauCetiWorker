@@ -106,6 +106,39 @@ def record_incident(kind: str, key: str, **fields) -> Path | None:
         return None
 
 
+BUDGET_SPENT = "budget-spent"
+ACKED = "acked"  # the fleet moves an acknowledged incident here (tauceti-fleet `attention --ack`)
+
+
+def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:
+    """Report that `stage` has spent its budget on PR `pr` at `head` and the PR waits for a human.
+
+    The survey sees the same exhausted head every round, so only the first sighting writes, and an
+    acknowledged record stays acknowledged. Without this the only trace was a `fix_waiting` line in one
+    worker's log: TauCeti#11891 sat two days with every fixer spent and nothing in the fleet's view."""
+    name = f"{BUDGET_SPENT}-{_safe(f'{stage}-{pr}-{head[:12]}')}.json"
+    if (incidents_dir() / name).exists() or (incidents_dir() / ACKED / name).exists():
+        return
+    record_incident(BUDGET_SPENT, f"{stage}-{pr}-{head[:12]}", stage=stage, pr=pr, head=head,
+                    url=f"https://github.com/TauCetiProject/TauCeti/pull/{pr}", detail=detail)
+
+
+def clear_stale_budget_spent(open_heads: dict[int, str]) -> None:
+    """Delete live budget-spent records whose PR has closed or moved to a new head (a push starts a
+    fresh budget). `open_heads` maps EVERY open PR to its head; pass it only from a complete listing."""
+    try:
+        paths = list(incidents_dir().glob(f"{BUDGET_SPENT}-*.json"))
+    except OSError:
+        return
+    for p in paths:
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if open_heads.get(d.get("pr")) != d.get("head"):
+            p.unlink(missing_ok=True)
+
+
 def list_incidents() -> list[dict]:
     d = incidents_dir()
     out = []

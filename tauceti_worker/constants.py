@@ -32,6 +32,13 @@ MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an
 # the budget starts charging anyway. Not a cost control — the escalating loop back-off already caps
 # retries at ~4/hour — but a stop on MISCLASSIFICATION: if some persistent, PR-specific failure ever
 # matched the transient patterns, an uncapped refund would retry it until a human noticed.
+MAX_SETUP_FAILURES = 3  # per-head: rounds whose pre-agent setup in bubble failed, so the agent never
+# started. Charged INSTEAD of the stage's own budget (fix/fix-ci/rebase), which such a round hands back;
+# at the cap the PR is reported for a human rather than retried. Keyed on the head like
+# MAX_FIX_ATTEMPTS: a new push is a new checkout and may well set up.
+# The line bubble_work_cmd prints when that setup fails, and the only evidence run_agent_proc takes for
+# "the agent never started" (with no structured agent event seen).
+PRE_AGENT_SETUP_FAILED = "tauceti: pre-agent setup failed; the agent did not start"
 MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without posting a verdict
 
 # The tauceti-review engine's exit status for "I stopped because the provider is unusable, and I
