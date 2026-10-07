@@ -47,6 +47,8 @@ RUN_STDLIB=(
   budget_pacing.py
   partial_markers.py
   pace_per_provider.py
+  bors_merged.py
+  usage_request_log.py
   idle_nap.py
   read_efficiency.py
   auto_stage_priority.py

@@ -44,6 +44,8 @@ FAILED_HOLD_DAYS = 3
 INCIDENT = "lookahead"
 HEADER_RE = re.compile(r"<!--tauceti-lookahead:v1 (\{.*?\})-->")
 PORT_RE = re.compile(r"<!--tauceti-lookahead-port:v1 (\{[^}]*\})-->")
+PORT_SEARCH = '"tauceti-lookahead-port:v1" in:body sort:updated-desc'
+PORT_SEARCH_LIMIT = 1000
 # The port prompt asks for one of these as the report's last word on the branch.
 NOT_USED_RE = re.compile(r"^\W*Lookahead:\W*not used\W*(.*)$", re.I | re.M)
 

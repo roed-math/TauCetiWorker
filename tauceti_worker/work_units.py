@@ -2850,7 +2850,12 @@ def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView
     """The fork's lookahead branches as they bear on this round: one gated `ls-remote`, plus the
     headers of branches not seen before (cached by tip). Without lookahead, and unless `fresh`, a
     listing younger than lookahead.OFF_LISTING_TTL is reused instead. None without a GitHub client
-    or when the branches cannot be listed; the round then neither holds, ports nor starts a session."""
+    or when the branches cannot be listed; the round then neither holds, ports nor starts a session.
+
+    The merged ports come from one search on the port marker. The round's merged listing
+    (_merged_marker_prs) reaches back under a day of TauCeti's traffic, and a branch's first splits
+    merge long before its last: on 2026-10-07 #12172 and #12246 had dropped out of it, so the plan
+    kept offering split 1 and never the closing split."""
     if w.gh is None or not lookahead.active():
         return None
     cached = None if (fresh or lookahead.enabled()) else lookahead.recent_snapshot(lookahead.OFF_LISTING_TTL)
@@ -2878,7 +2883,14 @@ def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView
         for key in p.target_ids:
             open_item_prs.setdefault(key, set()).add(p.number)
     merged_ports: dict[tuple[str, int], int] = {}
-    for d in _merged_marker_prs:
+    rows = list(_merged_marker_prs)
+    if headers:
+        try:
+            rows += w.gh.pr_list(["number", "body"], state="merged", search=lookahead.PORT_SEARCH,
+                                 limit=lookahead.PORT_SEARCH_LIMIT)
+        except GitHubError as e:
+            log(f"lookahead: could not list the merged port PRs ({e}) — using the round's merged listing")
+    for d in rows:
         for key in lookahead.port_markers(d.get("body") or ""):
             merged_ports[key] = int(d.get("number") or 0)
     plans = {

@@ -8,7 +8,8 @@ when the supplier lands. Offline checks:
     or a supplier, a decline, a recent failure or a complete branch excludes; a partial branch resumes;
   * port plans: a split is ready once the splits it needs have merged, and an in-flight item is offered
     for porting only while every open PR carrying its marker is one of its port PRs (owner's ruling:
-    no waiting for merges between independent splits);
+    no waiting for merges between independent splits); merged ports come from a search on the port
+    marker, so a split that merged days ago still counts;
   * `_pick_target`: lookahead first when nothing on the list can be taken (owner's ruling), no cap on
     live branches, the port plan handed to do_roadmap, and without lookahead the hold and its expiry;
   * a session's outcome is its branch: moved = pushed, unmoved = a `failed` incident and a pause;
@@ -388,6 +389,50 @@ try:
     check("TAUCETI_LOOKAHEAD unset: no fork resolution, listing or deletion", view is None)
 except AssertionError as e:
     check("TAUCETI_LOOKAHEAD unset: no fork resolution, listing or deletion", False, str(e))
+
+# ---- merged ports older than the round's merged listing (2026-10-07: #12172, #12246) --------------------
+from tauceti_worker.github import GitHubError  # noqa: E402
+
+os.environ["TAUCETI_LOOKAHEAD"] = "1"
+W.ensure_fork = lambda: "alice/TauCeti"
+L.list_branches = lambda fork: {("Item", "on-flying"): "p4"}
+L.read_header = lambda fork, sha: L.parse_header(header("Item", "on-flying", splits=[
+    {"n": 1, "after": []}, {"n": 2, "after": []}, {"n": 3, "after": [1]}, {"n": 4, "after": [2, 3]}]))
+BF = "lookahead/Item/on-flying"
+W._merged_marker_prs[:] = [{"number": 802, "body": L.port_marker(BF, 2)}]
+searches = []
+
+
+class PortsGH:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def pr_list(self, fields, *, state="open", search=None, limit=200, author=None):
+        searches.append((state, search, limit))
+        if self.fail:
+            raise GitHubError("gh pr list failed: HTTP 502")
+        return [{"number": 801, "body": L.port_marker(BF, 1)}, {"number": 803, "body": L.port_marker(BF, 3)}]
+
+
+wp = worker()
+wp.gh = PortsGH()
+plan = W._lookahead_view(wp, SimpleNamespace(open_prs=[]), live).plans.get(("Item", "on-flying"))
+check("merged ports the round's listing no longer holds still count: the closing split is next",
+      plan is not None and plan.merged == {1: 801, 2: 802, 3: 803} and plan.next is not None and plan.next.n == 4,
+      str(plan and plan.merged))
+check("…from one search on the port marker, merged PRs only",
+      searches == [("merged", L.PORT_SEARCH, L.PORT_SEARCH_LIMIT)], str(searches))
+searches.clear()
+wp.gh = PortsGH(fail=True)
+plan = W._lookahead_view(wp, SimpleNamespace(open_prs=[]), live).plans.get(("Item", "on-flying"))
+check("a failed search falls back to the round's listing", plan is not None and plan.merged == {2: 802}
+      and plan.next is not None and plan.next.n == 1, str(plan and plan.merged))
+searches.clear()
+L.list_branches = lambda fork: {}
+W._lookahead_view(wp, SimpleNamespace(open_prs=[]), live)
+check("no branch, no search", searches == [], str(searches))
+W._merged_marker_prs.clear()
+os.environ.pop("TAUCETI_LOOKAHEAD", None)
 
 # ---- the listing a fleet without lookahead reuses ------------------------------------------------------
 L.write_snapshot("alice/TauCeti", {("Item", "x"): "t1"}, {})
