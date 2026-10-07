@@ -324,6 +324,27 @@ def declined_targets() -> dict[str, dict]:
     return out
 
 
+def handed_back_targets() -> dict[str, dict]:
+    """Declined targets the curator handed back (`curator == "not-landed"`), `{slug: record}`, live
+    or acknowledged. The next author's prompt says why, so it does not decline for the same reason."""
+    out: dict[str, dict] = {}
+    d = interaction.incidents_dir()
+    for folder in (d / "acked", d):
+        try:
+            paths = sorted(folder.glob(f"{DECLINED}-roadmap-*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                rec = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            target = rec.get("target")
+            if isinstance(target, str) and "/" in target and rec.get("curator") == "not-landed":
+                out[target.split("/", 1)[1]] = rec
+    return out
+
+
 def mark_declined_target(path: str, **fields) -> None:
     """Annotate a declined-target incident with the curator's verdict. Never raises. A decline the
     curator settled (landed, or handed back) or found waiting on an open PR needs nobody, so it moves

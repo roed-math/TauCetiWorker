@@ -8,7 +8,11 @@ recorded under one key (`roadmap-unknown`) and nothing fed it back into the pick
   * the picker drops declined targets, and backs off when nothing else is eligible;
   * the curator puts a declined target to the model with the declarations the agent's account
     names, found on main: "landed" marks the item done, "not landed" hands it back to the authors,
-    and an account naming nothing on main is left for the owner.
+    and an account naming nothing on main is left for the owner;
+  * another account's PR that covers a target and has stalled (conflicts, or waiting on its author,
+    with no commit for a day) no longer holds it: a decline deferring to it is handed back, an item
+    in flight on it is reopened, the list says `stalled: #N`, and the next author is told to write
+    it and cite #N; a second decline makes it the owner's.
 Exit 0 = all hold; 1 = a mismatch."""
 
 import json
@@ -265,6 +269,70 @@ except NoProgress:
     pass
 check("when the blocking PR is no longer open, the target goes back to the authors",
       "relation-rank" not in attention.declined_targets(), str(sorted(attention.declined_targets())))
+late = W._render_assigned(parse_targets(LIST.read_text()), parse_targets(LIST.read_text()).find("late-unblock"))
+check("a handed-back target's next author is told why it came back",
+      "the curator handed it back: the PR it waited on (#9050) is no longer open" in late, late)
+
+# ---- another account's PR that stalls does not hold a target (2026-10-07: #12120, #11157) ----------------------
+import time  # noqa: E402
+
+os.environ["TAUCETI_IDENTITY_OK"] = "me"
+OLD = "2026-10-01T00:00:00Z"
+FRESH = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * 3600))
+
+
+def pr(login, mergeable, labels, committed):
+    return {"state": "OPEN", "body": "their work", "author": {"login": login}, "mergeable": mergeable,
+            "labels": [{"name": x} for x in labels], "commits": [{"committedDate": "2026-09-01T00:00:00Z"}, {"committedDate": committed}]}
+
+
+PRS.update({9061: pr("someone", "CONFLICTING", ["merge-conflict", "awaiting-author"], OLD),
+            9062: pr("someone", "CONFLICTING", ["merge-conflict"], FRESH),
+            9063: pr("me", "MERGEABLE", ["awaiting-author"], OLD),
+            9064: pr("someone", "MERGEABLE", ["awaiting-review"], OLD),
+            9065: pr("someone", "MERGEABLE", ["awaiting-author"], OLD)})
+for slug, n in (("stalled-cover", 9061), ("fresh-cover", 9062), ("own-cover", 9063), ("review-cover", 9064), ("flight-cover", 9065)):
+    ACCOUNTS[slug] = f"No PR: the target is already being done in open PR #{n}; writing it again would duplicate it."
+    decline("ProfiniteProPGroups", slug)
+LIST.write_text(LIST.read_text().replace("\n## ProfiniteCohomology", "".join(
+    f"- [ ] `{s}` — L2, \"Prove `{s}`.\" (serves: B1; needs: none)\n" for s in ("stalled-cover", "fresh-cover", "own-cover", "review-cover"))
+    + "- [~] `flight-cover` — L2, \"Prove it.\" (serves: B1; needs: none; in flight: #9065 — their PR under marker id flightcover, "
+      "after our split 1 landed as #9000; partial: #9000)\n\n## ProfiniteCohomology"))
+try:
+    W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
+except NoProgress:
+    pass
+left = attention.declined_targets()
+new = LIST.read_text()
+check("a decline waiting on another account's PR that has conflicts and no commit for a day goes back to the authors",
+      "stalled-cover" not in left and "- [ ] `stalled-cover` — L2, \"Prove `stalled-cover`.\" (serves: B1; needs: none; "
+      "stalled: #9061 — @someone's PR has merge conflicts, no commit since 2026-10-01)" in new, new)
+rec = json.loads((TMP / "incidents" / "acked" / "declined-roadmap-ProfiniteProPGroups-stalled-cover.json").read_text())
+check("…its record says which PR, whose, how and since when",
+      (rec.get("curator"), rec.get("stalled_pr"), rec.get("stalled_author"), rec.get("stalled_why"), rec.get("stalled_since"))
+      == ("not-landed", 9061, "someone", "has merge conflicts", OLD), str(rec))
+check("a PR with a recent commit, our own PR, and one waiting on its reviewers still hold theirs",
+      {"fresh-cover", "own-cover", "review-cover"} <= set(left) and "stalled:" not in new.split("`fresh-cover`")[1].split("\n")[0],
+      str(sorted(left)))
+check("an item in flight on another account's stalled PR is reopened, its whole in-flight clause replaced",
+      "- [ ] `flight-cover` — L2, \"Prove it.\" (serves: B1; needs: none; partial: #9000; "
+      "stalled: #9065 — @someone's PR waits on its author, no commit since 2026-10-01)" in new, new)
+check("…and its decline handed back", "flight-cover" not in left, str(sorted(left)))
+t2 = parse_targets(new)
+note = W._render_assigned(t2, t2.find("stalled-cover"))
+check("the next author is told to write it, cite the stalled PR, and not decline for it",
+      "#9061 covers this target but has stalled: @someone's PR has merge conflicts" in note
+      and "cite #9061 in the PR body" in note and "Do not decline because #9061 exists." in note, note)
+decline("ProfiniteProPGroups", "stalled-cover")  # declined again all the same
+try:
+    W.do_curate(w, SimpleNamespace(open_prs=[]), None, SimpleNamespace(), False)
+except NoProgress:
+    pass
+rec = json.loads((TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-stalled-cover.json").read_text())
+check("declined again after that hand-back, it is the owner's, not handed back a second time",
+      rec.get("curator") == "disputed" and "stalled-cover" in attention.declined_targets(), str(rec.get("curator")))
+check("…it asks the owner, on the live list", (TMP / "incidents" / "declined-roadmap-ProfiniteProPGroups-stalled-cover.json").exists()
+      and str(rec.get("curator_evidence")).startswith("@someone's PR has merge conflicts"), str(rec.get("curator_evidence")))
 
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)

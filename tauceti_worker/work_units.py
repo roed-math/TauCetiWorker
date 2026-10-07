@@ -120,6 +120,7 @@ from .targets import (
     parse_targets,
     partial_prs,
     render_area_block,
+    stalled_prs,
 )
 
 # ============================================================================
@@ -1474,30 +1475,92 @@ def _curate_main_checkout(w) -> Path | None:
 
 
 _BLOCKED_RE = re.compile(r"\bblocked\b|overlapping open|open work|after (it|that PR|#\d+) merges|waits? (for|on) #?\d+", re.I)
+# How long another account's PR may sit with conflicts, or waiting on its author, before the target it
+# covers goes back to our authors (2026-10-07: #12120 and #11157 held two list items for 30 h that way).
+COVER_STALL_HOURS = float(os.environ.get("TAUCETI_COVER_STALL_HOURS", "24"))
 
 
-def _declined_by_named_prs(w, rec: dict, area: str, slug: str, leads: list[int] | None = None) -> tuple[str, int]:
+def _stalled_cover(w, n: int, d: dict) -> dict | None:
+    """How open PR #n, which a declining author deferred to, has stalled: another account's PR with
+    merge conflicts or waiting on its author, and no commit for COVER_STALL_HOURS. None while it
+    moves, and always for our own PRs, which the fixers own."""
+    from .identity import cached_login, expected_login
+
+    who = str((d.get("author") or {}).get("login") or "")
+    me = cached_login() or expected_login() or ""
+    if not who or who.lower() == me.lower():
+        return None
+    labels = {str(x.get("name")) for x in d.get("labels") or [] if isinstance(x, dict)}
+    if d.get("mergeable") == "CONFLICTING" or "merge-conflict" in labels:
+        why = "has merge conflicts"
+    elif labels & {"awaiting-author", "ci-failed"}:
+        why = "waits on its author"
+    else:
+        return None
+    commits = (w.gh.pr_view(n, ["commits"]) or {}).get("commits") or []
+    dates = [str(c.get("committedDate")) for c in commits if isinstance(c, dict) and c.get("committedDate")]
+    last = max(dates, default="")
+    at = lookahead._parse_iso(last) if last else None
+    if at is None or time.time() - at < COVER_STALL_HOURS * 3600:
+        return None
+    return {"pr": n, "author": who, "why": why, "since": last}
+
+
+def _stalled_how(stall: dict) -> str:
+    """A `stall` as the list's `stalled:` clause states it: no `;`, no parentheses."""
+    return f"@{stall['author']}'s PR {stall['why']}, no commit since {str(stall['since'])[:10]}"
+
+
+def _hand_back_stalled(rec: dict, slug: str, stall: dict) -> str | None:
+    """Hand a decline that waited on a stalled PR back to the authors. An author who declines it again
+    after any hand-back makes it the owner's: the record says `disputed`, and the "owner decides" line
+    for the curator's report is returned instead."""
+    from .attention import mark_declined_target
+
+    path, how = rec.get("path", ""), _stalled_how(stall)
+    if int(rec.get("handed_back") or 0) or rec.get("curator") == "disputed":
+        if rec.get("curator") == "disputed":
+            return None
+        mark_declined_target(path, curator="disputed", curator_evidence=how)
+        return (f"`{slug}`: handed back because {how}, and an author declined it again — owner decides "
+                f"([x] if done; to hand it back, delete {path})")
+    mark_declined_target(path, curator="not-landed", curator_evidence=how, stalled_pr=stall["pr"],
+                         stalled_author=stall["author"], stalled_why=stall["why"], stalled_since=stall["since"])
+    log(f"curate: `{slug}` handed back to the authors ({how})")
+    return None
+
+
+def _declined_by_named_prs(w, rec: dict, area: str, slug: str, leads: list[int] | None = None,
+                           stall: dict | None = None) -> tuple[str, int]:
     """What the PRs a declining author named say about its target: ("merged", N) when #N is merged
     and carries this item's marker; ("blocked", N) when #N is still open (the author stopped to avoid
-    overlapping it); ("unblocked", N) when the PR a previous pass found blocking is no longer open;
-    else ("", 0). At most five gated reads. A named PR that merged under some other marker, or none,
-    is appended to `leads`: its declarations are evidence to weigh, not a verdict (2026-09-30: #9928
-    proved `lcs-graded-spanning` under its own id, and the item waited for the owner)."""
+    overlapping it); ("stalled", N) when every open one has stalled (`_stalled_cover`, whose account
+    of #N fills `stall`); ("unblocked", N) when the PR a previous pass found blocking is no longer
+    open; else ("", 0). At most five gated reads, plus one per open PR that looks stalled. A named PR
+    that merged under some other marker, or none, is appended to `leads`: its declarations are
+    evidence to weigh, not a verdict (2026-09-30: #9928 proved `lcs-graded-spanning` under its own
+    id, and the item waited for the owner)."""
     named = [int(n) for n in list(rec.get("subsumed_by") or []) + list(rec.get("mentions") or []) if str(n).isdigit()]
     blocked_on = rec.get("blocked_on")
-    open_pr = 0
+    open_prs: list[tuple[int, dict]] = []
     for n in list(dict.fromkeys(named))[:5]:
-        d = w.gh.pr_view(n, ["state", "body"]) or {}
+        d = w.gh.pr_view(n, ["state", "body", "author", "mergeable", "labels"]) or {}
         state = str(d.get("state") or "")
         body = d.get("body") or ""
         if state == "MERGED" and (area, slug) in set(target_marker_ids(body)) and (area, slug) not in partial_marker_ids(body):
             return "merged", n
         if state == "MERGED" and leads is not None:
             leads.append(n)
-        if state == "OPEN" and not open_pr:
-            open_pr = n
-    if open_pr:
-        return "blocked", open_pr
+        if state == "OPEN":
+            open_prs.append((n, d))
+    if open_prs:
+        stalls = [_stalled_cover(w, n, d) for n, d in open_prs]
+        moving = [n for (n, _d), s in zip(open_prs, stalls) if s is None]
+        if moving:
+            return "blocked", moving[0]
+        if stall is not None:
+            stall.update(stalls[0] or {})
+        return "stalled", open_prs[0][0]
     if isinstance(blocked_on, int):
         return "unblocked", blocked_on
     # An author that stopped for overlapping OPEN work, whose PR has closed or merged before any pass saw
@@ -1694,6 +1757,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
         mark_landed_elsewhere,
         mark_merged,
         mark_partial,
+        mark_stalled,
         sync_inflight,
     )
 
@@ -1720,11 +1784,14 @@ def _do_curate_inner(w, sv, opts) -> int | None:
     # ---- tier A: the PRs the file names
     states: dict[int, str] = {}
     partial: dict[int, str] = {}
+    stalled: list[tuple[TargetItem, dict]] = []
     for area, it, pr in inflight_prs(targets):
-        d = w.gh.pr_view(pr, ["state", "body"])
+        d = w.gh.pr_view(pr, ["state", "body", "author", "mergeable", "labels"])
         if not (d and d.get("state")):
             continue
         state = str(d["state"])
+        if state == "OPEN" and (stall := _stalled_cover(w, pr, d)):
+            stalled.append((it, stall))
         if state == "MERGED":
             if (area, it.slug) in partial_marker_ids(d.get("body") or ""):
                 partial[pr] = "its marker says partial"
@@ -1736,6 +1803,14 @@ def _do_curate_inner(w, sv, opts) -> int | None:
                     partial[pr] = "main lacks " + ", ".join(f"`{i}`" for i in lacking[:4])
         states[pr] = state
     new_text, changes = sync_inflight(text, states, verdicts_by_pr(), partial)
+    # An item in flight on another account's PR that has stalled goes back to the authors.
+    declined_now = declined_targets() if stalled else {}
+    for it, stall in stalled:
+        new_text, ok = mark_stalled(new_text, it.slug, stall["pr"], _stalled_how(stall))
+        if ok:
+            changes.append(f"`{it.slug}`: reopened — #{stall['pr']}, which it was in flight on, stalled: {_stalled_how(stall)}")
+        if it.slug in declined_now and (ask := _hand_back_stalled(declined_now[it.slug], it.slug, stall)):
+            changes.append(ask)
     # ---- tier A': merged PRs carrying a listed item's marker, whoever opened them. The live view sees
     # these only while they are recent; writing them into the file keeps them.
     try:
@@ -1817,7 +1892,8 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             # The PRs the agent named settle most declines outright: one merged with this item's marker
             # means done; one still open means the target is blocked, not done, and waits for it.
             leads: list[int] = []
-            verdict, pr_no = _declined_by_named_prs(w, rec, area, it.slug, leads)
+            stall: dict = {}
+            verdict, pr_no = _declined_by_named_prs(w, rec, area, it.slug, leads, stall)
             if verdict == "merged":
                 lacking = ["(listed as partial)"] if pr_no in partial_prs(it) else _missing_on_main(clone, it)
                 if not lacking:
@@ -1835,6 +1911,14 @@ def _do_curate_inner(w, sv, opts) -> int | None:
             if verdict == "blocked":
                 log(f"curate: `{it.slug}` is blocked on open #{pr_no}, not done — skipped until that PR closes")
                 mark_declined_target(rec.get("path", ""), blocked_on=pr_no)
+                continue
+            if verdict == "stalled":
+                new_text, ok = mark_stalled(new_text, it.slug, pr_no, _stalled_how(stall))
+                if ok:
+                    changes.append(f"`{it.slug}`: back to the authors — #{pr_no}, which an author deferred to, "
+                                   f"stalled: {_stalled_how(stall)}")
+                if ask := _hand_back_stalled(rec, it.slug, stall):
+                    undecided.append(ask)
                 continue
             if verdict == "unblocked":
                 mark_declined_target(rec.get("path", ""), curator="not-landed",
@@ -2786,7 +2870,26 @@ def _render_assigned(live: Targets, it: TargetItem) -> str:
     if unknown:
         parts.append(", ".join(f"`{s}`" for s in unknown) + " — not in the list, assumed landed")
     clauses = [*agent_clauses(it), "needs: " + ("; ".join(parts) if parts else "none")]
-    return f"Assigned target: `{it.slug}` — {it.text} ({'; '.join(clauses)})\n  Context — the rest of this area's list:"
+    return (f"Assigned target: `{it.slug}` — {it.text} ({'; '.join(clauses)})" + _handed_back_note(it)
+            + "\n  Context — the rest of this area's list:")
+
+
+def _handed_back_note(it: TargetItem) -> str:
+    """Continuation lines for an assigned target an author declined before: the stalled PR that covers
+    it (`stalled:` clauses), else the curator's reason for handing it back. Without them the next
+    author finds the same open PR, or the same half on main, and declines again."""
+    from .attention import handed_back_targets
+
+    lines = [f"  #{pr} covers this target but has stalled: {how}. No milestone waits on a pull request, so write "
+             f"the target yourself, cite #{pr} in the PR body as prior work, and reuse its approach where it helps. "
+             f"Do not decline because #{pr} exists."
+             for pr, how in stalled_prs(it)]
+    rec = handed_back_targets().get(it.slug) if not lines else None
+    if rec and rec.get("curator_evidence"):
+        lines.append("  An author declined this target before, and the curator handed it back: "
+                     + " ".join(str(rec["curator_evidence"]).split())[:300]
+                     + ". Check `main` against that before declining it again.")
+    return "".join("\n" + ln for ln in lines)
 
 
 def _without_declined(candidates: list[tuple[str, TargetItem]]) -> list[tuple[str, TargetItem]]:

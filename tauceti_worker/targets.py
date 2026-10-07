@@ -392,6 +392,36 @@ def sync_inflight(
     return "".join(out), changes
 
 
+def stalled_prs(it: TargetItem) -> list[tuple[int, str]]:
+    """(PR, how) for each `stalled:` clause: another account's PR that covers the item and stalled."""
+    out = []
+    for clause in it.meta:
+        key, _, value = clause.partition(":")
+        if key.strip().lower() == "stalled" and (m := re.match(r"\s*#(\d+)\s*(?:[—–-]\s*)?(.*)", value)):
+            out.append((int(m.group(1)), m.group(2).strip()))
+    return out
+
+
+def mark_stalled(text: str, slug: str, pr: int, how: str) -> tuple[str, bool]:
+    """Reopen an item covered by another account's PR #pr that has stalled: `[ ]`, with its
+    `in flight: #pr …` clause, prose included, replaced by `stalled: #pr — <how>`. Pure; False when
+    the item already says so. `how` holds no `;` and no parentheses, which would end the clause list."""
+    out, changed = [], False
+    for line in text.splitlines(keepends=True):
+        if not changed and re.match(r"- \[[ ~]\] `" + re.escape(slug) + r"`", line):
+            body = line.rstrip("\n")
+            meta_m = _META_RE.search(body)
+            clauses = [c.strip() for c in meta_m.group(1).split(";")] if meta_m else []
+            if any(re.match(rf"stalled:\s*#{pr}\b", c) for c in clauses):
+                return text, False
+            kept = [c for c in clauses if c and not re.match(rf"in flight:\s*#{pr}\b", c)]
+            head = body[: meta_m.start()].rstrip() if meta_m else body
+            line = re.sub(r"^- \[~\]", "- [ ]", f"{head} ({'; '.join(kept + [f'stalled: #{pr} — {how}'])})", count=1) + "\n"
+            changed = True
+        out.append(line)
+    return "".join(out), changed
+
+
 def mark_landed_elsewhere(text: str, slug: str, evidence: str) -> tuple[str, bool]:
     """Mark an open or in-flight item done because main already provides it (found by the curator, not
     by a PR of ours): `[x]` with `landed elsewhere: <evidence>` added to its metadata; an `in flight:`
