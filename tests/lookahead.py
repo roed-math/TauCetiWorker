@@ -9,7 +9,7 @@ when the supplier lands. Offline checks:
   * port plans: a split is ready once the splits it needs have merged, and an in-flight item is offered
     for porting only while every open PR carrying its marker is one of its port PRs (owner's ruling:
     no waiting for merges between independent splits); merged ports come from a search on the port
-    marker, so a split that merged days ago still counts;
+    marker (remembered for a round whose search fails), so a split that merged days ago still counts;
   * `_pick_target`: lookahead first when nothing on the list can be taken (owner's ruling), no cap on
     live branches, the port plan handed to do_roadmap, and without lookahead the hold and its expiry;
   * a session's outcome is its branch: moved = pushed, unmoved = a `failed` incident and a pause;
@@ -425,7 +425,12 @@ check("…from one search on the port marker, merged PRs only",
 searches.clear()
 wp.gh = PortsGH(fail=True)
 plan = W._lookahead_view(wp, SimpleNamespace(open_prs=[]), live).plans.get(("Item", "on-flying"))
-check("a failed search falls back to the round's listing", plan is not None and plan.merged == {2: 802}
+check("a failed search uses the ports the last search found (2026-10-09: split 1 re-offered after a busy gate)",
+      plan is not None and plan.merged == {1: 801, 2: 802, 3: 803} and plan.next is not None and plan.next.n == 4,
+      str(plan and plan.merged))
+(L.state_dir() / "merged-ports.json").unlink()
+plan = W._lookahead_view(wp, SimpleNamespace(open_prs=[]), live).plans.get(("Item", "on-flying"))
+check("…and with nothing remembered, the round's listing", plan is not None and plan.merged == {2: 802}
       and plan.next is not None and plan.next.n == 1, str(plan and plan.merged))
 searches.clear()
 L.list_branches = lambda fork: {}

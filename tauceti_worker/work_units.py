@@ -2982,7 +2982,9 @@ def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView
     The merged ports come from one search on the port marker. The round's merged listing
     (_merged_marker_prs) reaches back under a day of TauCeti's traffic, and a branch's first splits
     merge long before its last: on 2026-10-07 #12172 and #12246 had dropped out of it, so the plan
-    kept offering split 1 and never the closing split."""
+    kept offering split 1 and never the closing split. When that search fails (the gate refused it
+    as busy 27 times on 2026-10-08/09, each time re-offering a split 1 merged days before), the ports
+    the last successful search found stand in."""
     if w.gh is None or not lookahead.active():
         return None
     cached = None if (fresh or lookahead.enabled()) else lookahead.recent_snapshot(lookahead.OFF_LISTING_TTL)
@@ -3011,15 +3013,21 @@ def _lookahead_view(w, sv, live: Targets, fresh: bool = False) -> _LookaheadView
             open_item_prs.setdefault(key, set()).add(p.number)
     merged_ports: dict[tuple[str, int], int] = {}
     rows = list(_merged_marker_prs)
+    searched = False
     if headers:
         try:
             rows += w.gh.pr_list(["number", "body"], state="merged", search=lookahead.PORT_SEARCH,
                                  limit=lookahead.PORT_SEARCH_LIMIT)
+            searched = True
         except GitHubError as e:
-            log(f"lookahead: could not list the merged port PRs ({e}) — using the round's merged listing")
+            merged_ports = lookahead.remembered_merged_ports()
+            log(f"lookahead: could not list the merged port PRs ({e}) — using the {len(merged_ports)} the last "
+                "search found and the round's merged listing")
     for d in rows:
         for key in lookahead.port_markers(d.get("body") or ""):
             merged_ports[key] = int(d.get("number") or 0)
+    if searched:
+        lookahead.remember_merged_ports(merged_ports)
     plans = {
         key: lookahead.port_plan(lookahead.branch_name(*key), headers[sha], open_ports, merged_ports)
         for key, sha in branches.items()

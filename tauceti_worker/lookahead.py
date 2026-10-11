@@ -452,6 +452,28 @@ def recent_snapshot(max_age: float) -> tuple[str, dict[tuple[str, str], str]] | 
         return None
 
 
+def remember_merged_ports(ports: dict[tuple[str, int], int]) -> None:
+    """Keep what a successful search on the port marker found, for the rounds whose search fails."""
+    d = state_dir()
+    if d is None:
+        return
+    _write_json(d / "merged-ports.json",
+                {"at": time.time(), "ports": sorted([b, n, pr] for (b, n), pr in ports.items())})
+
+
+def remembered_merged_ports() -> dict[tuple[str, int], int]:
+    """`{(branch, split): pr}` from the last successful search. A merge is final, so a remembered port
+    is never wrong; the memory only lacks what merged since, which the round's own listing covers."""
+    d = state_dir()
+    if d is None:
+        return {}
+    try:
+        rows = json.loads((d / "merged-ports.json").read_text())["ports"]
+        return {(str(b), int(n)): int(pr) for b, n, pr in rows}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
 def history(event: str, area: str, slug: str, **fields) -> None:
     """One line per session, port and deletion in `<gate>/lookahead/history.jsonl`: the pilot's
     measurements (session time, outcome) come from here and from the port markers on GitHub."""
