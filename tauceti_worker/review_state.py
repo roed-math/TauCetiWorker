@@ -35,7 +35,15 @@ COALESCE_POLL_S = 0.5  # a reader waiting on a peer's in-flight fetch polls the 
 def review_state_dir(cfg: Config) -> Path:
     """Where the sidecars live: fleet-shared under the gate store when there is one (design §5: the
     files are keyed by PR and `updatedAt`, so any worker's read entitles every worker), else the
-    per-worker directory upstream used."""
+    per-worker directory upstream used.
+
+    $TAUCETI_SHARED_READ_CACHE moves them to a directory several fleets on one account share. Fleets
+    that take turns hand over with no gap, so the incoming one starts on the outgoing one's reads; on
+    its own store it refilled ~320 PRs at once (2026-10-12: 900 reads in 9 min, then an hour of
+    refused rounds)."""
+    shared = os.environ.get("TAUCETI_SHARED_READ_CACHE", "")
+    if shared:
+        return Path(shared) / "review_state"
     g = gate_mod.current()
     if g.enabled and g.dir is not None:
         return g.cache_dir / "review_state"

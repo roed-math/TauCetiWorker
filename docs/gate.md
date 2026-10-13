@@ -273,9 +273,17 @@ either way: run gated rounds on the host or point the container at the store.
 With a gate store, `ReviewState`'s sidecars (`<pr>.key.json`, `<pr>.contest.json`,
 `<pr>.json`) live under `$TAUCETI_GATE_DIR/cache/review_state/` instead of the
 per-worker `state/<id>/cache/scoreboard/`. Upstream's `updatedAt` keying, the
-30-minute backstop and the forced live re-read of the one chosen candidate are
-untouched: the files are keyed by PR and `updatedAt`, so any worker's read entitles
-every worker, and `assumed` is still not `fresh`.
+3-hour backstop (`TAUCETI_META_BACKSTOP`) and the forced live re-read of the one chosen
+candidate are untouched: the files are keyed by PR and `updatedAt`, so any worker's read
+entitles every worker, and `assumed` is still not `fresh`.
+
+Fleets that take turns on one account can share the sidecars too:
+`TAUCETI_SHARED_READ_CACHE=<dir>` puts them in `<dir>/review_state/`, a directory every
+fleet user can write (group-writable, setgid, no sticky bit, since a fleet replaces and
+deletes files another fleet wrote). A fleet starting its slot then reads on from the
+previous fleet's sidecars instead of refilling every open PR at once, which once spent
+900 reads in 9 minutes. The in-flight markers stay in each fleet's own store, so two
+fleets running at once may both fetch a miss; that is a duplicate read, not a wrong one.
 
 Misses are coalesced across processes. A reader about to fetch a PR's comments (or
 review comments) writes `cache/inflight/<pr>.comments.json` (`.contest.json`) —
