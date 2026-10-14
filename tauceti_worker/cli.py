@@ -5,7 +5,7 @@ Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the wo
 
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and
 treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
-of work, chosen in priority order: rebase → bump → progress → fix-ci → fix → review → roadmap.
+of work, chosen in priority order: rebase → bump → lint-repair → progress → fix-ci → fix → review → overlap-fix → overlap-scan → roadmap.
 The `bump` step adapts a red bump-mathlib PR (the review bot opens those; the worker
 never authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI,
 not the worker.
@@ -35,6 +35,7 @@ from .agents import (
     KIRO_BUBBLE_MIN_VERSION,
     bubble_cmd_is_disposable,
     bubble_supports_allow_push,
+    bubble_supports_github_account,
     bubble_supports_lake_cache_service,
     bubble_version_meets_minimum,
     ensure_fork_proxy_current,
@@ -44,9 +45,14 @@ from .agents import (
     run_in_bubble,
     tauceti_cache_unreachable_reason,
 )
+from .budget import BudgetError
+from .budget_cli import add_budget_parser, cmd_budget
+from .claude_api import api_mode, configure_api
 from .config import (
+    AdmissionUnavailable,
     Config,
     Die,
+    GitHubUnavailable,
     NoProgress,
     acquire_slot,
     auto_assign_wid,
@@ -61,14 +67,20 @@ from .constants import (
     AGENTS,
     ALLOWED_TASKS,
     CLAIMS,
+    EX_ADMISSION_WAIT,
+    EX_GITHUB_WAIT,
     EX_HALTED,
     EX_NOPROGRESS,
+    EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
     TAUCETI,
     WORK_TASKS,
 )
-from .github import GitHub, is_canonical_repo, shared_claims_granted
+from .cost_model import analyze as analyze_costs
+from .cost_model import analyze_review_archive, infrastructure_model, loc_cost_model, measured_ai_model
+from .cost_model import format_report as format_cost_report
+from .github import GitHub, is_canonical_repo, pin_github_account, shared_claims_granted
 from .identity import Halted, clear_halt, halt_path, refuse_if_halted
 from .identity import gate as identity_gate
 from .loop import cmd_loop, resolve_work_model
@@ -76,7 +88,7 @@ from .paths import HERE, ensure_ssl_cert_file
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
-from .runtime_status import report_failure
+from .runtime_status import report_failure, report_runtime
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
 from .usage import kiro_data_dir, usage_snapshot
@@ -91,17 +103,20 @@ WORK_EPILOG = """\
 the cascade (priority order; a round does the first that applies):
   rebase    bring our open PRs up to date with their base branch
   bump      adapt a red bump-mathlib PR (the worker never authors one)
+  lint-repair  fix what TauCeti's daily full lint found on main, on its red lint-repair PR
   progress  write a roadmap's STATUS.md / PROGRESS.md report (globally paced at 8h; on demand per
             roadmap with TAUCETI_PROGRESS_STRATEGY=threshold)
   fix-ci    fix red CI on one of our PRs
   fix       address review feedback on one of our PRs
   review    review an open PR (runs the tauceti-review engine)
+  overlap-fix   adopt Mathlib APIs identified by labelled overlap issues
+  overlap-scan  investigate consecutive Mathlib commits up to Tau Ceti's pin
   roadmap   open a new PR for a roadmap item
 
   With no --only a round walks the whole cascade; --only pins it to a subset,
   --skip drops a subset (and the two combine by subtraction). --pr narrows the
   same round to named pull requests: it filters what the round would already
-  have done, so progress and roadmap (which name no existing PR) drop out.
+  have done, so progress, roadmap, and overlap phases drop out.
 
 examples:
   tauceti work                          one round: auto agent, on the host
@@ -140,17 +155,50 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude/Codex token; see --auto-refresh)
   TAUCETI_CLAUDE_WARM=1  macOS: renew an expired Claude Keychain token with a one-turn `claude` warm-up
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
+  TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
+  TAUCETI_OVERLAP_BATCH_COMMITS  commits per scan session (default 160)
+  TAUCETI_MAX_OPEN_PRS   open PR authoring cutoff (default 8)
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
   CODEX_HOME             Codex config/credential source; point it at a private directory to give
                          TauCeti its own Codex account without disturbing your interactive one
 
 full reference:
-  https://github.com/kim-em/TauCetiWorker/blob/main/docs/reference.md
+  https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/reference.md
 """
 
 
+def add_github_account_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--github-state-url", default=argparse.SUPPRESS, help="shared GitHub state service URL")
+    p.add_argument("--github-state-token-file", default=argparse.SUPPRESS, help="private service client token file")
+    p.add_argument(
+        "--github-account",
+        default=argparse.SUPPRESS,
+        metavar="LOGIN",
+        help="use this GitHub login without changing gh's active account; defaults to "
+        "$TAUCETI_GITHUB_ACCOUNT, otherwise current gh authentication. Independent of --account (Codex)",
+    )
+
+
 def add_work_flags(p: argparse.ArgumentParser) -> None:
+    from .config import positive_integer
+
+    p.add_argument(
+        "--max-open-prs",
+        type=positive_integer,
+        default=None,
+        help="open roadmap PR authoring cutoff (env TAUCETI_MAX_OPEN_PRS; default 8)",
+    )
+    p.add_argument(
+        "--overlap-batch-commits",
+        type=positive_integer,
+        default=None,
+        help="Mathlib commits per overlap-scan session (env TAUCETI_OVERLAP_BATCH_COMMITS; default 160)",
+    )
+    p.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
+    p.add_argument("--budget", action="store_true", help="admit Claude API sessions through shared local grants")
+    p.add_argument("--anthropic-api-key-file", metavar="PATH", help="private API key file; otherwise ANTHROPIC_API_KEY")
+    add_github_account_flag(p)
     p.add_argument(
         "--loop",
         action="store_true",
@@ -163,7 +211,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         default=[],
         metavar="TASKS",
         help="restrict the round to these work units, a comma list of: "
-        + ", ".join(ALLOWED_TASKS)
+        + ", ".join((*ALLOWED_TASKS, *EXPLICIT_TASKS))
         + " (default: walk the whole cascade)",
     )
     p.add_argument(
@@ -406,7 +454,7 @@ def parse_only(values: list[str], flag: str = "--only") -> list[str]:
         for tok in v.replace(" ", "").split(","):
             if not tok:
                 continue
-            if tok not in ALLOWED_TASKS:
+            if tok not in (*ALLOWED_TASKS, *EXPLICIT_TASKS):
                 raise SystemExit(
                     f"unknown {flag} task '{tok}' (valid: {', '.join(ALLOWED_TASKS)})"
                 )  # exit 1; argparse uses 2
@@ -425,7 +473,7 @@ def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
     if not skip:
         return only
     allowed = set(only) if only else set(ALLOWED_TASKS)
-    tasks = [t for t in ALLOWED_TASKS if t in allowed and t not in skip]
+    tasks = [t for t in (*ALLOWED_TASKS, *EXPLICIT_TASKS) if t in allowed and t not in skip]
     if not tasks:
         raise SystemExit("--only/--skip leave no work units enabled")
     return tasks
@@ -561,8 +609,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Run 'tauceti work -h' for work units and examples, or 'tauceti workers -h'\n"
         "for persistent workers. Guide and reference:\n"
-        "  https://github.com/kim-em/TauCetiWorker",
+        "  https://github.com/TauCetiProject/TauCetiWorker",
     )
+    add_github_account_flag(p)
     sub = p.add_subparsers(dest="cmd")
 
     w = sub.add_parser(
@@ -577,9 +626,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_work_flags(w)
 
+    overlap = sub.add_parser("overlap", help="initialize the shared Mathlib overlap cursor")
+    add_github_account_flag(overlap)
+    overlap_sub = overlap.add_subparsers(dest="overlap_cmd", required=True)
+    init = overlap_sub.add_parser("init", help="create the cursor without overwriting existing state")
+    init.add_argument("--mathlib-commit", required=True)
+    init.add_argument("--worker-id", default="overlap-init")
+    add_github_account_flag(init)
+
     s = sub.add_parser("status", help="read-only survey of available work + quota")
     s.add_argument("--json", action="store_true", help="emit the survey as JSON")
     s.add_argument("--worker-id", dest="worker_id", default=None)
+    add_github_account_flag(s)
 
     u = sub.add_parser("usage", help="read Kiro/OpenRouter credits without sending a model prompt")
     u.add_argument(
@@ -603,9 +661,176 @@ def build_parser() -> argparse.ArgumentParser:
     )
     u.add_argument("--timeout", type=float, default=30.0, help="per-provider query timeout in seconds")
 
-    sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
+    c = sub.add_parser(
+        "cost-model",
+        help="estimate local agent, CI, and Lake-cache compute costs from available logs",
+    )
+    c.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    c.add_argument("--logs-dir", type=Path, default=HERE / "logs", help="agent log root")
+    c.add_argument("--state-dir", type=Path, default=HERE / "state", help="worker state/transcript root")
+    c.add_argument(
+        "--review-data-dir",
+        type=Path,
+        default=Path.home() / ".cache/tauceti-review/data/TauCetiData",
+        help="TauCetiData checkout containing canonical review-run records",
+    )
+    c.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="analyze this many most-recent agent sessions; 0 means all (default: all)",
+    )
+    c.add_argument(
+        "--ci-builds-per-pr",
+        type=float,
+        default=4.34,
+        help="branch plus merge-queue builds per merged PR (measured default: 4.34)",
+    )
+    c.add_argument(
+        "--ci-minutes-per-build",
+        type=float,
+        default=8.77,
+        help="8-vCPU PR runner-minutes per build (measured default: 8.77)",
+    )
+    c.add_argument(
+        "--main-ci-minutes",
+        type=float,
+        default=14.07,
+        help="2-vCPU post-merge runner-minutes per PR (measured default: 14.07)",
+    )
+    c.add_argument(
+        "--ci-fixed-weight",
+        "--ci-fixed-minutes",
+        dest="ci_fixed_weight",
+        type=float,
+        default=1.86,
+        help="relative fixed/setup weight in a PR build (sample proxy: 1.86)",
+    )
+    c.add_argument(
+        "--ci-touched-weight",
+        "--ci-touched-minutes",
+        dest="ci_touched_weight",
+        type=float,
+        default=5.44,
+        help="relative candidate-build weight in a PR build (sample proxy: 5.44)",
+    )
+    c.add_argument(
+        "--ci-repo-weight",
+        "--ci-repo-minutes",
+        dest="ci_repo_weight",
+        type=float,
+        default=1.47,
+        help="relative repository-wide weight in a PR build (sample proxy: 1.47)",
+    )
+    c.add_argument(
+        "--main-fixed-weight",
+        "--main-fixed-minutes",
+        dest="main_fixed_weight",
+        type=float,
+        default=3.42,
+        help="relative fixed/setup weight in post-merge CI (sample proxy: 3.42)",
+    )
+    c.add_argument(
+        "--main-touched-weight",
+        "--main-touched-minutes",
+        dest="main_touched_weight",
+        type=float,
+        default=1.15,
+        help="relative candidate-build weight in post-merge CI (sample proxy: 1.15)",
+    )
+    c.add_argument(
+        "--main-repo-weight",
+        "--main-repo-minutes",
+        dest="main_repo_weight",
+        type=float,
+        default=9.50,
+        help="relative repository-wide weight in post-merge CI (sample proxy: 9.50)",
+    )
+    c.add_argument(
+        "--pr-runner-usd-minute",
+        type=float,
+        default=0.022,
+        help="comparison price for an 8-vCPU runner-minute (default: GitHub $0.022)",
+    )
+    c.add_argument(
+        "--main-runner-usd-minute",
+        type=float,
+        default=0.006,
+        help="comparison price for a 2-vCPU runner-minute (default: GitHub $0.006)",
+    )
+    c.add_argument(
+        "--cache-objects",
+        type=int,
+        default=5787,
+        help="objects in one complete TauCeti Lake cache map (measured default: 5787)",
+    )
+    c.add_argument(
+        "--cache-gib",
+        type=float,
+        default=0.162,
+        help="compressed bytes in one complete cache fetch, GiB (sample estimate: 0.162)",
+    )
+    c.add_argument(
+        "--retained-cache-gib",
+        type=float,
+        default=1.9,
+        help="estimated retained R2 cache size, GiB (local-history estimate: 1.9)",
+    )
+    c.add_argument(
+        "--merged-prs-month",
+        type=float,
+        default=None,
+        help="also project R2 traffic and read charges at this monthly merge rate",
+    )
+    c.add_argument(
+        "--ai-usd-per-changed-loc",
+        type=float,
+        default=None,
+        help="override measured preparation + review + revision API-equivalent cost",
+    )
+    c.add_argument(
+        "--ai-family",
+        choices=["observed", "sol", "opus"],
+        default="observed",
+        help="measured AI scenario used in the LOC headline (default: observed mix)",
+    )
+    c.add_argument(
+        "--changed-loc-per-pr",
+        type=float,
+        default=275.42,
+        help="mean additions plus deletions per authored PR (measured default: 275.42)",
+    )
+    c.add_argument(
+        "--changed-per-net-loc",
+        type=float,
+        default=275.42 / 257.60,
+        help="changed-to-net-retained LOC churn multiplier (measured default: 1.069)",
+    )
+    c.add_argument(
+        "--reference-repo-loc",
+        type=float,
+        default=None,
+        help="CI/R2 baseline size in LOC (default: --current-repo-loc)",
+    )
+    c.add_argument(
+        "--current-repo-loc",
+        type=float,
+        default=2.7e6,
+        help="repository size at which to evaluate the headline marginal cost (2026-10-12 snapshot: 2.7e6)",
+    )
+    c.add_argument(
+        "--projection-loc",
+        type=float,
+        action="append",
+        default=None,
+        help="target repository LOC for an integrated projection (repeatable; defaults: 1e6, 1e7, 1e8)",
+    )
+
+    doctor = sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
+    add_github_account_flag(doctor)
 
     add_workers_parser(sub)
+    add_budget_parser(sub)
 
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
@@ -615,6 +840,7 @@ def build_parser() -> argparse.ArgumentParser:
     hb.add_argument("--ppipe", type=int, default=None)
     ep = sub.add_parser("_egress-probe", add_help=False)
     ep.add_argument("--worker-id", dest="worker_id", default=None)
+    add_github_account_flag(ep)
     mr = sub.add_parser("_managed-run", add_help=False)
     mr.add_argument("--spec", required=True)
     mr.add_argument("--state-dir", required=True)
@@ -669,14 +895,72 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cmd = args.cmd
 
-    resolve_pace(cmd, args)
+    from .config import max_open_prs
+    from .overlaps import batch_size
 
+    for field, variable in (
+        ("overlap_batch_commits", "TAUCETI_OVERLAP_BATCH_COMMITS"),
+        ("max_open_prs", "TAUCETI_MAX_OPEN_PRS"),
+    ):
+        if getattr(args, field, None) is not None:
+            os.environ[variable] = str(getattr(args, field))
+    try:
+        batch_size()
+        max_open_prs()
+    except ValueError as error:
+        raise Die(str(error)) from None
+
+    resolve_pace(cmd, args)
+    for field, variable in (
+        ("github_state_url", "TAUCETI_GITHUB_STATE_URL"),
+        ("github_state_token_file", "TAUCETI_GITHUB_STATE_TOKEN_FILE"),
+    ):
+        if hasattr(args, field):
+            value = getattr(args, field)
+            os.environ[variable] = str(Path(value).expanduser().resolve()) if field.endswith("file") else value
+    from .config import max_open_prs
+
+    if getattr(args, "max_open_prs", None) is not None:
+        os.environ["TAUCETI_MAX_OPEN_PRS"] = str(args.max_open_prs)
+    try:
+        max_open_prs()
+    except ValueError as error:
+        raise Die(f"TAUCETI_MAX_OPEN_PRS {error}") from None
+
+    if cmd == "budget":
+        try:
+            return cmd_budget(args)
+        except (BudgetError, OSError) as error:
+            raise Die(str(error)) from None
+    if cmd in (None, "status", "doctor", "work", "_round", "_egress-probe", "overlap"):
+        from .github_transport import install_proxy
+
+        if getattr(args, "worker_id", None):
+            os.environ["TAUCETI_WORKER_ID"] = sanitize_wid(args.worker_id)
+        install_proxy()
+        if cmd in ("work", "_round"):
+            report_runtime(max_open_prs=max_open_prs())
+        if cmd == "work" and getattr(args, "loop", False):
+            report_runtime(github_transport_loop_rev=os.environ.get("TAUCETI_GITHUB_TRANSPORT_REV"))
+        account = getattr(args, "github_account", os.environ.get("TAUCETI_GITHUB_ACCOUNT"))
+        if account is not None:
+            args.github_account = pin_github_account(
+                account, wait_for_reset=cmd == "work" and getattr(args, "loop", False)
+            )
+            report_runtime(github_account=args.github_account)
+
+    if cmd == "overlap":
+        from .overlaps import initialize
+
+        return initialize(Config.resolve(args.worker_id), args.mathlib_commit)
     if cmd is None:
         return cmd_tui(args)
     if cmd == "status":
         return cmd_status(args)
     if cmd == "usage":
         return cmd_usage(args)
+    if cmd == "cost-model":
+        return cmd_cost_model(args)
     if cmd in ("work", "_round"):
         only = resolve_tasks(getattr(args, "only", []), getattr(args, "skip", []))
         prs = resolve_pr_targets(getattr(args, "pr", []))
@@ -718,6 +1002,95 @@ def main(argv: list[str] | None = None) -> int:
         return gate_main(args.gate_args, prog="tauceti gate")
     parser.print_help()
     return 64
+
+
+def cmd_cost_model(args) -> int:
+    numeric = {
+        "--ci-builds-per-pr": args.ci_builds_per_pr,
+        "--ci-minutes-per-build": args.ci_minutes_per_build,
+        "--main-ci-minutes": args.main_ci_minutes,
+        "--pr-runner-usd-minute": args.pr_runner_usd_minute,
+        "--main-runner-usd-minute": args.main_runner_usd_minute,
+        "--cache-gib": args.cache_gib,
+        "--retained-cache-gib": args.retained_cache_gib,
+        "--ci-fixed-weight": args.ci_fixed_weight,
+        "--ci-touched-weight": args.ci_touched_weight,
+        "--ci-repo-weight": args.ci_repo_weight,
+        "--main-fixed-weight": args.main_fixed_weight,
+        "--main-touched-weight": args.main_touched_weight,
+        "--main-repo-weight": args.main_repo_weight,
+    }
+    if args.ai_usd_per_changed_loc is not None:
+        numeric["--ai-usd-per-changed-loc"] = args.ai_usd_per_changed_loc
+    if args.merged_prs_month is not None:
+        numeric["--merged-prs-month"] = args.merged_prs_month
+    for flag, value in numeric.items():
+        if not math.isfinite(value) or value < 0:
+            raise Die(f"{flag} must be a non-negative finite number")
+    if args.limit < 0:
+        raise Die("--limit must be a non-negative integer")
+    if args.cache_objects < 0:
+        raise Die("--cache-objects must be a non-negative integer")
+    reference_repo_loc = args.current_repo_loc if args.reference_repo_loc is None else args.reference_repo_loc
+    positive = {
+        "--changed-loc-per-pr": args.changed_loc_per_pr,
+        "--changed-per-net-loc": args.changed_per_net_loc,
+        "--reference-repo-loc": reference_repo_loc,
+        "--current-repo-loc": args.current_repo_loc,
+    }
+    projections = args.projection_loc or [1e6, 1e7, 1e8]
+    for i, value in enumerate(projections):
+        positive[f"--projection-loc #{i + 1}"] = value
+    for flag, value in positive.items():
+        if not math.isfinite(value) or value <= 0:
+            raise Die(f"{flag} must be a positive finite number")
+    pr_weights = (args.ci_fixed_weight, args.ci_touched_weight, args.ci_repo_weight)
+    main_weights = (args.main_fixed_weight, args.main_touched_weight, args.main_repo_weight)
+    if sum(pr_weights) <= 0:
+        raise Die("the three --ci-*-weight decomposition values may not all be zero")
+    if sum(main_weights) <= 0:
+        raise Die("the three --main-*-weight decomposition values may not all be zero")
+    pr_shares = tuple(value / sum(pr_weights) for value in pr_weights)
+    main_shares = tuple(value / sum(main_weights) for value in main_weights)
+    report = analyze_costs(args.logs_dir, args.state_dir, args.limit)
+    report["ai_reviews"] = analyze_review_archive(args.review_data_dir, args.state_dir)
+    report["ai_cost_model"] = measured_ai_model(report, report["ai_reviews"], args.changed_loc_per_pr)
+    report["infrastructure"] = infrastructure_model(
+        pr_builds=args.ci_builds_per_pr,
+        pr_runner_minutes=args.ci_minutes_per_build,
+        pr_runner_vcpus=8,
+        main_runner_minutes=args.main_ci_minutes,
+        main_runner_vcpus=2,
+        pr_runner_usd_minute=args.pr_runner_usd_minute,
+        main_runner_usd_minute=args.main_runner_usd_minute,
+        cache_objects=args.cache_objects,
+        cache_gib=args.cache_gib,
+        retained_cache_gib=args.retained_cache_gib,
+        merged_prs_month=args.merged_prs_month,
+        pr_component_shares=pr_shares,
+        main_component_shares=main_shares,
+    )
+    measured_ai = report["ai_cost_model"]["scenarios"][args.ai_family]["usd_per_changed_loc"]
+    selected_ai = args.ai_usd_per_changed_loc if args.ai_usd_per_changed_loc is not None else measured_ai
+    report["ai_cost_model"]["selected"] = {
+        "family": "override" if args.ai_usd_per_changed_loc is not None else args.ai_family,
+        "usd_per_changed_loc": selected_ai,
+    }
+    if selected_ai is not None:
+        report["loc_cost"] = loc_cost_model(
+            report["infrastructure"],
+            ai_usd_per_changed_loc=selected_ai,
+            changed_loc_per_pr=args.changed_loc_per_pr,
+            changed_per_net_loc=args.changed_per_net_loc,
+            reference_repo_loc=reference_repo_loc,
+            current_repo_loc=args.current_repo_loc,
+            projection_locs=projections,
+        )
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(format_cost_report(report))
+    return 0
 
 
 def _usage_burn_rate(value: str | float | None, label: str) -> float | None:
@@ -842,10 +1215,39 @@ def enter_offline_mode(cfg: Config) -> None:
     resolved = shutil.which("gh")
     if not resolved or Path(resolved).resolve() != (fakes / "gh").resolve():
         raise Die(f"--offline: `gh` on PATH resolves to {resolved!r}, not the fake at {fakes / 'gh'}")
+    # install_proxy ran before the fakes led PATH and recorded whatever `gh` resolved to then.
+    os.environ["TAUCETI_REAL_GH"] = str(fakes / "gh")
     log(f"offline: fakes on PATH from {fakes}; gate store {os.environ['TAUCETI_GATE_DIR']}")
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
+    if "security-audit" in only:
+        from .security_audit import require_admin
+
+        if only != ["security-audit"] or prs:
+            raise Die("security-audit must run alone, without --pr")
+        if agent not in ("auto", "codex", "claude"):
+            raise Die("security-audit supports Codex Luna or Claude Haiku only")
+        if getattr(args, "author_model", None) or getattr(args, "author_effort", None):
+            raise Die("security-audit uses its dedicated Luna/Haiku profile; omit author-model/effort overrides")
+        if getattr(args, "claude_billing", None) == "api" or api_mode():
+            raise Die("security-audit currently uses paced subscription CLI sessions")
+        require_admin()  # Before quota/model selection, including on the loop-driver path.
+    if one_round and not getattr(args, "dry_run", False):
+        from .github_outbox import drain
+
+        pending = drain()
+        if pending:
+            log(f"GitHub publications awaiting retry or reconciliation: {len(pending)}; retaining completed work")
+            reason = f"{len(pending)} retained GitHub publications awaiting retry or reconciliation"
+            report_runtime(publication_pending_count=len(pending))
+            log(reason + "; selecting unrelated work while recovery continues")
+        else:
+            report_runtime(publication_pending_count=0)
+    try:
+        configure_api(args, agent)
+    except (BudgetError, OSError) as error:
+        raise Die(str(error)) from None
     # --host used to opt OUT of the bubble sandbox; running on the host is now the default, so the flag
     # is a no-op we only warn about. --bubble is the way to opt back INTO the sandbox.
     if getattr(args, "host", False):
@@ -1014,9 +1416,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
         # rather than refuse the round on a cached verdict that may be an hour old.
-        work_model, pending_init = resolve_work_model(
-            cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd, fresh=not one_round
-        )
+        if api_mode():
+            work_model, pending_init = "claude", False
+        else:
+            work_model, pending_init = resolve_work_model(
+                cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd, fresh=not one_round
+            )
         authoring_profile = None
         if work_model != "auto":
             authoring_profile = resolve_authoring_profile(
@@ -1090,7 +1495,9 @@ def cmd_doctor(args) -> int:
     rows.append(("uv/uvx", _have("uvx"), "required (runs tauceti and fetches the review engine)"))
     rows.append(("jq", _have("jq"), "claim.sh needs it"))
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
-    rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
+    github_account = os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    gh_note = f"GitHub account: {github_account}" if github_account else "current gh authentication"
+    rows.append(("gh auth", gh_auth, gh_note + "; its PRs are the ones the worker tends"))
     # Which claim namespace this account gets, and therefore how far its de-duplication reaches. The
     # row is not a failure: the fork always works, it just does not coordinate beyond your own fleet.
     # Deliberately does not resolve the fork, so `doctor` never creates one as a side effect.
@@ -1154,13 +1561,24 @@ def cmd_doctor(args) -> int:
 def preflight(cfg: Config, opts: RoundOpts) -> None:
     """Fail a round early if its chosen mode can't run, rather than partway through. bubble and the
     review engine are fetched on demand, so we don't require them on PATH (only uvx + a runtime)."""
+    if "security-audit" in opts.only:
+        for t in ("gh", "git", opts.work_model):
+            if not _have(t):
+                raise Die(f"security-audit: missing '{t}' on PATH")
+        return  # No Lake, fork, general agent launcher, or GitHub proxy.
     for t in ("gh", "git", "uvx"):
         if not _have(t):
             raise Die(f"preflight: missing '{t}' on PATH")
     # Only authoring/fixing stages build with lake on the host; review runs the fetched-on-demand review
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
-    needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s != "review")
+    needs_host_build = any(
+        (not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan")
+    )
+    if needs_host_build:
+        from .agents import lake_cache_max_revs
+
+        lake_cache_max_revs(os.environ)
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die(
             "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
@@ -1172,7 +1590,7 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     uses_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
     # Rounds that may push to the contributor's fork (everything except review, which only reads/comments).
     # The fork-PR preflight below is scoped to these so a `--only review` worker is never blocked by it.
-    uses_fork = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s) and s != "review")
+    uses_fork = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan"))
     if uses_bubble and not opts.dry_run and not _have("incus"):
         raise Die(
             "preflight: the bubble sandbox needs a working Incus runtime, but `incus` is not on PATH.\n"
@@ -1190,6 +1608,11 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "  or set $TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
         )
     if uses_bubble and not opts.dry_run:
+        if os.environ.get("TAUCETI_GITHUB_ACCOUNT") and not bubble_supports_github_account():
+            raise Die(
+                "preflight: --github-account with --bubble requires account-aware Bubble "
+                "(--github-account support in both the CLI and auth proxy). Use host mode or update Bubble."
+            )
         bubble_version = installed_bubble_version()
         minimum = KIRO_BUBBLE_MIN_VERSION if opts.work_model == "kiro" else BUBBLE_MIN_VERSION
         if not bubble_version_meets_minimum(bubble_version, minimum):
@@ -1233,8 +1656,8 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             )
     # The CLI may advertise --allow-push while an older live daemon keeps rejecting fork pushes (403).
     # Require a reachable endpoint that advertises the capability, and refresh it safely when needed.
-    # Fork-pushing rounds only (a stale daemon must not block review).
-    if uses_fork and not opts.dry_run:
+    # Account-selected reviews also require the account-aware daemon.
+    if (uses_fork or (uses_bubble and os.environ.get("TAUCETI_GITHUB_ACCOUNT"))) and not opts.dry_run:
         ensure_fork_proxy_current()
 
 
@@ -1246,15 +1669,48 @@ def cli_main() -> int:
     if ensure_ssl_cert_file() is None:
         log("no system CA bundle found; set SSL_CERT_FILE if TLS verification fails")
     _ensure_scripts_executable()
+    from .github_transport import blocking_event_since
+
+    started = time.time()
+
+    def github_pause(error, retry_at=None):
+        log(str(error))
+        report_runtime(
+            "waiting-github",
+            detail=str(error),
+            next_action_at=retry_at,
+            failure_reason=None,
+            failure_code=None,
+            failure_log=None,
+        )
+        return EX_GITHUB_WAIT
+
     try:
         return main() or 0
+    except GitHubUnavailable as e:
+        return github_pause(e, e.retry_at)
     except Die as e:
+        event = blocking_event_since(started)
+        if event:
+            return github_pause(e, event.get("reset"))
         log(str(e))
         report_failure(str(e), code=1)
         return 1
-    except NoProgress as e:
+    except AdmissionUnavailable as e:
         log(str(e))
-        report_failure(str(e), code=EX_NOPROGRESS, declined=getattr(e, "declined", False))
+        report_failure(str(e), code=EX_ADMISSION_WAIT)
+        return EX_ADMISSION_WAIT
+    except NoProgress as e:
+        event = blocking_event_since(started)
+        if event:
+            return github_pause(e, event.get("reset"))
+        log(str(e))
+        report_failure(
+            str(e),
+            code=EX_NOPROGRESS,
+            log_file=getattr(e, "log_file", None),
+            declined=getattr(e, "declined", False),
+        )
         return EX_NOPROGRESS
     except Halted as e:
         log(str(e))

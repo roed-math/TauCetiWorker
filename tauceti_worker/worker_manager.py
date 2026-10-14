@@ -29,17 +29,24 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-from .constants import AGENTS, ALLOWED_TASKS
+from .config import positive_integer
+from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
+from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
-from .runtime_status import STATUS_ENV, read_json, update_status
+from .runtime_status import STATUS_ENV, StatusPublisher, read_json
+from .runtime_status import update_status as update_status
 
 CONFIG_VERSION = 1
 DEFAULT_INTERVAL = 2.0
 TMUX_SESSION = "tauceti-workers"
 _WORKER_KEYS = {
+    "max_open_prs",
+    "github_state_url",
+    "github_state_token_file",
     "id",
+    "github_account",
     "enabled",
     "agent",
     "only",
@@ -59,6 +66,9 @@ _WORKER_KEYS = {
     "isolate_home",
     "restart",
     "env",
+    "claude_billing",
+    "budget",
+    "anthropic_api_key_file",
 }
 
 WORKERS_EPILOG = """\
@@ -90,7 +100,7 @@ configuration (first that is set wins):
   tauceti workers import workers.conf         import the legacy line-oriented format once
 
 full reference:
-  https://github.com/kim-em/TauCetiWorker/blob/main/docs/workers.md
+  https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/workers.md
 """
 
 
@@ -242,12 +252,19 @@ def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
+    max_open_prs: int = MAX_OPEN_PRS
+    github_state_url: str | None = None
+    github_state_token_file: str | None = None
+    github_account: str | None = None
     enabled: bool = True
     agent: str = "auto"
     only: tuple[str, ...] = ()
     sandbox: str = "host"
     ignore_quota: bool = False
     auto_refresh: bool = False
+    claude_billing: str = "subscription"
+    budget: bool = False
+    anthropic_api_key_file: str | None = None
     roadmap_only: str | None = None
     roadmap_skip: tuple[str, ...] = ()
     roadmap_targets: str | None = None
@@ -280,7 +297,7 @@ class WorkerSpec:
         if agent not in AGENTS:
             raise WorkersError(f"workers[{index}].agent must be one of: {', '.join(AGENTS)}")
         only = _strings(raw.get("only", []), f"workers[{index}].only")
-        bad_tasks = [task for task in only if task not in ALLOWED_TASKS]
+        bad_tasks = [task for task in only if task not in (*ALLOWED_TASKS, *EXPLICIT_TASKS)]
         if bad_tasks:
             raise WorkersError(f"workers[{index}].only has unknown task(s): {', '.join(bad_tasks)}")
         sandbox = _string(raw.get("sandbox", "host"), f"workers[{index}].sandbox")
@@ -289,14 +306,31 @@ class WorkerSpec:
         restart = _string(raw.get("restart", "always"), f"workers[{index}].restart")
         if restart not in ("always", "on-failure", "never"):
             raise WorkersError(f"workers[{index}].restart must be 'always', 'on-failure', or 'never'")
+        try:
+            cutoff = positive_integer(raw.get("max_open_prs", MAX_OPEN_PRS))
+        except ValueError as error:
+            raise WorkersError(f"workers[{index}].max_open_prs {error}") from None
+        if not isinstance(raw.get("max_open_prs", MAX_OPEN_PRS), int):
+            raise WorkersError(f"workers[{index}].max_open_prs must be an integer")
         spec = WorkerSpec(
             id=wid,
+            max_open_prs=cutoff,
+            github_state_url=_string(raw.get("github_state_url"), f"workers[{index}].github_state_url", optional=True),
+            github_state_token_file=_string(
+                raw.get("github_state_token_file"), f"workers[{index}].github_state_token_file", optional=True
+            ),
             enabled=enabled,
             agent=agent,
+            github_account=_string(raw.get("github_account"), f"workers[{index}].github_account", optional=True),
             only=only,
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
             auto_refresh=_boolean(raw.get("auto_refresh", False), f"workers[{index}].auto_refresh"),
+            claude_billing=_string(raw.get("claude_billing", "subscription"), f"workers[{index}].claude_billing"),
+            budget=_boolean(raw.get("budget", False), f"workers[{index}].budget"),
+            anthropic_api_key_file=_string(
+                raw.get("anthropic_api_key_file"), f"workers[{index}].anthropic_api_key_file", optional=True
+            ),
             roadmap_only=_string(raw.get("roadmap_only"), f"workers[{index}].roadmap_only", optional=True),
             roadmap_skip=_strings(raw.get("roadmap_skip", []), f"workers[{index}].roadmap_skip"),
             roadmap_targets=_string(raw.get("roadmap_targets"), f"workers[{index}].roadmap_targets", optional=True),
@@ -313,14 +347,28 @@ class WorkerSpec:
             restart=restart,
             env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
+        if spec.github_account is not None:
+            try:
+                validate_github_account(spec.github_account)
+            except ValueError as e:
+                raise WorkersError(f"workers[{index}].github_account: {e}") from None
         if spec.source is not None and ("roadmap" not in spec.only or not spec.roadmap_only):
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
+        if spec.claude_billing not in ("subscription", "api"):
+            raise WorkersError("claude_billing must be subscription or api")
+        if spec.claude_billing == "api":
+            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or spec.pace:
+                raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
+        elif spec.budget or spec.anthropic_api_key_file:
+            raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
         return spec
 
     def as_dict(self) -> dict:
         value: dict = {"id": self.id, "enabled": self.enabled}
+        if self.max_open_prs != MAX_OPEN_PRS:
+            value["max_open_prs"] = self.max_open_prs
         if self.agent != "auto":
             value["agent"] = self.agent
         if self.only:
@@ -331,6 +379,12 @@ class WorkerSpec:
             value["ignore_quota"] = True
         if self.auto_refresh:
             value["auto_refresh"] = True
+        if self.claude_billing != "subscription":
+            value["claude_billing"] = self.claude_billing
+        if self.budget:
+            value["budget"] = True
+        if self.anthropic_api_key_file:
+            value["anthropic_api_key_file"] = self.anthropic_api_key_file
         if self.roadmap_only is not None:
             value["roadmap_only"] = self.roadmap_only
         if self.roadmap_skip:
@@ -341,7 +395,15 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if not self.respect_claims:
             value["respect_claims"] = False
-        for name in ("source", "author_model", "author_effort", "pace"):
+        for name in (
+            "github_account",
+            "github_state_url",
+            "github_state_token_file",
+            "source",
+            "author_model",
+            "author_effort",
+            "pace",
+        ):
             item = getattr(self, name)
             if item is not None:
                 value[name] = item
@@ -363,6 +425,13 @@ class WorkerSpec:
 
     def work_argv(self) -> list[str]:
         argv = self_argv("work", "--loop", "--worker-id", self.id)
+        argv += ["--max-open-prs", str(self.max_open_prs)]
+        if self.claude_billing == "api":
+            argv += ["--claude-billing", "api"]
+        if self.budget:
+            argv.append("--budget")
+        if self.anthropic_api_key_file:
+            argv += ["--anthropic-api-key-file", str(Path(self.anthropic_api_key_file).expanduser().resolve())]
         if self.only:
             argv += ["--only", ",".join(self.only)]
         if self.agent != "auto":
@@ -384,6 +453,9 @@ class WorkerSpec:
         if not self.respect_claims:
             argv.append("--ignore-claims")
         for field, flag in (
+            (self.github_account, "--github-account"),
+            (self.github_state_url, "--github-state-url"),
+            (self.github_state_token_file, "--github-state-token-file"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -427,10 +499,14 @@ def load_worker_specs(path: Path) -> list[WorkerSpec]:
 def _toml_value(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(_toml_value(key) + " = " + _toml_value(item) for key, item in value.items()) + " }"
     raise WorkersError(f"cannot encode TOML value of type {type(value).__name__}")
 
 
@@ -656,9 +732,9 @@ def cmd_managed_runner(args) -> int:
         parent_pipe_write: int | None = None
         started = time.time()
         prior = read_json(state)
+        publisher = StatusPublisher(state)
         restart_count = int(prior.get("restart_count", 0)) + 1 if prior.get("spec_hash") == spec.fingerprint() else 0
         log_dir = state_dir / "logs" / spec.id
-        log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"work-{time.strftime('%Y%m%d-%H%M%S')}.log"
 
         def stop(_signum=None, _frame=None) -> None:
@@ -673,14 +749,17 @@ def cmd_managed_runner(args) -> int:
             # that discovery while the PYTHONPATH the child needs to import itself is still prepended
             # rather than replaced. The manager's own variables are assigned last and are reserved, so
             # nothing here can shadow them.
-            env = self_env({**os.environ, **dict(spec.env)})
+            env = self_env(unselected_github_env({**unselected_github_env(), **dict(spec.env)}))
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
             env["TAUCETI_LOG_FILE"] = os.devnull
-            logf = log_path.open("ab", buffering=0)
-            update_status(
-                state,
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                logf = log_path.open("ab", buffering=0)
+            except OSError:
+                logf = sys.stderr  # Retain console/journal output if file logging fails.
+            publisher.update(
                 id=spec.id,
                 state="starting",
                 alive=True,
@@ -690,10 +769,14 @@ def cmd_managed_runner(args) -> int:
                 process_group=None,
                 instance=uuid.uuid4().hex,
                 spec_hash=spec.fingerprint(),
+                applied_spec=spec.as_dict(),
+                max_open_prs=spec.max_open_prs,
+                pending_read_policy=None,
                 agent=spec.agent,
+                github_account=spec.github_account,
                 only=list(spec.only),
                 sandbox=spec.sandbox,
-                log_file=str(log_path),
+                log_file=str(log_path) if logf is not sys.stderr else None,
                 started_at=started,
                 heartbeat_at=time.time(),
                 activity_at=started,
@@ -719,13 +802,13 @@ def cmd_managed_runner(args) -> int:
             )
             os.close(parent_pipe_read)
             parent_pipe_read = None
-            update_status(state, child_pid=child.pid, process_group=child.pid)
+            publisher.update(child_pid=child.pid, process_group=child.pid)
 
             def request(req: dict) -> dict:
                 nonlocal stopping
                 action = req.get("action")
                 if action == "status":
-                    return read_json(state)
+                    return publisher.snapshot()
                 if action == "stop":
                     stopping = True
                     return {"ok": True}
@@ -737,10 +820,10 @@ def cmd_managed_runner(args) -> int:
                 if ready:
                     _serve_one(server, request)
                 if time.monotonic() - last_heartbeat >= 2:
-                    update_status(state, alive=True, heartbeat_at=time.time(), child_pid=child.pid)
+                    publisher.update(alive=True, heartbeat_at=time.time(), child_pid=child.pid)
                     last_heartbeat = time.monotonic()
             if stopping and child.poll() is None:
-                update_status(state, state="stopping", activity_at=time.time())
+                publisher.update(state="stopping", activity_at=time.time())
                 signal_group(child.pid, signal.SIGTERM)
                 deadline = time.monotonic() + 20
                 while child.poll() is None and time.monotonic() < deadline:
@@ -752,8 +835,8 @@ def cmd_managed_runner(args) -> int:
                     child.wait()
             rc = child.wait()
             final = "stopped" if stopping else ("exited" if rc == 0 else "failed")
-            update_status(
-                state,
+            publisher.update(
+                timeout=1,
                 state=final,
                 alive=False,
                 heartbeat_at=time.time(),
@@ -797,11 +880,45 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
             runtime_dir,
         ),
         cwd=HERE,
-        env=self_env(),
+        env=self_env(unselected_github_env()),
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
     )
+
+
+def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
+    """These read-policy edits can wait for a round boundary instead of killing paid work."""
+    applied = live.get("applied_spec")
+    if not isinstance(applied, dict):
+        # Older runners persisted only a hash. Recognize the default read policy by its
+        # actual fingerprint; unknown generations are deferred conservatively.
+        previous = dataclasses.replace(
+            spec, max_open_prs=MAX_OPEN_PRS, github_state_url=None, github_state_token_file=None
+        )
+        if previous.fingerprint() != live.get("spec_hash"):
+            # No trustworthy previous definition: use the same conservative idle/child checks.
+            applied = spec.as_dict()
+        else:
+            applied = previous.as_dict()
+    old = dict(applied)
+    desired = spec.as_dict()
+    for field in ("max_open_prs", "github_state_url", "github_state_token_file"):
+        old.pop(field, None)
+        desired.pop(field, None)
+    if old != desired:
+        return False
+    if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
+        return True
+    if (live.get("next_action_at") or 0) - time.time() < 15:
+        return True
+    pid = live.get("child_pid")
+    if sys.platform == "linux" and isinstance(pid, int):
+        try:
+            return bool(Path(f"/proc/{pid}/task/{pid}/children").read_text().strip())
+        except OSError:
+            return True
+    return False
 
 
 def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
@@ -820,7 +937,10 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
         exiting = False
         stop_workers = False
         restart_ids: set[str] = set()
+        enable_ids: set[str] = set()
         children: dict[str, subprocess.Popen] = {}
+        child_generations: dict[str, str] = {}
+        exit_outcomes: dict[str, tuple[str, int]] = {}
         launch_failures: dict[str, tuple[str, int, float]] = {}
         last_good: list[WorkerSpec] | None = None
         last_error: str | None = None
@@ -843,6 +963,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 if not isinstance(wid, str):
                     return {"ok": False, "error": "restart requires id"}
                 restart_ids.add(wid)
+                return {"ok": True}
+            if action == "enable":
+                wid = req.get("id")
+                if not isinstance(wid, str):
+                    return {"ok": False, "error": "enable requires id"}
+                enable_ids.add(wid)
+                exit_outcomes.pop(wid, None)
+                launch_failures.pop(wid, None)
                 return {"ok": True}
             if action == "shutdown":
                 exiting = True
@@ -877,13 +1005,15 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 for wid, process in list(children.items()):
                     if process.poll() is not None:
                         children.pop(wid, None)
+                        generation = child_generations.pop(wid)
+                        exit_outcomes[wid] = (generation, process.returncode)
                         status = read_json(status_path(wid, state_dir))
                         terminal = (
                             status.get("wrapper_pid") == process.pid
                             and not status.get("alive")
                             and status.get("stopped_at") is not None
                         )
-                        if not terminal:
+                        if not terminal and process.returncode != 0:
                             spec = wanted.get(wid)
                             fingerprint = spec.fingerprint() if spec else "removed"
                             previous = launch_failures.get(wid)
@@ -905,14 +1035,19 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     live = runner_status(wid, state_dir, runtime_dir)
                     is_live = bool(live.get("alive"))
                     should_run = bool(spec and spec.enabled)
+                    if is_live or not should_run:
+                        enable_ids.discard(wid)
                     changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
+                    if changed and should_run and wid not in restart_ids and _defer_read_policy_reload(spec, live):
+                        StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=spec.fingerprint())
+                        continue
                     if (
                         is_live
                         and not changed
                         and int(live.get("restart_count", 0))
                         and time.time() - float(live.get("started_at") or time.time()) >= 300
                     ):
-                        update_status(status_path(wid, state_dir), restart_count=0)
+                        StatusPublisher(status_path(wid, state_dir)).update(restart_count=0)
                         launch_failures.pop(wid, None)
                     if is_live and (not should_run or changed or wid in restart_ids):
                         _stop_runner(wid, runtime_dir)
@@ -929,7 +1064,11 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                                     pass
                         continue
                     prior = read_json(status_path(wid, state_dir))
-                    forced = wid in restart_ids
+                    forced = wid in restart_ids or wid in enable_ids
+                    outcome = exit_outcomes.get(wid)
+                    if not forced and outcome and outcome[0] == spec.fingerprint():
+                        if spec.restart == "never" or spec.restart == "on-failure" and outcome[1] == 0:
+                            continue  # Parent-observed exits remain authoritative if reporting fails.
                     if (
                         not forced
                         and spec.restart == "never"
@@ -958,7 +1097,10 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     if not forced and max(float(prior.get("stopped_at") or 0) + delay, manager_retry_at) > time.time():
                         continue
                     children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    child_generations[wid] = spec.fingerprint()
+                    exit_outcomes.pop(wid, None)
                     restart_ids.discard(wid)
+                    enable_ids.discard(wid)
                 ready, _, _ = select.select([server], [], [], max(0.1, interval))
                 if ready:
                     _serve_one(server, handle)
@@ -1014,7 +1156,7 @@ def ensure_manager(config: Path) -> bool:
                     spawned = subprocess.Popen(
                         self_argv("workers", "--config", config, "manager"),
                         cwd=HERE,
-                        env=self_env(),
+                        env=self_env(unselected_github_env()),
                         stdin=subprocess.DEVNULL,
                         stdout=log,
                         stderr=subprocess.STDOUT,
@@ -1171,6 +1313,17 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
     agent = str(spec.get("agent") or item.get("agent") or "auto")
     sandbox = str(spec.get("sandbox") or item.get("sandbox") or "host")
     lines.extend(_status_field("agent", [f"{agent} · {sandbox} sandbox"], width))
+    if spec.get("claude_billing") == "api":
+        lines.extend(
+            _status_field(
+                "billing",
+                ["Claude API · " + ("shared local grants" if spec.get("budget") else "no local budget")],
+                width,
+            )
+        )
+    github_account = spec.get("github_account") or item.get("github_account")
+    if github_account:
+        lines.extend(_status_field("github", [str(github_account)], width))
 
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
     if spec.get("pace"):
@@ -1270,6 +1423,17 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
         if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
             label = "retry" if state == "backoff" else "recheck"
             lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))
+        if budget := item.get("budget"):
+            lines.extend(
+                _status_field(
+                    "budget",
+                    [
+                        f"${float(budget['balance']):.2f} balance · "
+                        f"${float(budget['pending']):.2f} pending · ${float(budget['grant_rate']):.2f}/hour"
+                    ],
+                    width,
+                )
+            )
         if state == "backoff":
             lines.extend(_status_field("logs", [f"tauceti workers logs {item['id']}"], width))
     return lines
@@ -1299,12 +1463,14 @@ def _mutate_enabled(config: Path, wid: str, enabled: bool) -> None:
     if enabled:
         # Re-enabling is an explicit request to run, even for restart="never" or after a clean
         # on-failure exit. Clear the terminal policy record after persisting desired state.
-        update_status(status_path(wid), stopped_at=None, exit_code=None, state="queued")
+        StatusPublisher(status_path(wid)).update(stopped_at=None, exit_code=None, state="queued")
 
 
 def set_worker_enabled(config: Path, wid: str, enabled: bool) -> None:
     _mutate_enabled(config, wid, enabled)
     ensure_manager(config)
+    if enabled:
+        manager_request("enable", id=wid)
 
 
 def restart_worker(config: Path, wid: str) -> None:
@@ -1326,7 +1492,14 @@ def _remove_spec(config: Path, wid: str) -> None:
 
 
 def add_dashboard_worker(
-    config: Path, *, only: str | None, agent: str, bubble: bool, roadmap_only: str | None, roadmap_skip: str | None
+    config: Path,
+    *,
+    only: str | None,
+    agent: str,
+    bubble: bool,
+    roadmap_only: str | None,
+    roadmap_skip: str | None,
+    github_account: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1337,6 +1510,7 @@ def add_dashboard_worker(
             specs = []
         spec = WorkerSpec(
             id=next_worker_id(specs),
+            github_account=github_account,
             agent=agent,
             only=(only,) if only else (),
             sandbox="bubble" if bubble else "host",
@@ -1639,6 +1813,10 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             key = {
                 "--worker-id": "id",
                 "--agent": "agent",
+                "--github-account": "github_account",
+                "--github-state-url": "github_state_url",
+                "--github-state-token-file": "github_state_token_file",
+                "--max-open-prs": "max_open_prs",
                 "--only": "only",
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
@@ -1651,7 +1829,11 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             }.get(token)
             if key is None:
                 raise WorkersError(f"{path}:{number}: unsupported legacy argument {token}")
-            values[key] = value.split(",") if key in ("only", "roadmap_skip", "roadmap_extra_identities") else value
+            values[key] = (
+                value.split(",")
+                if key in ("only", "roadmap_skip", "roadmap_extra_identities")
+                else (positive_integer(value) if key == "max_open_prs" else value)
+            )
         if not values.get("id"):
             raise WorkersError(f"{path}:{number}: persistent workers need an explicit --worker-id")
         if values.pop("bubble", False):
@@ -1691,8 +1873,19 @@ def add_workers_parser(subparsers) -> None:
         item = actions.add_parser(action, help=descriptions[action])
         item.add_argument("worker_id", help="worker id")
     add = actions.add_parser("add", help="add an enabled persistent worker definition")
+    add.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
+    add.add_argument("--budget", action="store_true")
+    add.add_argument("--anthropic-api-key-file")
     add.add_argument("worker_id", nargs="?", help="stable id (default: next free workerN)")
     add.add_argument("--agent", choices=AGENTS, default="auto", help="agent for each round (default: auto)")
+    add.add_argument("--max-open-prs", type=positive_integer, default=MAX_OPEN_PRS)
+    add.add_argument("--github-state-url")
+    add.add_argument("--github-state-token-file")
+    add.add_argument(
+        "--github-account",
+        default=argparse.SUPPRESS,
+        help="GitHub login for this worker (independent of its agent account)",
+    )
     add.add_argument("--only", default="", help="comma-separated work phases (default: full cascade)")
     add.add_argument(
         "--sandbox", choices=("host", "bubble"), default="host", help="where eligible phases run (default: host)"
@@ -1774,8 +1967,7 @@ def cmd_workers(args) -> int:
                 ensure_manager(config)
             return 0
         if action in ("enable", "disable"):
-            _mutate_enabled(config, args.worker_id, action == "enable")
-            ensure_manager(config)
+            set_worker_enabled(config, args.worker_id, action == "enable")
             return 0
         if action == "add":
             with _config_lock(config):
@@ -1790,6 +1982,7 @@ def cmd_workers(args) -> int:
                     raise WorkersError(f"worker already exists: {wid}")
                 raw = {
                     "id": wid,
+                    "max_open_prs": args.max_open_prs,
                     "agent": args.agent,
                     "only": [item for item in args.only.split(",") if item],
                     "sandbox": args.sandbox,
@@ -1798,9 +1991,24 @@ def cmd_workers(args) -> int:
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
+                    "claude_billing": args.claude_billing,
+                    "budget": args.budget,
+                    "anthropic_api_key_file": str(Path(args.anthropic_api_key_file).expanduser().resolve())
+                    if args.anthropic_api_key_file
+                    else None,
                 }
-                for key in ("roadmap_only", "roadmap_targets", "source", "author_model", "author_effort", "pace"):
-                    value = getattr(args, key)
+                for key in (
+                    "github_account",
+                    "github_state_url",
+                    "github_state_token_file",
+                    "roadmap_only",
+                    "roadmap_targets",
+                    "source",
+                    "author_model",
+                    "author_effort",
+                    "pace",
+                ):
+                    value = getattr(args, key, None)
                     if value is not None:
                         raw[key] = value
                 spec = WorkerSpec.from_dict(raw, len(specs))

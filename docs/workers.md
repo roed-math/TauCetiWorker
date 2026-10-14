@@ -5,6 +5,31 @@ Persistent workers are declarative. You describe the workers you want in
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
 
+## Rebase retry budget
+
+For genuine Git conflicts, a tended PR gets three rebase attempts between verified progress checkpoints.
+The ordinary survey records a checkpoint when the current head has a successful
+`build` status, GitHub reports it mergeable, and it has no `needs-rebase` label.
+A distinct green head can renew the allowance once; rebuilding or repeatedly
+observing the same head cannot.
+Unverified pushes, comments, agent exit codes, failed or pending CI, unknown
+mergeability, drafts and hold labels do not renew it.
+
+Trusted merge-sweep handoffs retain the existing three-attempt per-PR cap. A
+handoff can start from a branch that is already green and mergeable, so another
+green push does not establish that the reconciliation succeeded. A missing or
+failed handoff-comment read never bypasses the `needs-rebase` label's hold on
+budget renewal.
+
+The evidence comes from the existing survey, without extra GitHub reads or agent
+sessions. Each worker keeps its checkpoints with its existing counters. A round
+charges and refunds the allowance it selected even if another survey observes
+new progress while that round is running. Old integer counter files remain
+intact; PRs with no verified checkpoint keep their existing allowance. This is
+a per-worker bound, as before, not a fleet-wide attempt limit.
+Unreadable or malformed checkpoint/counter evidence suppresses rebase work with
+a diagnostic reason. Counter and checkpoint writes use atomic, synced replacement.
+
 ## Quickstart
 
 Nothing needs to exist first. `workers add` creates the config, writes the
@@ -103,7 +128,14 @@ other top-level key is an error, as is any unrecognized field inside a
 | `id` | string | required | `[a-z0-9-]+`, at most 40 characters; namespaces the worker's state, checkout, review store, and logs |
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
-| `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`. Empty means the whole cascade |
+| `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token |
+| `max_open_prs` | positive integer | `8` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
+| `github_state_url` | string | unset | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
+| `github_state_token_file` | string | unset | Private client-token file for the service; installation credentials stay on the server. |
+| `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`, `lint-repair`, `overlap-scan`, `overlap-fix`. Empty means the automatic cascade. Set `TAUCETI_OVERLAP_BATCH_COMMITS` through `env` to override the calibrated 160-commit scan batch. |
+| `claude_billing` | string | `"subscription"` | `"api"` requires `agent = "claude"`; API mode bypasses subscription quota polling |
+| `budget` | bool | `false` | Admit API sessions through the shared local grant ledger; active sessions are never cut off by funding |
+| `anthropic_api_key_file` | string | unset | Private key-file path for API mode; otherwise use `ANTHROPIC_API_KEY`; never store a raw key in config |
 | `sandbox` | string | `"host"` | `host` or `bubble`. Progress-report rounds always run on the host |
 | `ignore_quota` | bool | `false` | Skip soft pacing. Provider hard limits still apply; an `auto` worker cannot launch with this enabled |
 | `auto_refresh` | bool | `false` | Renew this worker's Claude and Codex access tokens when they expire, instead of parking until a human runs `claude` or `codex`. Only safe when nothing else uses the same credential file — the refresh token is single-use. On macOS the Claude half is a no-op: set `TAUCETI_CLAUDE_WARM = "1"` in the worker's `env` table instead, which renews the operator's Keychain token with a one-turn `claude` warm-up. See [quota and pacing](quota.md) |
@@ -201,6 +233,9 @@ entry with `enabled = true`.
 | `--agent AGENT` | `agent` |
 | `--only TASKS` | `only`, as a comma-separated list |
 | `--sandbox {host,bubble}` | `sandbox` |
+| `--claude-billing {subscription,api}` | `claude_billing` |
+| `--budget` | `budget` |
+| `--anthropic-api-key-file PATH` | `anthropic_api_key_file` |
 | `--ignore-quota` | `ignore_quota`; use with an explicit subscription agent |
 | `--auto-refresh` | `auto_refresh` |
 | `--roadmap-only AREA` | `roadmap_only` |
@@ -366,6 +401,38 @@ Each managed worker publishes a structured state such as `waiting-quota`,
 the path to its logfile. That is what `tauceti workers status` and the
 dashboard's workers view read.
 
+Every work round samples its host process tree's resident memory every two seconds,
+including agent and Lean subprocesses. Live resource statistics appear under
+`resources` in `workers status --json`. Round completion writes a `resources:` line
+to the existing worker log and appends structured measurements to
+`logs/<worker-id>/resources.jsonl`; cumulative completed-round statistics live in
+`state/<worker-id>/resources.json` and survive restarts.
+
+CPU time includes the round and running or waited-for child processes. Average CPU
+uses elapsed wall time: 100% means one logical core, and parallel builds may exceed
+100%. The worker average includes time between rounds since recording began; the
+round average covers just that round. `peak_tree_rss_bytes` is the highest sampled
+sum of resident memory across the process tree, including shared pages in each
+process. `max_process_rss_bytes` is the kernel's single-process high-water reading,
+which also catches short-lived children between samples. Neither is proportional
+set size (PSS). Container workloads in Bubble are outside these host measurements.
+Historical tree peaks before recording started cannot be reconstructed.
+
+Reporting does not control whether useful work may continue. Status lock waits
+are bounded and unsent fields retry on a later update; a failed status write leaves the supervisor's identity available
+over its control socket and retries the pending fields on a later heartbeat.
+Unavailable log files fall back to console output. Optional GitHub identity caches,
+CLI instrumentation and endpoint metrics may also fail without rejecting an
+authenticated request. A temporary CLI launcher preserves quota handling when
+the normal launcher directory is unavailable, without moving retained publications.
+Under these failures, retained metrics can be incomplete and worker status marks
+degraded instrumentation.
+
+A final cost-receipt write failure preserves the native agent's exit status and
+result. The accounting bridge still attempts settlement, while missing receipts
+retain their spending reservations until recovery. Actual funding admission and
+provider quota handling continue to apply independently of reporting.
+
 ## tmux is a viewer, not the supervisor
 
 `tauceti workers tmux` opens one dashboard window plus one log-following window
@@ -386,3 +453,22 @@ tauceti workers import workers.conf
 
 Anything the legacy parser does not recognize is an error naming the file, line,
 and token, so a partial migration is never silently accepted.
+
+## Integration-only dependency repairs
+
+Bors retries an unchanged automatically reviewed bump after main advances, with
+three retries per head. This uses the existing Bors heartbeat and leaves the
+branch and its reviews intact. Workers do not request queue retries.
+
+Bors durably hands a confirmed singleton failure to proof repair when no retry
+is currently possible or its budget is exhausted, then publishes
+`bump-integration`. Later main advances cannot retry that handed-off head.
+The bump phase recognizes that status alongside a green standalone build. Before
+spending on an editor, it checks the live exact-head PR and Bors `bump_repairs`
+handoff. Pending or active queue work, withdrawals, draft/closed PRs and holds
+are excluded. A second check after taking the normal branch claim closes the
+selection gap. Failed observations decline the candidate and leave unrelated
+work available. Normal bump editing budgets apply. The repair session fetches
+and merges current main, diagnoses the actual integration failure, preserves
+the dependency target and verifies its changes before pushing. Healthy surveys
+make no additional API calls.

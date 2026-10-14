@@ -20,6 +20,32 @@ SHIM = SCRIPTS / "shim"
 
 fails = 0
 
+# The worker reads a PR's issue comments with one GraphQL query (GitHub._issue_comments); its argv
+# carries this name, which is how a scenario entry or a fetch count recognizes it.
+COMMENTS_QUERY = "issueOrPullRequest"
+
+
+def graphql_comments(comments: list[dict]) -> str:
+    """REST-shaped issue comments as the one-page GraphQL answer GitHub._issue_comments expects."""
+    nodes = [
+        {
+            "id": f"IC_{c['id']}",
+            "fullDatabaseId": str(c["id"]),
+            "body": c["body"],
+            "createdAt": c.get("created_at", c["updated_at"]),
+            "updatedAt": c["updated_at"],
+            "author": {"login": (c.get("user") or {}).get("login", "someone")},
+            "authorAssociation": "NONE",
+        }
+        for c in comments
+    ]
+    page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}
+    return json.dumps({"data": {"repository": {"issueOrPullRequest": {"comments": page}}}}) + "\n"
+
+
+def is_comments_fetch(argv: list[str]) -> bool:
+    return argv[:2] == ["api", "graphql"] and COMMENTS_QUERY in " ".join(argv)
+
 
 def check(name: str, cond) -> bool:
     global fails

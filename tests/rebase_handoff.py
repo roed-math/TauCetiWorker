@@ -2,8 +2,8 @@
 """A trusted head-bound request reaches only the tending worker, with bounded retries."""
 
 import importlib
-import json
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,10 +25,13 @@ def stalled(head=HEAD):
                     f"includes current `main`.\n\n<!--tauceti-merge-stalled:v1 {head}-->"}
 
 
+def with_user(row):
+    return {**row, "user": {"login": row["author"]}}
+
+
 def test_trusted_paginated_comments():
     gh = GitHub()
-    response = SimpleNamespace(returncode=0, stdout="")
-    with patch.object(gh, "_gh", return_value=response) as call:
+    with patch.object(gh, "issue_comments") as call:
         for rows, expected in [
             ([request(author="peer"), request()], True),
             ([request(author="peer")], False),
@@ -39,24 +42,21 @@ def test_trusted_paginated_comments():
             ([{"author": "tauceti-review-bot[bot]", "body": []}], False),
             ([None, [], request()], True),
         ]:
-            response.stdout = "\n".join(json.dumps(row) for row in rows)
+            call.return_value = [
+                {**row, "user": {"login": row["author"]}} if isinstance(row, dict) else row for row in rows
+            ]
             assert gh.rebase_requested(1, HEAD) is expected, rows
-        assert "--paginate" in call.call_args.args[0]
-        response.stdout = "not json"
-        assert not gh.rebase_requested(1, HEAD)
-        response.stdout = json.dumps(request())
-        response.returncode = 1
+        call.return_value = None
         assert not gh.rebase_requested(1, HEAD)
         call.reset_mock()
         assert not gh.rebase_requested(1, "invalid")
         call.assert_not_called()
         # the sweep's "flagged for a maintainer" verdict counts only when asked for (our own PRs)
-        response.returncode = 0
-        response.stdout = json.dumps(stalled())
+        call.return_value = [with_user(stalled())]
         assert not gh.rebase_requested(1, HEAD)
         assert gh.rebase_requested(1, HEAD, accept_stalled=True)
         assert not gh.rebase_requested(1, "b" * 40, accept_stalled=True)
-        response.stdout = json.dumps({**stalled(), "author": "peer"})
+        call.return_value = [with_user({**stalled(), "author": "peer"})]
         assert not gh.rebase_requested(1, HEAD, accept_stalled=True)
 
 
@@ -86,13 +86,14 @@ def test_survey_ownership_head_pause_and_budget():
         pr(8, labels=("hold",), conflicting=True),
     ]
     gh = GitHub()
-    response = SimpleNamespace(returncode=0, stdout=json.dumps(request()))
     counters = SimpleNamespace(read=lambda name: survey_mod.MAX_REBASE_ATTEMPTS if name == "rebase-pr-6" else 0)
     with (
         patch.object(survey_mod, "me", return_value="me"),
         patch.object(survey_mod, "can_push", side_effect=AssertionError("no canonical bot PRs")),
         patch.object(gh, "open_prs", return_value=raw),
-        patch.object(gh, "_gh", return_value=response) as calls,
+        patch.object(
+            gh, "issue_comments", return_value=[{**request(), "user": {"login": request()["author"]}}]
+        ) as calls,
     ):
         sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False)
     assert [c.pr for c in sv.rebaseable.actionable] == [1, 7]
@@ -104,21 +105,119 @@ def test_survey_ownership_head_pause_and_budget():
 def test_survey_takes_our_own_stalled_pr():
     """#9857 (2026-09-29): ours, ready to merge, evicted twice, flagged `needs-rebase` with a stalled marker."""
     gh = GitHub()
-    response = SimpleNamespace(returncode=0, stdout=json.dumps(stalled()))
     counters = SimpleNamespace(read=lambda name: 0)
     with (
         patch.object(survey_mod, "me", return_value="me"),
         patch.object(survey_mod, "can_push", side_effect=AssertionError("no canonical bot PRs")),
         patch.object(gh, "open_prs", return_value=[pr(1, labels=("ready-to-merge", "needs-rebase"))]),
-        patch.object(gh, "_gh", return_value=response),
+        patch.object(gh, "issue_comments", return_value=[with_user(stalled())]),
     ):
         sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False)
     assert [c.pr for c in sv.rebaseable.actionable] == [1], sv.rebaseable
     assert "stalled" in sv.rebaseable.actionable[0].reason
 
 
+def test_verified_progress_restores_budget_without_unbounded_retries():
+    gh = GitHub()
+    raw = pr(17, labels=())
+    raw["statusCheckRollup"] = [{"context": "build", "state": "SUCCESS", "startedAt": "2026-10-12T00:00:00Z"}]
+    with tempfile.TemporaryDirectory() as directory:
+        counters = survey_mod.Counters(SimpleNamespace(state=Path(directory)))
+        counters.write("rebase-pr-17", 3)
+        with (
+            patch.object(survey_mod, "me", return_value="me"),
+            patch.object(gh, "open_prs", return_value=[raw]),
+            patch.object(gh, "rebase_requested", return_value=True) as requests,
+        ):
+            cfg = SimpleNamespace(wid="test")
+            # Observe the repaired head while healthy, before later main movement.
+            survey_mod.survey(cfg, gh, None, counters, deep=False)
+            epoch = counters.rebase_budget_key(17)
+            assert epoch != "rebase-pr-17"
+            raw["mergeable"] = "CONFLICTING"
+            selected = survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.actionable[0]
+            assert selected.attempts == 0 and selected.rebase_budget_key == epoch
+            for _ in range(3):
+                counters.incr(epoch)
+            assert survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.suppressed[0].attempts == 3
+            # A new commit alone and a hold both leave that cap in place.
+            raw["headRefOid"] = "b" * 40
+            raw["statusCheckRollup"][0]["state"] = "FAILURE"
+            assert survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.suppressed[0].attempts == 3
+            raw["mergeable"] = "MERGEABLE"
+            raw["statusCheckRollup"][0]["state"] = "SUCCESS"
+            raw["labels"] = [{"name": "hold"}]
+            survey_mod.survey(cfg, gh, None, counters, deep=False)
+            assert counters.rebase_budget_key(17) == epoch
+            # A live reconciliation request also blocks renewal on green CI.
+            raw["labels"] = [{"name": "needs-rebase"}]
+            assert survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.suppressed[0].attempts == 3
+            raw["labels"] = []
+            survey_mod.survey(cfg, gh, None, counters, deep=False)
+            raw["mergeable"] = "CONFLICTING"
+            selected = survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.actionable[0]
+            assert selected.attempts == 0 and selected.rebase_budget_key != epoch
+            assert requests.call_count == 1  # no extra GitHub reads for checkpoints
+
+
+def test_green_push_handoff_cycle_keeps_its_per_pr_bound():
+    gh = GitHub()
+    raw = pr(18)
+    raw["statusCheckRollup"] = [{"context": "build", "state": "SUCCESS", "startedAt": "2026-10-12T00:00:00Z"}]
+    with tempfile.TemporaryDirectory() as directory:
+        counters = survey_mod.Counters(SimpleNamespace(state=Path(directory)))
+        with (
+            patch.object(survey_mod, "me", return_value="me"),
+            patch.object(gh, "open_prs", return_value=[raw]),
+            patch.object(gh, "rebase_requested", return_value=True),
+        ):
+            cfg = SimpleNamespace(wid="test")
+            for i, character in enumerate("abcd"):
+                raw["headRefOid"] = character * 40
+                raw["labels"] = []
+                survey_mod.survey(cfg, gh, None, counters, deep=False)
+                raw["labels"] = [{"name": "needs-rebase"}]
+                sv = survey_mod.survey(cfg, gh, None, counters, deep=False)
+                if i < 3:
+                    selected = sv.rebaseable.actionable[0]
+                    assert selected.rebase_budget_key == "rebase-pr-18" and selected.attempts == i
+                    counters.incr(selected.rebase_budget_key)
+                else:
+                    assert not sv.rebaseable.actionable
+                    assert sv.rebaseable.suppressed[0].attempts == 3
+            # A comment read failure does not permit checkpoint renewal while
+            # the label remains, even on another successful head.
+            before = counters.rebase_budget_key(18)
+            raw["headRefOid"] = "e" * 40
+            with patch.object(gh, "rebase_requested", return_value=False):
+                sv = survey_mod.survey(cfg, gh, None, counters, deep=False)
+            assert not sv.rebaseable.actionable and counters.rebase_budget_key(18) == before
+
+
+def test_broken_retry_evidence_suppresses_rebase():
+    gh = GitHub()
+    raw = pr(19, labels=(), conflicting=True)
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory)
+        counters = survey_mod.Counters(SimpleNamespace(state=state))
+        (state / "rebase-progress-19.json").write_text("{")
+        with patch.object(survey_mod, "me", return_value="me"), patch.object(gh, "open_prs", return_value=[raw]):
+            sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False)
+        assert not sv.rebaseable.actionable
+        assert "checkpoint is unreadable" in sv.rebaseable.suppressed[0].reason
+        (state / "rebase-progress-19.json").unlink()
+        (state / "rebase-pr-19").write_text("")
+        with patch.object(survey_mod, "me", return_value="me"), patch.object(gh, "open_prs", return_value=[raw]):
+            sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, counters, deep=False)
+        assert not sv.rebaseable.actionable
+        assert "counter is malformed" in sv.rebaseable.suppressed[0].reason
+
+
 if __name__ == "__main__":
     test_trusted_paginated_comments()
     test_survey_ownership_head_pause_and_budget()
     test_survey_takes_our_own_stalled_pr()
+    test_verified_progress_restores_budget_without_unbounded_retries()
+    test_green_push_handoff_cycle_keeps_its_per_pr_bound()
+    test_broken_retry_evidence_suppresses_rebase()
     print("PASS: trusted fork handoff, ownership, stale heads, pause labels, retry cap and our own stalled PRs")

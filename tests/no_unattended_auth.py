@@ -37,6 +37,10 @@ ALLOW = {
         "tauceti_worker/github.py",
         'raise Die("could not determine the authenticated GitHub account (run `gh auth login`)")',
     ),
+    (
+        "tauceti_worker/github.py",
+        'f"no GitHub credential for {account}; log that account in with `gh auth login --hostname github.com`"',
+    ),
     ("tauceti_worker/identity.py", "_INVALID_RE = re.compile("),
     (
         "scripts/docker-entrypoint",

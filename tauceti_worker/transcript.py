@@ -188,6 +188,8 @@ class AgentTranscriptRenderer:
         # each Codex turn its token counts. The fleet paces outside-list work by these (round spend).
         self.cost_usd: float | None = None
         self.tokens: dict[str, int] = {}
+        self.compactions = 0
+        self.usage: dict[str, int] = {}
 
     def render_line(self, raw: str) -> str:
         if self.provider not in {"codex", "claude"}:
@@ -201,6 +203,29 @@ class AgentTranscriptRenderer:
             return raw
         if not isinstance(event, dict):
             return raw
+
+        kind, subtype = event.get("type"), event.get("subtype")
+        if kind in {"context.compacted", "context_compacted", "thread.compacted"} or (
+            kind == "system" and subtype == "compact_boundary"
+        ):
+            self.active = True
+            self.compactions += 1
+            return _line("compaction", f"{self.provider}; count={self.compactions}")
+        if kind in {"turn.completed", "result"} and isinstance(event.get("usage"), dict):
+            self.usage = {
+                key: value
+                for key, value in event["usage"].items()
+                if key
+                in {
+                    "input_tokens",
+                    "output_tokens",
+                    "cached_input_tokens",
+                    "reasoning_output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                }
+                and type(value) is int
+            }
 
         try:
             rendered = self._render_codex(event) if self.provider == "codex" else self._render_claude(event)
@@ -514,6 +539,8 @@ class AgentTranscriptRenderer:
             if isinstance(value, int):
                 self.tokens[key] = self.tokens.get(key, 0) + value
         rendered = [_line("result", detail)]
+        if self.usage:
+            rendered.append(_line("usage", "; ".join(f"{key}={value}" for key, value in self.usage.items())))
 
         result = event.get("result")
         if isinstance(result, str) and result.strip() and result.strip() != (self._last_assistant or "").strip():

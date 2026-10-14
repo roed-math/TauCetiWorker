@@ -6,16 +6,31 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .constants import ROADMAP
+from .constants import MAX_OPEN_PRS, ROADMAP
 from .paths import HERE
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
+
+
+def positive_integer(value) -> int:
+    """Strict positive policy integer, shared by CLI, environment and TOML."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not re.fullmatch(r"[0-9]+", str(value)):
+        raise ValueError("must be a positive integer")
+    result = int(value)
+    if result < 1:
+        raise ValueError("must be a positive integer")
+    return result
+
+
+def max_open_prs() -> int:
+    return positive_integer(os.environ.get("TAUCETI_MAX_OPEN_PRS", MAX_OPEN_PRS))
 
 
 def is_git_url(value: str) -> bool:
@@ -31,7 +46,7 @@ def roadmap_only() -> str | None:
     """The single roadmap area the worker steers toward, as the operator set it — read live from the
     env each call so the TUI's [o] key can change it and have both the survey display and any launched
     round pick it up (children inherit TAUCETI_ROADMAP_ONLY). Tri-state: None = unset, so a fresh
-    random area is picked per round (see do_roadmap); "" = all areas; else the area name. There is
+    random area is picked before each work survey; "" = all areas; else the area name. There is
     deliberately no baked-in default, and nothing here consults the dashboard prefs — a bare CLI run
     resolves only from the env + the live area list, never from a saved dashboard preference."""
     return os.environ.get("TAUCETI_ROADMAP_ONLY")
@@ -96,6 +111,14 @@ def roadmap_areas(gh) -> list[str]:
     """The roadmap areas a user can steer toward: the subdirectories of the roadmap repo (each
     holds a README.md + Suggested.lean). Listed over the API so the TUI can offer a picker. Returns []
     if it can't be fetched (the picker then falls back to free-text entry)."""
+    from .shared_repositories import snapshot
+
+    try:
+        tree = snapshot(ROADMAP, ttl=3600)
+        if tree:
+            return sorted(path.name for path in (tree / "TauCetiRoadmap").iterdir() if path.is_dir())
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        pass
     out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')
     return sorted(out.splitlines()) if out else []
 
@@ -238,7 +261,10 @@ def one_line(text: str, limit: int = 200) -> str:
 
 def log(msg: str) -> None:
     line = f"{time.strftime('%F %T')} tauceti: {msg}"
-    print(line, file=sys.stderr, flush=True)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
     if _LOG_FH is not None:
         try:
             _LOG_FH.write(_ANSI_RE.sub("", line) + "\n")
@@ -269,3 +295,15 @@ class NoProgress(Exception):
     def __init__(self, message: str = "", *, declined: bool = False):
         super().__init__(message)
         self.declined = declined
+
+
+class AdmissionUnavailable(NoProgress):
+    """Local API admission needs a bounded recheck, without no-progress backoff."""
+
+
+class GitHubUnavailable(NoProgress):
+    """GitHub infrastructure pause; completed work and PR attempt budgets survive."""
+
+    def __init__(self, message: str, *, retry_at: float | None = None):
+        super().__init__(message)
+        self.retry_at = retry_at

@@ -21,6 +21,7 @@ FAIL_FAST=0
 
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
+  api_budget.py
   agent_cmds.py
   agent_transcript.py
   declined_round.py
@@ -36,6 +37,7 @@ RUN_STDLIB=(
   review_target_priority.py
   declined_targets.py
   decide_round.py
+  decide_retire.py
   safe_push_resync.py
   progress_threshold.py
   progress_threshold_round.py
@@ -58,6 +60,7 @@ RUN_STDLIB=(
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py
+  bump_integration.py
   claude_config_dir.py
   claude_keychain.py
   claude_warm.py
@@ -67,6 +70,8 @@ RUN_STDLIB=(
   codex_fallback.py
   codex_refresh.py
   contest_claim.py
+  compact_surveys.py
+  cost_model.py
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
@@ -90,10 +95,18 @@ RUN_STDLIB=(
   gate_t16_store_unavailable.py
   gate_body_is_not_a_status.py
   publication_prune.py
+  github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
+  github_shared_transport.py
+  github_state.py
+  github_state_rollout.py
+  github_state_reconciliation.py
+  github_outbox.py
+  github_pause.py
   host_agent_preflight.py
   identity_gate.py
+  host_build_cache.py
   ignore_quota_hardblock.py
   infra_failure_budget.py
   setup_failure_budget.py
@@ -109,7 +122,9 @@ RUN_STDLIB=(
   no_unattended_auth.py
   oauth_refresh_loop.py
   oauth_user_agent.py
+  observability_failures.py
   open_pr_pages.py
+  overlaps.py
   pace_curve.py
   pr_targeting.py
   preflight_review_lake.py
@@ -120,6 +135,7 @@ RUN_STDLIB=(
   quota_cache_fp.py
   quota_loop_refresh.py
   rebase_handoff.py
+  rebase_budget.py
   review_sync_failure.py
   quota_claude_bootstrap.py
   quota_claude_windows.py
@@ -139,10 +155,13 @@ RUN_STDLIB=(
   round_done_hook.py
   round_file_changes.py
   round_group_sweep.py
+  resources.py
   rubric_bundle.py
   safe_exists.py
   scoreboard_trust.py
+  security_audit.py
   shared_build_caches.py
+  shared_repositories.py
   source_argument.py
   spread_candidates.py
   ssl_cert_file.py
@@ -161,15 +180,22 @@ SKIP=(egress.sh)
 pass=0; fail=0; failed=()
 
 # run <label> <cmd...> : run a test, tally the result, honour --fail-fast
+# Repository snapshots under a transport dir are read-only.
+drop() { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }
+
 run() {
   local label="$1"; shift
   echo "== $label =="
-  if "$@"; then
+  # The GitHub transport keeps its outbox and request ledger under TAUCETI_GITHUB_SHARED_DIR (default:
+  # the checkout's state/). One test's retained publication would hold the next test's identical one.
+  local shared; shared="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-github.XXXXXX")"
+  if TAUCETI_GITHUB_SHARED_DIR="$shared" "$@"; then
     echo "  [PASS] $label"; pass=$((pass + 1))
   else
     echo "  [FAIL] $label (rc=$?)"; fail=$((fail + 1)); failed+=("$label")
-    [ "$FAIL_FAST" = 1 ] && { summary; exit 1; }
+    [ "$FAIL_FAST" = 1 ] && { drop "$shared"; summary; exit 1; }
   fi
+  drop "$shared"
   echo
 }
 

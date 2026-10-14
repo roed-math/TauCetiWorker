@@ -20,7 +20,17 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests" / "fakes"))
 
-from harness import check, fake_calls, fake_env, finish, mktemp, scrub_env  # noqa: E402
+from harness import (  # noqa: E402
+    COMMENTS_QUERY,
+    check,
+    fake_calls,
+    fake_env,
+    finish,
+    graphql_comments,
+    is_comments_fetch,
+    mktemp,
+    scrub_env,
+)
 
 scrub_env()
 os.environ.pop("TAUCETI_SHARED_READ_CACHE", None)
@@ -38,9 +48,10 @@ COMMENTS = [
 SCENARIO = {
     "gh": [
         {
-            "match": ["api", "--paginate", f"/repos/TauCetiProject/TauCeti/issues/{PR}/comments?per_page=100"],
+            "match": ["api", "graphql"],
+            "contains": COMMENTS_QUERY,
             "rc": 0,
-            "stdout": json.dumps(COMMENTS) + "\n",
+            "stdout": graphql_comments(COMMENTS),
         }
     ],
     "git": [],
@@ -83,7 +94,7 @@ def read(fleet: str, shared: bool, *args: str) -> dict:
 
 
 def fetches() -> int:
-    return len([a for a in fake_calls(TMP, "gh") if a[:2] == ["api", "--paginate"] and "comments" in a[2]])
+    return len([a for a in fake_calls(TMP, "gh") if is_comments_fetch(a)])
 
 
 # ---- 1. shared: the second fleet starts on the first fleet's read ----------------------------------------------

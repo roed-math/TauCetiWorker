@@ -3,6 +3,7 @@ agent/task tables."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 
@@ -54,7 +55,15 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "dbb229dec0434fd7faaa18a79c776b18f18a8252")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "1feea7926eefd7129089bb060a47c28ae915a877")
+# A repaired tool gets a fresh error budget. Failures of an older pinned release must not
+# permanently suppress progress after an upgrade; the attempt gap still limits retries.
+# Keep the usual immutable SHA readable, and hash other refs so a branch name containing
+# slashes cannot become a directory path. Mutable refs retain their budget until renamed.
+_PROGRESS_ERROR_REF = (
+    PROGRESS_REF if re.fullmatch(r"[0-9a-f]{40}", PROGRESS_REF) else hashlib.sha256(PROGRESS_REF.encode()).hexdigest()
+)
+PROGRESS_ERROR_KEY = f"progress-err-{_PROGRESS_ERROR_REF}"
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
@@ -104,13 +113,19 @@ MAX_CI_ATTEMPTS = 3  # per-head: stop trying to green a red-CI head
 
 MAX_CI_PR_ATTEMPTS = 5  # per-PR lifetime backstop for red-CI fixing
 
-MAX_REBASE_ATTEMPTS = 3  # per-PR: stop trying to rebase a conflicting PR
+MAX_REBASE_ATTEMPTS = 3  # conflict attempts per verified progress checkpoint; handoffs keep a per-PR cap
 
 MAX_BUMP_ATTEMPTS = 3  # per-head: stop trying to green a red bump-mathlib head
 
 MAX_BUMP_PR_ATTEMPTS = 5  # per-PR lifetime backstop for bump fixing across heads
 
 BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mathlib-bump PRs on
+MAX_LINT_REPAIR_ATTEMPTS = 3  # per-head: stop trying to green a red lint-repair head
+MAX_LINT_REPAIR_PR_ATTEMPTS = 6  # per-PR lifetime backstop for lint repair across heads
+# Branch prefix of the repair PR TauCeti's daily full lint (.github/workflows/lint-full.yml) opens
+# when main carries environment-lint violations that PR builds, which lint only changed modules,
+# could not see.
+LINT_REPAIR_HEAD_PREFIX = "lint-repair/"
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
 # are open. An operator may override the project's default with $TAUCETI_MAX_OPEN_PRS.
@@ -142,7 +157,9 @@ ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min h
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
-EX_HALTED = 77  # sysexits EX_NOPERM: the identity gate halted the worker (halt.json written; no retry, no back-off)
+EX_ADMISSION_WAIT = 76  # API funding/queue/throughput wait, outside the round timeout
+EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
+EX_HALTED = 78  # the identity gate halted the worker (halt.json written; no retry, no back-off)
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -268,19 +285,21 @@ AGENT_NAMES = {
 
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
 # selected, host and bubble launchers consume this exact model/effort profile.
-# Review models are configured separately by the review engine.
-CODEX_AUTHORING_FALLBACK_MODEL = "gpt-5.6-terra"
+# Claude reviews share this default; other review models follow the review engine's policy.
+CODEX_AUTHORING_FALLBACK_MODEL = "gpt-6-luna"
 # A model entitlement normally changes only when an account's subscription changes. Keep the
 # side-effect-free access probe out of every round while still noticing an upgrade promptly.
 CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
-    # Prefer flagship Sol for authoring. A cached preflight probe selects Terra only when Codex confirms
+    # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
-    # Pin Claude to the current exact Opus generation, not its moving alias.
-    "codex": ("gpt-5.6-sol", "high"),
-    "claude": ("claude-opus-5", "high"),
+    "codex": ("gpt-6.1-sol", "high"),
+    # Pin Claude authoring, reviews and quota bootstrap to an exact model, not the moving opus alias.
+    # The review engine must price a new model first, so update TauCetiReview before this default.
+    "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
     # id (for example claude-opus-5) with the existing --author-model flag.
+    # Kiro does not serve gpt-6-sol yet (https://kiro.dev/changelog/models/).
     "kiro": ("gpt-5.6-sol", "high"),
 }
 
@@ -300,9 +319,23 @@ CODEX_REFRESH_SKEW_S = int(os.environ.get("TAUCETI_CODEX_REFRESH_SKEW", str(48 *
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 # `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap", "curate", "decide"]
+ALLOWED_TASKS = [
+    "rebase",
+    "review",
+    "fix-ci",
+    "fix",
+    "bump",
+    "progress",
+    "roadmap",
+    "lint-repair",
+    "overlap-scan",
+    "overlap-fix",
+    "curate",
+    "decide",
+]
 
-WORK_TASKS = list(ALLOWED_TASKS)
+EXPLICIT_TASKS = ("security-audit",)
+WORK_TASKS = [*ALLOWED_TASKS, *EXPLICIT_TASKS]
 
 # Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
 # honor the project's globally paced progress reporting. The worker's fix/CI maintenance remains
@@ -313,18 +346,31 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # runs it under `--only curate` on a timer (2026-09-21: a periodic round found "no eligible work"
 # because the stage was surveyed but never dispatched). `decide` is last for the same reason: it rules
 # on declined rounds (decide.py), and the fleet runs it under `--only decide` when one is recorded.
-AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review", "curate", "decide")
+AUTO_STAGES = (
+    "rebase",
+    "bump",
+    "lint-repair",
+    "progress",
+    "fix-ci",
+    "fix",
+    "review",
+    "overlap-fix",
+    "overlap-scan",
+    "curate",
+    "decide",
+)
 
-# The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The two
-# left out cannot be named by a PR number at all: `progress` writes a roadmap's generated reports
-# rather than touching a PR of ours, and `roadmap` opens a PR that does not exist yet. Both carry a
+# The work units that act on an EXISTING pull request, and so are the ones `--pr` can target. The
+# others write reports, investigate Mathlib commits or open new PRs. They carry a
 # pr=0 candidate, which is why no `--pr` value is allowed to be 0.
-PR_TASKS = ("rebase", "bump", "fix-ci", "fix", "review")
+PR_TASKS = ("rebase", "bump", "lint-repair", "fix-ci", "fix", "review")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
 # runtime priority. Keeping those concepts separate avoids silently rebinding established digit keys.
-KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> "rebase", ...
+# The fleet's own stages (curate, decide) come after the ten digits and have no key: the fleet runs
+# them under `--only`, and the TUI still reaches them with the cursor.
+KIND_KEYS = {key: name for key, name in zip("1234567890", ALLOWED_TASKS[:10], strict=True)}
 
 KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}  # "rebase" -> "1", ...
 
@@ -354,6 +400,7 @@ DECIDE_MAX_CLOSES_PER_DAY = int(os.environ.get("TAUCETI_DECIDE_MAX_CLOSES_PER_DA
 CURATE_GAP = int(os.environ.get("TAUCETI_CURATE_GAP", "21600"))  # 6 h
 CURATE_TTL = int(os.environ.get("TAUCETI_CURATE_TTL", "600"))
 CURATE_MAX_CANDIDATES = int(os.environ.get("TAUCETI_CURATE_MAX_CANDIDATES", "12"))
+SANDBOX_DEFAULT["overlap-scan"] = False  # host investigation; publication stays outside the model
 
 
 AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]

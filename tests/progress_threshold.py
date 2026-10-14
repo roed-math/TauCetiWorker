@@ -293,7 +293,9 @@ check("a report nobody has landed for ADOPT_AFTER is adopted", acted and any("#7
 
 seen = []
 saved = (tc.work_units.survey, tc.work_units.dispatch)
-tc.work_units.survey = lambda *_a, **kw: seen.append(kw) or tc.Survey(worker_id="t")
+tc.work_units.survey = lambda *_a, **kw: (
+    seen.append({k: kw[k] for k in ("deep", "progress_check")}) or tc.Survey(worker_id="t")
+)
 tc.work_units.dispatch = lambda *a, **k: 0
 try:
     worker = SimpleNamespace(cfg=None, gh=None, rs=None, counters=None)

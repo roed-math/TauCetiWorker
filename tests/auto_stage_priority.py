@@ -2,10 +2,12 @@
 """The unrestricted work predictor and runtime follow the documented priority order."""
 
 import os
+import runpy
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -28,8 +30,20 @@ checks = [
     check(
         "single shared auto order",
         tc.AUTO_STAGES,
-        # curate is last: it is about the operator's target list, not a PR, and keeps its own cadence.
-        ("rebase", "bump", "progress", "fix-ci", "fix", "review", "curate", "decide"),
+        # curate and decide are last: they serve the operator, not a PR, and keep their own cadence.
+        (
+            "rebase",
+            "bump",
+            "lint-repair",
+            "progress",
+            "fix-ci",
+            "fix",
+            "review",
+            "overlap-fix",
+            "overlap-scan",
+            "curate",
+            "decide",
+        ),
     ),
 ]
 if "TAUCETI_PROGRESS_GAP" not in os.environ:
@@ -119,9 +133,116 @@ with tempfile.TemporaryDirectory() as tmp:
 checks.append(check("fresh not-due plan returns the fallthrough signal", progress_result, None))
 checks.append(check("fresh plan re-check records the attempt", writes[0][0], "progress-attempt-ts"))
 
+# Starting a progress attempt consumes the cached due verdict even when the fresh plan fails. Without
+# this, the cache is consulted before the eight-hour attempt gap and the worker can spend its whole
+# three-error breaker in a few minutes retrying the identical failure.
+with tempfile.TemporaryDirectory() as tmp:
+    state = Path(tmp)
+    due_cache = state / "cache" / "progress-due.json"
+    due_cache.parent.mkdir(parents=True)
+    due_cache.write_text('{"due": true, "reason": "due"}')
+    counters = tc.Counters(SimpleNamespace(state=state))
+    progress_worker = SimpleNamespace(
+        cfg=SimpleNamespace(state=state, checkout=state / "code", logdir=state / "logs"),
+        counters=counters,
+    )
+
+    def failing_plan(argv, *_a, **_k):
+        if "plan" in argv:
+            return SimpleNamespace(returncode=1, stdout="", stderr="broken plan")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    tc.work_units.prepare_checkout = lambda _cfg: True
+    tc.work_units.subprocess.run = failing_plan
+    try:
+        try:
+            tc.work_units._do_progress_inner(progress_worker, None)
+        except tc.Die:
+            pass
+        else:
+            checks.append(check("a failed progress plan raises Die", False, True))
+    finally:
+        tc.work_units.prepare_checkout = saved_prepare_checkout
+        tc.work_units.subprocess.run = saved_run
+    checks.append(check("a failed attempt consumes the cached due verdict", due_cache.exists(), False))
+    checks.append(check("a failed plan still charges the error breaker", counters.read(tc.PROGRESS_ERROR_KEY), 1))
+    due, reason = tc.progress_due(progress_worker.cfg, counters)
+    checks.append(
+        check(
+            "the next survey observes the attempt gap instead of retrying cached due work",
+            due is False and "waiting out the attempt gap" in reason,
+            True,
+        )
+    )
+
+# Upgrading the progress tool must recover workers latched by the previous release, while
+# repeated failures of the current release still trip the breaker without another tool call.
+with tempfile.TemporaryDirectory() as tmp:
+    state = Path(tmp)
+    cfg = SimpleNamespace(state=state)
+    counters = tc.Counters(cfg)
+    counters.write("progress-err", tc.MAX_PROGRESS_ERRORS)  # legacy unversioned state
+    counters.write("progress-err-old-release", tc.MAX_PROGRESS_ERRORS)
+    calls = []
+
+    def due_tool(argv, *_a, **_k):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="due", stderr="")
+
+    tc.work_units.subprocess.run = due_tool
+    try:
+        due, reason = tc.progress_due(cfg, counters)
+        checks.append(check("old progress failures do not suppress an upgraded tool", due, True))
+        for _ in range(tc.MAX_PROGRESS_ERRORS):
+            counters.incr(tc.PROGRESS_ERROR_KEY)
+        tc.bust_progress_cache(cfg)
+        due, reason = tc.progress_due(cfg, counters)
+        checks.append(check("current progress failures still trip the breaker", due, False))
+        checks.append(check("the breaker names the current counter file", tc.PROGRESS_ERROR_KEY in reason, True))
+        checks.append(check("a latched current release does not launch the tool", len(calls), 1))
+    finally:
+        tc.work_units.subprocess.run = saved_run
+
+# Branch refs used to trial a release must still produce a writable counter filename.
+with tempfile.TemporaryDirectory() as tmp:
+    with patch.dict(os.environ, {"TAUCETI_PROGRESS_REF": "fix/bors-progress"}):
+        branch_constants = runpy.run_path(str(REPO / "tauceti_worker" / "constants.py"))
+    branch_key = branch_constants["PROGRESS_ERROR_KEY"]
+    counters = tc.Counters(SimpleNamespace(state=Path(tmp)))
+    for _ in range(tc.MAX_PROGRESS_ERRORS):
+        counters.incr(branch_key)
+    checks.append(check("a branch ref can persist its error budget", counters.read(branch_key), tc.MAX_PROGRESS_ERRORS))
+    checks.append(check("a branch ref does not become a counter directory", "/" in branch_key, False))
+
+# If no requested phase can run, a focused progress worker must retain the survey's suppression reason
+# for its manager/status output instead of collapsing it into the generic no-eligible-work fallback.
+suppressed = tc.Survey(worker_id="test")
+suppressed.progress.suppressed.append(tc.Candidate(0, "", "progress rounds have failed 3x; clear the breaker"))
+saved_survey = tc.work_units.survey
+tc.work_units.survey = lambda *_a, **_k: suppressed
+try:
+    try:
+        tc.work_units.run_round(worker, SimpleNamespace(only=["bump", "progress"], dry_run=True))
+    except tc.NoProgress as exc:
+        suppressed_reason = str(exc)
+    else:
+        suppressed_reason = ""
+finally:
+    tc.work_units.survey = saved_survey
+checks.append(
+    check(
+        "focused progress no-work preserves its suppression reason",
+        suppressed_reason,
+        "progress: progress rounds have failed 3x; clear the breaker",
+    )
+)
+
 # Bumps and rebases remain ahead of reporting.
 busy.bump.actionable.append(candidate)
 checks.append(check("bump beats a due progress report", tc._next_auto_stage(busy), "bump"))
+busy.bump.actionable.clear()
+busy.lint_repair.actionable.append(candidate)
+checks.append(check("lint-repair beats a due progress report", tc._next_auto_stage(busy), "lint-repair"))
 busy.rebaseable.actionable.append(candidate)
 checks.append(check("rebase remains first", tc._next_auto_stage(busy), "rebase"))
 
@@ -134,6 +255,12 @@ checks.append(check("progress beats roadmap authoring", tc._next_auto_stage(quie
 # And when no report is due, the fallback is roadmap authoring as before.
 idle = tc.Survey(worker_id="test")
 checks.append(check("no report due falls back to roadmap", tc._next_auto_stage(idle), "roadmap"))
+idle.overlap_scan.actionable.append(tc.Candidate(0, "cursor", "behind pin"))
+checks.append(check("Mathlib scan beats new roadmap authoring", tc._next_auto_stage(idle), "overlap-scan"))
+idle.overlap_fix.actionable.append(tc.Candidate(0, "123", "overlap issue"))
+checks.append(check("overlap repair beats further scanning", tc._next_auto_stage(idle), "overlap-fix"))
+idle.reviewable.actionable.append(candidate)
+checks.append(check("existing PR review still beats overlap work", tc._next_auto_stage(idle), "review"))
 
 sv.red_ci.actionable.append(candidate)
 checks.append(check("red CI beats review findings", tc._next_auto_stage(sv), "fix-ci"))

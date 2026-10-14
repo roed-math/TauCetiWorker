@@ -35,6 +35,14 @@ def lines():
     return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
 
 
+def unhold(quota):
+    """Lift both holds a 429 leaves: the token's usage-hold.json and the account's cooldown."""
+    (quota.cache_dir / "usage-hold.json").unlink(missing_ok=True)
+    for held in quota.cache_dir.glob("ratelimit-*.json"):
+        held.unlink()
+    Q._COOLDOWNS.clear()
+
+
 Q._http_get_json = lambda url, headers, timeout=15: (429, {}, 1319.0)
 prov, readings = q._claude_pass("fp1", "tok", refresh=True)
 rec = (lines() or [{}])[-1]
@@ -48,7 +56,7 @@ def boom(url, headers, timeout=15):
 
 
 Q._http_get_json = boom
-(q.cache_dir / "usage-hold.json").unlink(missing_ok=True)  # the 429 above holds the token; this case wants a request
+unhold(q)  # the 429 above holds the token; this case wants a request
 q._claude_pass("fp1", "tok", refresh=True)
 rec = (lines() or [{}])[-1]
 check("a failed request is logged with no status", len(lines()) == 2 and rec.get("status") is None
@@ -56,7 +64,7 @@ check("a failed request is logged with no status", len(lines()) == 2 and rec.get
 
 # a valid cached reading serves an unforced read: no request, no line
 q._cached_claude = lambda fp: ({"x": 1}, 0.0)
-q._from_cached_claude = lambda cached: ("cached", [])
+q._from_cached_claude = lambda cached: (Q.Provider("claude", True, None), [])
 q._claude_pass("fp1", "tok", refresh=False)
 check("a cache hit makes no request and logs nothing", len(lines()) == 2, str(len(lines())))
 
@@ -86,12 +94,12 @@ def cache(age):
 cache(2 * 3600)
 check("a 2-hour-old reading is past the ordinary staleness bound", q2._cached_claude("fp2") is None)
 for code, served in ((429, True), (503, True), (401, False)):
-    (q2.cache_dir / "usage-hold.json").unlink(missing_ok=True)
+    unhold(q2)
     Q._http_get_json = lambda url, headers, timeout=15, code=code: (code, {}, 600.0 if code == 429 else None)
     _prov, readings = q2._claude_pass("fp2", "tok", refresh=True)
     check(f"…and an HTTP {code} {'falls back on it' if served else 'never falls back'}", (readings is not None) == served)
 Q._http_get_json = boom
-(q2.cache_dir / "usage-hold.json").unlink(missing_ok=True)
+unhold(q2)
 check("…as does a request that fails outright", q2._claude_pass("fp2", "tok", refresh=True)[1] is not None)
 
 # ---- after a 429 the token does not ask again until the wait (plus a margin) has run out
@@ -104,7 +112,7 @@ def counted(url, headers, timeout=15):
 
 
 Q._http_get_json = counted
-(q2.cache_dir / "usage-hold.json").unlink(missing_ok=True)
+unhold(q2)
 q2._claude_pass("fp2", "tok", refresh=True)
 hold = q2._usage_hold("fp2")
 check("a 429 holds the token for its wait plus the margin", 600 + Q.USAGE_RETRY_MARGIN - 5 < hold <= 600 + Q.USAGE_RETRY_MARGIN, str(hold))
@@ -113,8 +121,12 @@ _prov, readings = q2._claude_pass("fp2", "tok", refresh=True)
 check("a forced read during the hold asks nothing and serves the fallback", len(calls) == 1 and readings is not None, str(len(calls)))
 cache(7 * 3600)
 prov, readings = q2._claude_pass("fp2", "tok", refresh=True)
-check("…and with no reading to fall back on, waits out the rest of the hold",
-      len(calls) == 1 and readings is None and prov.retry_after and abs(prov.retry_after - hold) < 5, str(prov.retry_after))
+# the account cooldown (its own 15-minute cap) runs beside the hold, and answers first while it lasts
+cooling = q2._cooldown("claude", "fp2")[0]
+check("…and with no reading to fall back on, waits out the rest of the cooldown",
+      len(calls) == 1 and readings is None and prov.retry_after and abs(prov.retry_after - cooling) < 5,
+      str(prov.retry_after))
+unhold(q2)  # the account cooldown is shorter than the hold, so it has run out too by then
 (q2.cache_dir / "usage-hold.json").write_text(json.dumps({"fp": "fp2", "until": time.time() - 1}))
 prov, readings = q2._claude_pass("fp2", "tok", refresh=True)
 check("once the hold has run out the token asks again", len(calls) == 2)

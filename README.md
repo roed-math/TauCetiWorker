@@ -43,12 +43,13 @@ additional requirements; see [the sandbox notes](docs/sandbox.md).
 Install it as a tool, no clone needed:
 
 ```bash
-uv tool install git+https://github.com/kim-em/TauCetiWorker.git
+uv tool install git+https://github.com/TauCetiProject/TauCetiWorker
 
 tauceti doctor                     # report the tools and credentials this host can use
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
 tauceti usage --json               # prompt-free Kiro/OpenRouter credit telemetry
+tauceti cost-model                 # agent, CI, cache, and marginal/cumulative LOC-cost estimates
 tauceti work --only review         # one round of a specific kind of work, then exit
 tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / roadmap / ...)
 tauceti work --loop                # fully automatic: keep picking the most useful job
@@ -57,6 +58,33 @@ tauceti work --loop                # fully automatic: keep picking the most usef
 Ctrl-C stops the current round and exits. From a clone you can run `./tauceti`
 instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
+
+### Multiple GitHub accounts
+
+Log each account into `gh`, then select a login for each worker:
+
+```bash
+tauceti work --worker-id alice-review --github-account alice --only review --loop
+tauceti work --worker-id bob-author --github-account bob --only roadmap --loop
+tauceti --github-account alice                 # dashboard and its launches
+tauceti doctor --github-account bob            # verify a selected account
+tauceti workers add alice-review --github-account alice --only review
+```
+
+`--github-account` (or `TAUCETI_GITHUB_ACCOUNT`) selects the named stored `gh`
+credential without changing your active `gh` login. A supplied `GH_TOKEN` or
+`GITHUB_TOKEN` can serve as a fallback when there is no stored credential, but
+must authenticate as the requested login. Loop children inherit and verify the
+selected credential. GitHub API calls, HTTPS Git operations, commit attribution,
+fork resolution, and PR maintenance all use that identity. Changing a persistent
+worker's `github_account` setting restarts it. `--account` still checks the
+Codex subscription account independently.
+
+Accounts coordinate across their forks only when they use the same writable
+claim repository: give each access to the shared namespace, or set `CLAIM_REPO`
+to a repository they can all write. Bubble mode requires the companion
+account-aware Bubble CLI and proxy; older installations reject the combination
+before launching an agent. See [GitHub accounts](docs/reference.md#github-accounts).
 
 ## The dashboard
 
@@ -91,16 +119,24 @@ status` in scripts.
 
 ## What a round does
 
+Mathlib adoption has two maintenance phases: `overlap-scan` examines batches
+between a shared cursor and Tau Ceti's pinned Mathlib commit; `overlap-fix`
+authors refactor PRs for labelled findings. They run after existing PR maintenance
+and review, before new roadmap authoring. See [Mathlib overlaps](docs/mathlib-overlaps.md).
+
 A round does exactly one unit of work: the first of these that applies.
 
 | Step | What it does |
 |------|--------------|
-| **Rebase** | Reconcile one of our conflicting PRs, or a fork update requested by the merge sweep for the current head. Both use the existing per-PR rebase-attempt cap; `keep` pauses recovery. |
+| **Rebase** | Reconcile one of our conflicting PRs, or a fork update requested by the merge sweep for the current head. Genuine conflict retries renew after a distinct head builds and becomes mergeable; sweep handoffs keep their per-PR cap. Hold labels pause recovery. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
+| **Lint repair** | Fix `TauCeti/` on a red `lint-repair/` PR. PR builds lint only the modules a change touches, so TauCeti's daily full lint opens one of these when main carries environment-lint violations elsewhere (for example, a new simp lemma that takes an older one out of simp normal form). The worker never opens one itself. |
 | **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
 | **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
+| **Overlap fix** | Refactor a labelled Mathlib overlap issue into a normal upstream PR, preserving additional Tau Ceti functionality. |
+| **Overlap scan** | Examine up to 160 consecutive Mathlib commits after the shared cursor, publish actionable overlaps as issues, then advance the cursor through the completed batch. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
 Review selection is cooperative across community workers. The worker named by
@@ -125,6 +161,56 @@ Four independent dials: which work, which pull requests, which agent, and where
 it runs. Combine them however you like.
 
 ### What work: `--only`
+
+`security-audit` is an explicit, admin-only phase outside the normal cascade:
+
+```bash
+tauceti work --only security-audit --agent codex --dry-run
+tauceti work --only security-audit --agent codex
+tauceti work --only security-audit --agent claude --loop
+```
+
+It advances TauCeti's protected `security-audit` branch through main's first-parent
+history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
+Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
+Each session receives complete per-commit diffs and before/after file contents,
+up to 20 commits and 256 KiB of input. Luna/Haiku receives no GitHub credential or
+command/edit tools; trusted Worker code alone verifies ancestry and moves the ref.
+No Lean builds or candidate scripts run. A finding, incomplete inspection, oversized
+commit or model error stops advancement. Read the retained `security-audit/blocked.json`
+in that worker's state directory. Resolve findings by explicit human attestation,
+not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
+The input, transcript and durable ledger are retained in the same directory.
+
+This phase must be selected alone, cannot use `--pr` or authoring-model overrides,
+and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
+`--agent claude` uses Haiku, with ordinary subscription pacing and no expensive fallback.
+It uses its own isolated launcher regardless of the ordinary host/Bubble setting.
+The active GitHub credential must have repository-admin permission, checked before
+spending and again before updating the cursor. New toolchain tags must be at or
+behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docbuild/docs/security-audit.md).
+
+An admin initializes the protections and original audited snapshot once with:
+
+```bash
+python3 -m tauceti_worker.security_audit setup --state /path/to/private/audit-bootstrap
+```
+
+Setup is idempotent and refuses to overwrite a differing existing ruleset. Cursor
+updates are admin-only, with separate non-bypassable deletion/rewind restrictions.
+`v*` tag creation is admin-only, and existing tags cannot be updated or deleted.
+
+After manually inspecting every intermediate commit in a blocked or oversized range,
+an admin can record the evidence and advance with the same ancestry checks:
+
+```bash
+python3 -m tauceti_worker.security_audit attest --state /path/to/worker/state/security-audit \
+  --through FULL_MAIN_SHA --reason 'Human review evidence and explanation'
+```
+
+The local ledger and blocks are operational records, not a shared authorization
+service. This design trusts admins, including credentials used by other agents;
+admin credentials should be kept out of ordinary authoring/review workers.
 
 With no `--only`, a round walks the whole cascade and does the first job that
 applies. `--only <task>[,<task>...]` pins it to particular kinds, and `--skip`
@@ -215,12 +301,15 @@ rather than wandering onto other work.
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex (`gpt-5.6-sol` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
-| `codex` | `gpt-5.6-sol`, high effort; Terra fallback if Sol is unavailable | subscription, paced |
-| `claude` | `claude-opus-5`, high effort | subscription, paced |
+| `auto` (default) | Codex (`gpt-6.1-sol` → Luna if unavailable, high) preferred; Claude (`claude-opus-5-5`, high) fallback | subscription, paced |
+| `codex` | `gpt-6.1-sol`, high effort; Luna fallback if Sol is unavailable | subscription, paced |
+| `claude` | `claude-opus-5-5`, high effort | subscription, paced |
 | `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-5` opt-in | subscription credits, unpaced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
+
+Claude authoring and reviews both default to exact `claude-opus-5-5`, on the host and in Bubble.
+Set `TAUCETI_CLAUDE_MODEL` to override reviews independently of the authoring profile.
 
 Set a default with `TAUCETI_AGENT`. Kiro and the OpenRouter agents are unpaced
 and never run on their own; you have to ask for them by name. Kiro always passes
@@ -238,7 +327,7 @@ TauCeti isolates Kiro's browser-login store so the persisted login cannot take
 precedence over the key.
 
 For an explicit provider, `--author-model` and `--author-effort` override the
-profile for one run. Pinning a Codex model also disables the automatic Terra
+profile for one run. Pinning a Codex model also disables the automatic Luna
 fallback. Every authoring launch prints its effective provider, model, effort,
 and sandbox.
 
@@ -377,6 +466,65 @@ window has room.
 [The quota notes](docs/quota.md) cover credential sources, the macOS Keychain,
 and that bootstrap in detail.
 
+## Claude API grants
+
+Use explicit API billing with `--claude-billing api` and `--agent claude`.
+Enable `--budget` to share local grants across workers. The
+[budget design](docs/api-budget-plan.md) covers accounting and recovery.
+
+API workers share one persistent local budget, including across worker
+restarts and different checkouts. The budget controls when sessions start. It
+never cuts off a running session; completed costs can take the balance negative,
+and automatic grants repay that deficit before more work starts.
+
+```bash
+tauceti budget --grant 100          # add $100 to the current balance
+tauceti budget --set-grant 50       # set the current balance to $50
+tauceti budget --grant-rate 20      # replenish at $20/hour, even while stopped
+tauceti budget                     # balance, rate, pending costs, and ledger path
+tauceti budget --log                # append-only accounting history
+
+# API key is supplied through ANTHROPIC_API_KEY or a private key file.
+tauceti work --agent claude --claude-billing api --budget --loop \
+  --worker-id worker1 --anthropic-api-key-file /path/to/anthropic.key
+```
+
+`--set-grant` records an adjustment rather than erasing history. It preserves
+the replenishment rate and costs still owed by running sessions. Setting
+`--grant-rate 0` stops replenishment; there is no accumulation ceiling or
+per-session spending cap. Active sessions carry estimates of pending costs so
+parallel workers do not all start against the same funds. Estimates only affect
+new admissions. Funding waits happen outside the timed round.
+
+The append-only ledger lives at
+`$XDG_STATE_HOME/tauceti/budget/events.jsonl` (normally
+`~/.local/state/tauceti/budget/events.jsonl` on Linux), with a macOS equivalent
+and an explicit `TAUCETI_BUDGET_DIR` override. Grants, rate changes, balance
+adjustments, session admissions, and cost settlements remain auditable. Unknown
+costs remain visible for reconciliation and retain their pending estimates.
+Workers continue whenever available funds cover the next admission; API
+throttling is handled separately from funding. Local accounting uses Claude's reported cost estimates
+and does not represent the actual credit balance in Anthropic Console.
+
+Use `tauceti budget --json` for scripts. To recover a missing cost or correct a
+settlement, use `tauceti budget --reconcile INVOCATION --cost USD --note TEXT`;
+the correction is appended to history. A cold model runs one calibration
+session before parallel admissions use learned cost estimates. Its reservation
+is at least $1, or the largest of the last 20 recorded costs across all models if that is higher;
+zero-cost launch failures do not establish a spending estimate. If that session
+loses its receipt, another calibration session can run; missing costs never
+pause the fleet merely because reconciliation is outstanding. Resuming the same
+provider session waits while a previous resume is unsettled; unrelated sessions
+can run. Recover the cumulative receipt before resuming that provider session;
+a cost-only manual reconciliation does not restore its cumulative baseline. No local budget amount is passed as
+Claude's `--max-budget-usd`. After a crashed worker, first try
+`tauceti budget --recover --note "worker crash"` to recover its durable receipts
+and remove stale staged keys. Costs without a receipt still require reconciliation.
+
+Managed workers accept the same flags through `workers add`, or the
+`claude_billing = "api"`, `budget = true`, and `anthropic_api_key_file` fields
+in `workers.toml`. Keep the raw API key out of that file.
+
 ## Further documentation
 
 - [Persistent workers](docs/workers.md): the `workers.toml` schema, every
@@ -385,6 +533,12 @@ and that bootstrap in detail.
   variable.
 - [Quota and pacing](docs/quota.md): credential sources, Claude's two windows,
   and the window bootstrap.
+- [Claude API grants design](docs/api-budget-plan.md): shared local
+  budget, append-only ledger, and API worker integration.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
+
+The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
+adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
+for initialization, coordination, and the live calibration results.
