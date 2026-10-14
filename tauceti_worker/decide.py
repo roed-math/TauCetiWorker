@@ -84,7 +84,7 @@ from .constants import DECIDE_MAX_CASES, DECIDE_MAX_CLOSES_PER_DAY, REVIEW, TAUC
 from .constants import ROADMAP as ROADMAP_REPO
 from .github import GitHub, me
 from .paths import HERE
-from .targets import _AREA_RE, insert_items, parse_targets, remove_items
+from .targets import _AREA_RE, decide_added, insert_items, parse_targets, remove_items
 
 KEEP_LABELS = {"keep", "hold", "wip", "human", "do-not-close"}
 PREREQUISITE = "prerequisite"
@@ -296,7 +296,7 @@ def _retire_prerequisites(w, open_by_no: dict, tpath: Path | None, targets) -> l
         for it in items:
             if it.status == "done" or it.slug in needed or it.slug in parked:
                 continue
-            if not any(c.strip().lower() == "added by the decide stage" for c in it.meta):
+            if not decide_added(it):
                 continue
             prs = [
                 int(n)

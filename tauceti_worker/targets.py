@@ -481,6 +481,11 @@ def insert_items(text: str, area: str, lines: list[str]) -> tuple[str, bool]:
     return "".join(out + ["\n", *section]).rstrip("\n") + "\n", True
 
 
+def decide_added(it: TargetItem) -> bool:
+    """Did the decide stage add this item, as a prerequisite a blocked PR waits on (see insert_items)?"""
+    return any(c.strip().lower() == "added by the decide stage" for c in it.meta)
+
+
 def remove_items(text: str, slugs: set[str]) -> tuple[str, list[str]]:
     """Drop the item lines of `slugs`, each with the `>` note lines directly under it. Pure. Returns the
     new text and the slugs removed, in file order."""

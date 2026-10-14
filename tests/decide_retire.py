@@ -3,9 +3,11 @@
 
 A decide-added item whose PR merged or closed comes off the list with its note lines; one whose PR is
 still open, one another open item needs, one a parked PR waits on, a done one, and an operator's item
-with no `added by the decide stage` clause all stay. A failed state read keeps the item. Exit 0 = all hold."""
+with no `added by the decide stage` clause all stay. A failed state read keeps the item. With no decline
+and no wait ruling, an added prerequisite still on the list makes the round due. Exit 0 = all hold."""
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -16,6 +18,7 @@ sys.path.insert(0, str(REPO))
 from tauceti_worker import decide as D  # noqa: E402
 from tauceti_worker import interaction  # noqa: E402
 from tauceti_worker import work_units as W  # noqa: E402
+from tauceti_worker.survey import decide_due  # noqa: E402
 from tauceti_worker.targets import parse_targets, remove_items  # noqa: E402
 
 fails = 0
@@ -111,5 +114,13 @@ check(
     removed == ["a"] and t2 == "\n- [ ] `b` — y (needs: none)\n",
     repr((t2, removed)),
 )
+
+# with no decline and no wait ruling, an added prerequisite still listed makes the round due
+os.environ["TAUCETI_ROADMAP_TARGETS"] = str(tpath)
+(INC / "acked" / "declined-fix-210.json").unlink()
+never_ran = SimpleNamespace(read=lambda k: 0)
+check("an added prerequisite still on the list makes the round due", decide_due(never_ran)[0])
+tpath.write_text(LIST.split("## Area")[0] + '## Area\n- [ ] `operator-item` — L0, "Prove I." (needs: none)\n')
+check("without one, nothing is due", not decide_due(never_ran)[0])
 
 sys.exit(1 if fails else 0)

@@ -570,18 +570,37 @@ def curate_due(counters: Counters) -> tuple[bool, str]:
 
 
 def decide_due(counters: Counters) -> tuple[bool, str]:
-    """Is a decide round due? Local only: a decline nobody has ruled on, or a `wait` ruling to look at
-    again, and the attempt gap passed. The fleet starts the round when a decline is recorded; this is
-    the second line of defence against running it back to back."""
+    """Is a decide round due? Local only: a decline nobody has ruled on, a `wait` ruling to look at
+    again, or a prerequisite the stage added to the target list (it may be retired), and the attempt
+    gap passed. The fleet starts the round when a decline is recorded; this is the second line of
+    defence against running it back to back."""
     from .attention import decided_waits, undecided_declines
 
     last = counters.read("decide-attempt-ts")
     if last and (time.time() - last) < DECIDE_GAP:
         return False, f"declines were ruled on {(time.time() - last) / 60:.0f} min ago; waiting out the gap"
-    pending, waits = len(undecided_declines()), len(decided_waits())
-    if not (pending or waits):
+    pending, waits, added = len(undecided_declines()), len(decided_waits()), _decide_added_open()
+    if not (pending or waits or added):
         return False, "no declined round awaits a ruling"
-    return True, f"{pending} decline(s) to rule on, {waits} waiting ruling(s) to re-check"
+    return True, (
+        f"{pending} decline(s) to rule on, {waits} waiting ruling(s) and {added} added prerequisite(s) to re-check"
+    )
+
+
+def _decide_added_open() -> int:
+    """How many open or in-flight items on the target list the decide stage added. 0 when there is no
+    list or it cannot be read: a due check must not raise."""
+    from .config import Die, roadmap_targets
+    from .targets import decide_added, parse_targets
+
+    tpath = roadmap_targets()
+    try:
+        targets = parse_targets(tpath.read_text()) if tpath is not None and tpath.is_file() else None
+    except (OSError, Die):
+        return 0
+    if targets is None:
+        return 0
+    return sum(1 for items in targets.areas.values() for it in items if it.status != "done" and decide_added(it))
 
 
 def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
