@@ -14,7 +14,8 @@ The decide stage makes those rulings. Two tiers, host-side like the curator:
      curator's). A `wait` ruling whose blockers have all moved on becomes a `retry` with a note for the
      fixer saying what changed, or goes back for a new ruling if a blocker closed unmerged. A `roadmap`
      or `escalate` ruling still waiting on the owner is stale once its PR merges or closes (an
-     escalation also once the PR moves to a new head).
+     escalation also once the PR moves to a new head). A prerequisite this stage added to the list is
+     taken off it once every PR it unblocks has merged or closed (see _retire_prerequisites).
   B. model. Each remaining decline is put to the model with the PR, its scoreboard and review
      threads, the fixer's own account, the open PRs, the target list and the roadmap and rubric
      checkouts. It answers in `decisions.json`, one ruling per PR:
@@ -83,7 +84,7 @@ from .constants import DECIDE_MAX_CASES, DECIDE_MAX_CLOSES_PER_DAY, REVIEW, TAUC
 from .constants import ROADMAP as ROADMAP_REPO
 from .github import GitHub, me
 from .paths import HERE
-from .targets import _AREA_RE, insert_items, parse_targets
+from .targets import _AREA_RE, insert_items, parse_targets, remove_items
 
 KEEP_LABELS = {"keep", "hold", "wip", "human", "do-not-close"}
 PREREQUISITE = "prerequisite"
@@ -145,6 +146,11 @@ def _do_decide_inner(w, sv, opts) -> int | None:
         line = _recheck_owner_ruling(w, path, rec, open_by_no)
         if line:
             ruled.append(line)
+    # ---- tier A: prerequisites whose PRs have moved on (after the waits, so a stale wait no longer pins one)
+    retired = _retire_prerequisites(w, open_by_no, tpath, targets)
+    if retired:
+        ruled += retired
+        targets = parse_targets(tpath.read_text())
     # ---- tier A: declines the facts have overtaken
     cases: list[tuple[Path, dict]] = []
     for path, rec in undecided_declines():
@@ -272,6 +278,51 @@ def _recheck_wait(w, path: Path, rec: dict, open_by_no: dict, targets) -> str:
         note += f" The earlier ruling said: {_clip(rec['decision_note'], 600)}"
     record_decision(path, RETRY, decision_note=note)
     return f"#{pr}: retry ({'; '.join(moved)})"
+
+
+def _retire_prerequisites(w, open_by_no: dict, tpath: Path | None, targets) -> list[str]:
+    """Take off the target list each open or in-flight item this stage added as a prerequisite once every
+    PR it unblocks has merged or closed. Such an item serves the list's goal only through that PR, and
+    left on the list it keeps authors working for nobody: ModularCurves' `effective-fpqc-descent-affine-
+    schemes` drew eight PRs for #13577, whose result had reached main by another route. An item
+    another listed item still needs, or that a PR parked on a `wait` names, stays. Returns one line per
+    retired item, or none when the list could not be written."""
+    if targets is None or tpath is None or not tpath.is_file():
+        return []
+    needed = {s for items in targets.areas.values() for it in items if it.status != "done" for s in it.needs}
+    parked = {s for _path, rec in decided_waits() for s in rec.get("blocked_on_targets") or []}
+    why: dict[str, str] = {}
+    for items in targets.areas.values():
+        for it in items:
+            if it.status == "done" or it.slug in needed or it.slug in parked:
+                continue
+            if not any(c.strip().lower() == "added by the decide stage" for c in it.meta):
+                continue
+            prs = [
+                int(n)
+                for c in it.meta
+                if c.partition(":")[0].strip().lower() == "unblocks"
+                for n in re.findall(r"#(\d+)", c)
+            ]
+            moved: list[str] = []
+            for n in prs:
+                st = None if n in open_by_no else _pr_state(w, n, open_by_no)
+                if st is None or st[0] == "OPEN":
+                    break
+                moved.append(f"#{n} {st[0].lower()}")
+            else:
+                if moved:
+                    why[it.slug] = ", ".join(moved)
+    if not why:
+        return []
+    from .work_units import update_targets
+
+    base = tpath.read_text()
+    text, removed = remove_items(base, set(why))
+    applied = [f"`{s}`: retired, {why[s]} (the PR it was added to unblock)" for s in removed]
+    if not removed or not update_targets(tpath, base, text, applied, prefix="decide"):
+        return []
+    return applied
 
 
 # ---- tier B: the model ------------------------------------------------------------------------------------

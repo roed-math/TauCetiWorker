@@ -479,3 +479,23 @@ def insert_items(text: str, area: str, lines: list[str]) -> tuple[str, bool]:
     if out and not out[-1].endswith("\n"):
         out[-1] += "\n"
     return "".join(out + ["\n", *section]).rstrip("\n") + "\n", True
+
+
+def remove_items(text: str, slugs: set[str]) -> tuple[str, list[str]]:
+    """Drop the item lines of `slugs`, each with the `>` note lines directly under it. Pure. Returns the
+    new text and the slugs removed, in file order."""
+    out: list[str] = []
+    removed: list[str] = []
+    dropping = False
+    for line in text.splitlines(keepends=True):
+        if dropping and line.lstrip().startswith(">"):
+            continue
+        dropping = False
+        m = _ITEM_RE.match(line.rstrip("\n"))
+        slug_m = _SLUG_RE.search(m.group(2)) if m else None
+        if slug_m and slug_m.group(1).strip() in slugs:
+            removed.append(slug_m.group(1).strip())
+            dropping = True
+            continue
+        out.append(line)
+    return "".join(out), removed
