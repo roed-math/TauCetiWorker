@@ -3,6 +3,8 @@ picker, `status`, and the TUI all consume."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -70,13 +72,50 @@ class RebaseBudgetUnavailable(ValueError):
     """Existing retry evidence could not be read safely."""
 
 
+# The attempt budgets of the branch-writing stages, the rebase checkpoints their keys derive from, and
+# the provider-outage refunds charged against them. In a fleet (TAUCETI_GATE_DIR set) they live in the
+# gate store, so the fleet spends one budget per PR head rather than one per worker. Setup failures
+# (`setup-*`) stay per worker: they cost no agent time, and one worker's broken sandbox must not retire
+# heads for the others.
+SHARED_COUNTER_RE = re.compile(
+    r"(?:fix|ci|bump|lint-repair)-\d+-\w+|(?:ci|bump|lint-repair)-pr-\d+|rebase-pr-\d+(?:-\w+)?"
+    r"|rebase-progress-\d+\.json|infra-(?:fix|fix-ci|rebase|bump|lint-repair)-\d+"
+)
+SHARED_COUNTERS_DIR = "attempts"
+
+
 class Counters:
     def __init__(self, cfg: Config):
         self.state = cfg.state
+        gate = os.environ.get("TAUCETI_GATE_DIR", "").strip()
+        self.shared = Path(gate) / SHARED_COUNTERS_DIR if gate else None
+        # This process's net charge per key (incr minus decr), so a round can hand back exactly what
+        # it charged without overwriting what peers charged to the same shared key meanwhile.
+        self._own: dict[str, int] = {}
+
+    def _dir(self, name: str) -> Path:
+        if self.shared is not None and SHARED_COUNTER_RE.fullmatch(name):
+            return self.shared
+        return self.state
+
+    @contextlib.contextmanager
+    def _locked(self, name: str):
+        """Serialize a read-modify-write of a shared key across the fleet's workers. A worker's own
+        store has one writer, the round in progress, and needs no lock."""
+        if self._dir(name) is not self.shared:
+            yield
+            return
+        self.shared.mkdir(parents=True, exist_ok=True)
+        with open(self.shared / ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def read(self, name: str) -> int:
         try:
-            txt = (self.state / name).read_text().strip()
+            txt = (self._dir(name) / name).read_text().strip()
         except FileNotFoundError:
             return 0
         except (OSError, UnicodeError):
@@ -91,16 +130,17 @@ class Counters:
         self._atomic_write(name, str(value))
 
     def _atomic_write(self, name: str, text: str) -> None:
-        self.state.mkdir(parents=True, exist_ok=True)
+        store = self._dir(name)
+        store.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(mode="w", dir=self.state, prefix=f".{name}-", delete=False) as target:
+            with tempfile.NamedTemporaryFile(mode="w", dir=store, prefix=f".{name}-", delete=False) as target:
                 temporary = Path(target.name)
                 target.write(text)
                 target.flush()
                 os.fsync(target.fileno())
-            os.replace(temporary, self.state / name)
-            directory = os.open(self.state, os.O_RDONLY)
+            os.replace(temporary, store / name)
+            directory = os.open(store, os.O_RDONLY)
             try:
                 os.fsync(directory)
             finally:
@@ -113,13 +153,34 @@ class Counters:
                     pass
 
     def incr(self, name: str) -> int:
-        v = self.read(name) + 1
-        self.write(name, v)
+        with self._locked(name):
+            v = self.read(name) + 1
+            self.write(name, v)
+        self._own[name] = self._own.get(name, 0) + 1
         return v
 
+    def decr(self, name: str, n: int = 1) -> int:
+        """Hand back `n` attempts this round charged (never below 0)."""
+        with self._locked(name):
+            v = max(0, self.read(name) - n)
+            self.write(name, v)
+        self._own[name] = self._own.get(name, 0) - n
+        return v
+
+    def mark(self, names) -> dict[str, int]:
+        """This round's charges so far, for give_back."""
+        return {name: self._own.get(name, 0) for name in names}
+
+    def give_back(self, mark: dict[str, int]) -> None:
+        """Hand back what this round charged since `mark` and has not refunded already."""
+        for name, before in mark.items():
+            if (n := self._own.get(name, 0) - before) > 0:
+                self.decr(name, n)
+
     def _rebase_progress(self, pr: int) -> dict | None:
+        name = f"rebase-progress-{pr}.json"
         try:
-            value = json.loads((self.state / f"rebase-progress-{pr}.json").read_text())
+            value = json.loads((self._dir(name) / name).read_text())
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as error:

@@ -934,13 +934,22 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
         "progress": ("progress-err",),
     }.get(stage, ())
-    before = {key: w.counters.read(key) for key in keys}
+    # Counters hands back only this round's own charges: a fleet's workers share these keys, and
+    # restoring a snapshot would erase a peer's. Test doubles without it keep the snapshot.
+    mark = getattr(w.counters, "mark", None)
+    before = mark(keys) if mark else {key: w.counters.read(key) for key in keys}
     started = time.time()
 
-    def pause():
+    def give_back():
+        if mark:
+            w.counters.give_back(before)
+            return
         for key, value in before.items():
             # Another infrastructure handler may already have refunded this attempt.
             w.counters.write(key, min(value, w.counters.read(key)))
+
+    def pause():
+        give_back()
         event = blocking_event_since(started) or {}
         raise GitHubUnavailable(
             f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR", retry_at=event.get("reset")
@@ -949,8 +958,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     try:
         rc = fn(w, sv, c, opts, bubble)
     except GitHubUnavailable as error:
-        for key, value in before.items():
-            w.counters.write(key, min(value, w.counters.read(key)))
+        give_back()
         raise error
     except Exception:
         if blocked_since(started):
@@ -1471,14 +1479,14 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     That bound is keyed on the PR, NOT the head. Some of the counters refunded here are per-PR and
     lifetime or progress-scoped (`ci-pr-`, `bump-pr-`, rebase budgets), so a head-keyed allowance would reset on every
     push while still handing those back, and a persistent false positive could evade the lifetime
-    backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
-    per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
+    backstop indefinitely by moving the head. In a fleet the bound is fleet-wide, like the budgets it
+    refunds (Counters keeps both in the gate store); a worker outside one keeps its own.
     """
     from .claude_api import blocked_reason
 
     if reason := blocked_reason():
         for key in charged:
-            w.counters.write(key, max(0, w.counters.read(key) - 1))
+            w.counters.decr(key)
         from .claude_api import admission_failure
 
         raise admission_failure(reason)
@@ -1494,7 +1502,7 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
         )
         return
     for key in charged:
-        w.counters.write(key, max(0, w.counters.read(key) - 1))
+        w.counters.decr(key)
     log(
         f"  {label} #{c.pr}: {reason} — the agent never ran, so this attempt is not charged "
         f"(refund {refunds}/{MAX_INFRA_REFUNDS}); backing off and retrying later"
@@ -1515,7 +1523,7 @@ def _shift_setup_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     if not reason:
         return
     for key in charged:
-        w.counters.write(key, max(0, w.counters.read(key) - 1))
+        w.counters.decr(key)
     n = w.counters.incr(f"setup-{c.pr}-{c.head[:12]}")
     log(
         f"  {label} #{c.pr}: {reason} — the agent never started, so this attempt is not charged "
@@ -1550,12 +1558,16 @@ def _do_fixlike(
         log(f"  {label} #{pr}: head repo deleted/unavailable — skipping")
         return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
-        return None  # claimed elsewhere → caller tries the next candidate
+        # Claimed elsewhere → caller tries the next candidate. The peer holding the claim is the one
+        # making this attempt; charging the head's shared budget here too would spend it for nothing.
+        for key in charged:
+            w.counters.decr(key)
+        return None
     if label == "bump" and getattr(c, "bump_integration_failure", False):
         batch = w.gh.bump_repair_requested(pr, head)
         if not batch:
             for key in charged:
-                w.counters.write(key, max(0, w.counters.read(key) - 1))
+                w.counters.decr(key)
             return None
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
     # A round at this head was declined before and then ruled `retry` (decide.py): the ruling says what
@@ -1608,7 +1620,7 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         if label == "bump" and getattr(c, "bump_integration_failure", False) and (rev.returncode or checked != head):
             for key in charged:
-                w.counters.write(key, max(0, w.counters.read(key) - 1))
+                w.counters.decr(key)
             return None
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
@@ -1625,7 +1637,7 @@ def _do_fixlike(
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.
             for key in charged:
-                w.counters.write(key, max(0, w.counters.read(key) - 1))
+                w.counters.decr(key)
             raise
     if pub_id:
         os.environ.pop(pub_mod.ID_ENV, None)
