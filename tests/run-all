@@ -38,6 +38,7 @@ RUN_STDLIB=(
   declined_targets.py
   decide_round.py
   decide_retire.py
+  gh_proxy_real_gh.py
   safe_push_resync.py
   progress_threshold.py
   progress_threshold_round.py

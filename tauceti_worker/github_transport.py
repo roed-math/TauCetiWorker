@@ -757,11 +757,33 @@ def install_proxy():
         report_runtime(github_instrumentation_degraded=False)
 
 
+def _is_proxy(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    return b"github_transport.py" in head and b"--proxy" in head
+
+
+def real_gh() -> str | None:
+    """The gh binary itself: $TAUCETI_REAL_GH, else the first `gh` on PATH that is not this proxy. A daemon
+    started under a worker's PATH inherits the proxy without the variable: bubble writes that PATH into
+    the systemd unit of the auth proxy it (re)installs, whose `gh auth token` then reached the proxy."""
+    if os.environ.get("TAUCETI_REAL_GH"):
+        return os.environ["TAUCETI_REAL_GH"]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(d or ".", "gh")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and not _is_proxy(candidate):
+            return candidate
+    return None
+
+
 def _install_proxy(*, bindir=None):
     """Make host review/authoring subprocess gh traffic visible too; preserve real gh credentials."""
     os.environ.setdefault("TAUCETI_GITHUB_SHARED_DIR", str(root().resolve()))
     if not os.environ.get("TAUCETI_REAL_GH"):
-        real = shutil.which("gh")
+        real = real_gh()
         if not real:
             return
         os.environ["TAUCETI_REAL_GH"] = real
@@ -914,6 +936,10 @@ def report(hours: float):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--proxy"]:
+        real = real_gh()
+        if not real:
+            sys.exit("gh proxy: no gh on PATH besides this proxy")
+        os.environ["TAUCETI_REAL_GH"] = real
         # No API accounting for auth token output or interactive operations.
         args = sys.argv[2:]
         if not args or args[0] in ("auth", "help", "completion", "config", "extension") or "--web" in args:
