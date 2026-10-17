@@ -39,6 +39,7 @@ RUN_STDLIB=(
   decide_round.py
   decide_retire.py
   gh_proxy_real_gh.py
+  bubble_mount_symlinks.py
   safe_push_resync.py
   progress_threshold.py
   progress_threshold_round.py

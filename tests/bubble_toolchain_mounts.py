@@ -55,7 +55,10 @@ finally:
     tc.agents.ensure_bubble_home, tc.agents._bubble_pop = saved
 argv = out.getvalue()
 check("echo succeeds", rc == 0)
-check("the open command mounts both complete toolchains read-only", all(f"--mount {s}" in argv for s in specs))
+check(
+    "the open command mounts both complete toolchains read-only",
+    all(f"--mount {tc.agents.resolved_mount(s)}" in argv for s in specs),
+)
 check("the incomplete one is not mounted", "v4.35.0" not in argv)
 check("gate-lib.sh is staged beside the wrappers", (cfg.state / "bubble-round" / "gate-lib.sh").is_file())
 print("\nALL OK" if not fails else f"\n{fails} FAILED")

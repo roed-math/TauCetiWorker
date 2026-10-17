@@ -1913,6 +1913,17 @@ def pooled_toolchain_mounts() -> list[str]:
     return [f"{pool / n}:/home/user/.elan/toolchains/{n}:ro" for n in names]
 
 
+def resolved_mount(spec: str) -> str:
+    """A bubble `--mount SRC:DST[:MODE]` with SRC's symlinks resolved. Incus resolves a restricted
+    project's disk source inside its allowed path, so an absolute symlink there counts as leaving it
+    (`refs/roadmap` points into the shared repository store): "resolves outside of restricted parent
+    source path" for every incus-user fleet (gqa, 2026-10-16)."""
+    src, sep, rest = spec.partition(":")
+    if not sep or not src.startswith("/"):
+        return spec
+    return f"{Path(src).resolve()}:{rest}"
+
+
 def run_in_bubble(
     w: Worker,
     target: str,
@@ -2003,9 +2014,9 @@ def run_in_bubble(
             f"{bridge / 'outbox'}:/opt/api-bridge/outbox:ro",
         ]
     for m in mounts or []:
-        mount_flags += ["--mount", m]
+        mount_flags += ["--mount", resolved_mount(m)]
     for m in pooled_toolchain_mounts():  # main's toolchain after a merge, without network
-        mount_flags += ["--mount", m]
+        mount_flags += ["--mount", resolved_mount(m)]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
     # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch
