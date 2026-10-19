@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""link-mathlib-store STORE: inside a sandboxed round, in the Lake workspace in the current directory,
+point each dependency's `.lake/build` at the read-only Mathlib store mounted at STORE.
+
+STORE/<rev>/ is a Mathlib checkout at `rev`, unpacked and settled on the host (tauceti_worker.mathlib_store).
+A package is linked only when the workspace's lake-manifest.json pins the same revision the store's does,
+and only when its build directory does not exist yet; everything else is left to `lake exe cache get`,
+which then finds the linked files already decompressed. Plain python3: it runs in the container."""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def revs(manifest: Path) -> dict:
+    try:
+        return {p["name"]: p.get("rev") for p in json.loads(manifest.read_text())["packages"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def main() -> int:
+    root, ws = Path(sys.argv[1]), Path.cwd()
+    mine = revs(ws / "lake-manifest.json")
+    rev = mine.get("mathlib")
+    store = root / str(rev)
+    if not rev or not (store / ".tauceti-store-ready").is_file():
+        print(f"mathlib store: no build for {rev or 'this workspace'}; unpacking as usual")
+        return 0
+    theirs = {**revs(store / "lake-manifest.json"), "mathlib": rev}
+    linked = []
+    for name, pinned in sorted(mine.items()):
+        src = (store if name == "mathlib" else store / ".lake" / "packages" / name) / ".lake" / "build"
+        pkg = ws / ".lake" / "packages" / name
+        dst = pkg / ".lake" / "build"
+        if theirs.get(name) != pinned or not src.is_dir() or not pkg.is_dir() or dst.is_symlink() or dst.exists():
+            continue
+        dst.parent.mkdir(exist_ok=True)
+        os.symlink(src, dst)
+        linked.append(name)
+    print(f"mathlib store: {rev[:12]}: linked {', '.join(linked) or 'nothing'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1805,6 +1805,15 @@ def bubble_work_cmd(inner: str) -> str:
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     return (
         "set -e; "
+        # The mounts of shared_build_mounts, when the round has them: Lake's packages are materialized
+        # first so the store's builds can be linked in before the unpack would write them.
+        "if [ -d /opt/mathlib-store ]; then "
+        "lake env true >/dev/null 2>&1 || true; "
+        "python3 /opt/round/link-mathlib-store /opt/mathlib-store || true; "
+        "fi; "
+        "if [ -d /opt/tauceti-build ] && [ ! -L .lake/build ]; then "
+        "rm -rf .lake/build; mkdir -p .lake; ln -s /opt/tauceti-build .lake/build; "
+        "fi; "
         "if ! { lake exe cache get || lake exe cache get; }; then "
         f"echo {_shq(PRE_AGENT_SETUP_FAILED)} >&2; exit 1; "
         "fi; "
@@ -1893,7 +1902,15 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
 # that way, and the fleet's mutation count stayed at zero all day). The gate store does not cross into
 # the container, so gate-lib's functions are no-ops there; the push is still guarded by bubble's auth
 # proxy and the branch CAS. tests/bubble_round_scripts.py pins this list against the wrappers' sources.
-BUBBLE_ROUND_SCRIPTS = ("git-safe-push", "gh-safe-pr-create", "claim.sh", "gate-lib.sh", "tauceti-gate", "lookahead-check")
+BUBBLE_ROUND_SCRIPTS = (
+    "git-safe-push",
+    "gh-safe-pr-create",
+    "claim.sh",
+    "gate-lib.sh",
+    "tauceti-gate",
+    "lookahead-check",
+    "link-mathlib-store",
+)
 
 
 def pooled_toolchain_mounts() -> list[str]:
@@ -1911,6 +1928,27 @@ def pooled_toolchain_mounts() -> list[str]:
     except OSError:
         return []
     return [f"{pool / n}:/home/user/.elan/toolchains/{n}:ro" for n in names]
+
+
+def shared_build_mounts(cfg) -> list[str]:
+    """The build directories a work round mounts instead of writing them afresh, each opt-in.
+
+    `$TAUCETI_MATHLIB_STORE`: the host's read-only Mathlib builds (tauceti_worker.mathlib_store), one per
+    revision, which every container shares on disk and in the page cache.
+
+    `$TAUCETI_PERSISTENT_BUILD=1`: this worker's own TauCeti `.lake/build`, kept between its rounds, so a
+    round rebuilds what changed instead of the library. It is writable by the round, so whatever one round
+    leaves there the next round of the same worker builds on; only containers use it, never the host, and
+    CI rebuilds every PR from scratch."""
+    mounts = []
+    store = os.environ.get("TAUCETI_MATHLIB_STORE", "").strip()
+    if store and Path(store).is_dir():
+        mounts.append(f"{store}:/opt/mathlib-store:ro")
+    if os.environ.get("TAUCETI_PERSISTENT_BUILD") == "1":
+        build = cfg.state / "tauceti-build"
+        build.mkdir(parents=True, exist_ok=True)
+        mounts.append(f"{build}:/opt/tauceti-build:rw")
+    return mounts
 
 
 def resolved_mount(spec: str) -> str:
@@ -2016,6 +2054,8 @@ def run_in_bubble(
     for m in mounts or []:
         mount_flags += ["--mount", resolved_mount(m)]
     for m in pooled_toolchain_mounts():  # main's toolchain after a merge, without network
+        mount_flags += ["--mount", resolved_mount(m)]
+    for m in shared_build_mounts(cfg) if inner_cmd is None else []:  # only work rounds build
         mount_flags += ["--mount", resolved_mount(m)]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
