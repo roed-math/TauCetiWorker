@@ -171,7 +171,8 @@ def probe_roadmap(state: Path) -> str | None:
     if cached.get("roadmap_sha") and _now() - float(cached.get("roadmap_at") or 0) < ROADMAP_PROBE_TTL:
         return cached["roadmap_sha"]
     proc = gate_mod.gated_git(
-        ["git", "ls-remote", f"https://github.com/{ROADMAP}", "refs/heads/main"], op="ls-remote", target=ROADMAP
+        ["git", "ls-remote", f"https://github.com/{ROADMAP}", "refs/heads/main"], op="ls-remote", target=ROADMAP,
+        capture_output=True,
     )
     m = re.match(r"([0-9a-f]{40})\s", proc.stdout or "") if proc.returncode == 0 else None
     if not m:

@@ -61,6 +61,39 @@ def write(path, data):
     path.write_text(json.dumps(data))
 
 
+# ----------------------------------------------------------------------------- the roadmap probe
+
+# The real probe through the real `gated_git`; only the gate's admission and git itself are faked.
+# `gated_git` captures stdout only when asked, as subprocess.run does.
+_gate_current, _run = R.gate_mod.current, subprocess.run
+git_calls = []
+
+
+class _Gate:
+    def admit(self, op, target, kind, **kw):
+        return SimpleNamespace(child_env=lambda: {})
+
+    def record(self, admission, outcome):
+        return ""
+
+
+def _fake_run(argv, **kw):
+    git_calls.append(argv)
+    out = "a" * 40 + "\trefs/heads/main\n"
+    return subprocess.CompletedProcess(argv, 0, stdout=out if kw.get("capture_output") else None, stderr="")
+
+
+R.gate_mod.current, subprocess.run = (lambda: _Gate()), _fake_run
+try:
+    probe_state = TMP / "probe-state"
+    got = R.probe_roadmap(probe_state)
+    check("the roadmap probe reads main's tip from git ls-remote", got == "a" * 40, got)
+    check("…and caches it", R._read(R.Paths(probe_state).probe).get("roadmap_sha") == "a" * 40)
+    R.probe_roadmap(probe_state)
+    check("…so a second look within the TTL runs no git", len(git_calls) == 1, git_calls)
+finally:
+    R.gate_mod.current, subprocess.run = _gate_current, _run
+
 # ----------------------------------------------------------------------------- due
 
 probes = {"docs": "d" * 40, "roadmap": "r" * 40}
