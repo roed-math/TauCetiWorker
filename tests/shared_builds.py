@@ -170,6 +170,12 @@ check("a review round mounts neither", "/opt/mathlib-store" not in review and "/
 check("the linker is staged beside the round scripts", (cfg.state / "bubble-round" / "link-mathlib-store").is_file())
 boot = tc.agents.bubble_work_cmd("agent")
 check(
+    "Lake's artifact cache is left unset, in the bootstrap and in the agent's login shells",
+    boot.index("unset LAKE_ARTIFACT_CACHE") < boot.index("lake exe cache get")
+    and ".profile" in boot
+    and ".bashrc" in boot,
+)
+check(
     "the bootstrap links the builds before it unpacks",
     boot.index("link-mathlib-store") < boot.index("lake exe cache get")
     and boot.index("/opt/tauceti-build") < boot.index("lake exe cache get"),

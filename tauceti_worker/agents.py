@@ -1806,8 +1806,15 @@ def bubble_work_cmd(inner: str) -> str:
     return (
         "set -e; "
         # The mounts of shared_build_mounts, when the round has them: Lake's packages are materialized
-        # first so the store's builds can be linked in before the unpack would write them.
+        # first so the store's builds can be linked in before the unpack would write them. Bubble turns
+        # Lake's artifact cache on for every package (LAKE_ARTIFACT_CACHE=true), and a package whose cache
+        # is writable has each replayed output chmodded, hashed beside it and copied into the cache, which
+        # the read-only store refuses ("failed to cache artifact: read-only file system"). Unset, every
+        # package still READS the cache, so TauCeti's outputs from `lake cache get` are restored as before.
+        # Login shells the agent opens re-read /etc/profile.d, so ~/.profile and ~/.bashrc unset it too.
         "if [ -d /opt/mathlib-store ]; then "
+        "unset LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS; "
+        "for rc in ~/.profile ~/.bashrc; do echo 'unset LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS' >> \"$rc\"; done; "
         "lake env true >/dev/null 2>&1 || true; "
         "python3 /opt/round/link-mathlib-store /opt/mathlib-store || true; "
         "fi; "
