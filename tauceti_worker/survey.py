@@ -245,6 +245,17 @@ TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 (\{[^}]*\})-->")
 TARGET_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
 
 
+def own_branches() -> str:
+    """`TAUCETI_OWN_BRANCHES`: a regular expression naming the head branches this fleet wrote, for a
+    login that another operator's fleet also runs. Empty: every PR of the login is this fleet's."""
+    return os.environ.get("TAUCETI_OWN_BRANCHES", "")
+
+
+def own_branch(head_ref: str) -> bool:
+    pattern = own_branches()
+    return not pattern or re.search(pattern, head_ref) is not None
+
+
 def target_marker_focuses(body: str) -> tuple[str, ...]:
     """Concrete roadmap focuses in target markers; all/auto are scopes, not roadmap area names."""
     return tuple(target_focuses(body))
@@ -481,10 +492,14 @@ class Survey:
         self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
         self.next_auto_stage = _next_auto_stage(self)
 
+    def own_open_prs(self) -> list[PRInfo]:
+        """My open PRs that this fleet tends (see own_branch): what its fixers work on and are sized by."""
+        return [p for p in self._mine_open_prs if own_branch(getattr(p, "head_ref", ""))]
+
     def mine_awaiting_author(self) -> int:
         """How many of my open PRs carry `awaiting-author`: the review findings a fix worker exists to
         clear. Read off the survey, so it costs nothing."""
-        return sum(1 for p in self._mine_open_prs if "awaiting-author" in p.labels)
+        return sum(1 for p in self.own_open_prs() if "awaiting-author" in p.labels)
 
     def mine_needs_fix(self) -> int:
         """How many of my open PRs a fix worker has work on: `awaiting-author` (the fix stage) or
@@ -493,7 +508,7 @@ class Survey:
         number a fleet reconciler sizes fixers by; counting `awaiting-author` alone hid every red
         build from it, and counting declined PRs asked for fixers that would have nothing to do."""
         declined = declined_at("fix") | declined_at("fix-ci") | declined_at("rebase")
-        return sum(1 for p in self._mine_open_prs
+        return sum(1 for p in self.own_open_prs()
                    if {"awaiting-author", "ci-failed"} & set(p.labels)
                    and (getattr(p, "number", None), getattr(p, "head_oid", "")) not in declined)
 
@@ -933,14 +948,16 @@ def survey(
     clear_stale_budget_spent({p.number: p.head_oid for p in prs})
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
+    own = [p for p in mine if own_branch(p.head_ref)]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
-    bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
-        p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft
-    )
+    # A fleet that shares its login with another operator tends only its own branches, and no bot PRs.
+    tends_bots = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and not own_branches()
+    bot_on_canonical = tends_bots and any(p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft)
     tend_bot = bot_on_canonical and can_push(TAUCETI) is True
+    own_ids = {p.number for p in own}
     tended = [
-        p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
+        p for p in nondraft if p.number in own_ids or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
     ]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
