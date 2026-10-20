@@ -160,7 +160,7 @@ def test_roadmap():
     tc.work_units.ensure_fork = lambda: FORK
     os.environ.pop("CLAIM_REPO", None)
     tc.work_units.claims_repo = lambda: CLAIM_NS
-    tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
+    tc.work_units.avoid_list = lambda *_args: "none"
 
     # A real review checkout, so the round exercises the BUNDLED path rather than the fallback:
     # stage_rubrics only produces a bundle when it finds rubrics to concatenate.
@@ -205,8 +205,8 @@ def test_roadmap():
     )
     check("roadmap: prompt encourages cross-roadmap prerequisites", "Follow prerequisites across roadmaps" in prompt)
     check(
-        "roadmap: switched target checks its own intention board",
-        '--label "roadmap/<target-roadmap>"' in prompt,
+        "roadmap: switched target checks its own intention board by name, not by area label",
+        r'test("\\b<target-roadmap>\\b")' in prompt and '--label "roadmap/<target-roadmap>"' not in prompt,
     )
     check("roadmap: claim follows the actual target", "author/<target-roadmap>/<slug>" in prompt)
     check("roadmap: marker follows the actual target", '"focus":"<target-roadmap>"' in prompt)

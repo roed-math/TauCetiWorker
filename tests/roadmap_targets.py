@@ -189,7 +189,7 @@ def _stub_round(tmp):
     os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     tc.work_units.ensure_fork = lambda: FORK
-    tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
+    tc.work_units.avoid_list = lambda *_args: "none"
 
     def fake_fetch_ref(repo, dest):
         if repo == tc.constants.REVIEW:

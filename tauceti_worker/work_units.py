@@ -82,7 +82,7 @@ from .constants import (
 )
 from .decide import do_decide
 from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
-from .intentions import administrative_hold_avoid_list, claimed_avoid_list
+from .intentions import avoid_list
 from .interaction import contest_max_exchanges, record_incident
 from .paths import HERE
 from .quota import Quota, _unavail_reason, mirror_creds
@@ -3506,12 +3506,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     )
     # Administrative holds are binding, including for the holder's own workers, and fail closed.
     # Ordinary cross-contributor claims remain cooperative, fail-open, and optional.
-    hold_area = None if only in ("any", "") else only
-    blocks = [administrative_hold_avoid_list(w.gh, hold_area)]
-    if only not in ("any", ""):
-        if respect_claims():
-            blocks.append(claimed_avoid_list(w.gh, only))
-    claimed_str = "\n".join(block for block in blocks if block != "none") or "none"
+    claimed_str = avoid_list(w.gh, None if only in ("any", "") else only, respect_claims())
     refs = w.cfg.state / "refs"
     if not fetch_ref(ROADMAP, refs / "roadmap"):
         raise Die(f"fetch {ROADMAP} failed")
