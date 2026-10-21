@@ -47,6 +47,7 @@ from .config import (
     Config,
     Die,
     NoProgress,
+    finished_roadmap_areas,
     is_git_url,
     log,
     one_line,
@@ -3487,11 +3488,15 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 lookahead_str = _port_section(w, targets, only, item, *w.lookahead_port)
     if targets is None and only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         raw_areas = roadmap_areas(w.gh)
-        areas = [a for a in raw_areas if a not in skip]
+        # A finished roadmap only costs a round in which the agent confirms there is nothing to build.
+        finished = finished_roadmap_areas() & set(raw_areas)
+        areas = [a for a in raw_areas if a not in skip and a not in finished]
         if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
-            raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
+            raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) or finished "
+                             "— nothing to author")
         only = random.choice(areas) if areas else "any"
-        log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)})")
+        log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)}, "
+            f"{len(finished)} finished)")
     elif targets is None and only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is

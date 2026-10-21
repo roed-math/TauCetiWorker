@@ -23,6 +23,7 @@ FAIL_FAST=0
 RUN_STDLIB=(
   api_budget.py
   own_branches.py
+  finished_areas.py
   agent_cmds.py
   agent_transcript.py
   declined_round.py

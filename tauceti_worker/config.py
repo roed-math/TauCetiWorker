@@ -4,6 +4,8 @@ locking, and logging."""
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -121,6 +123,52 @@ def roadmap_areas(gh) -> list[str]:
         pass
     out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')
     return sorted(out.splitlines()) if out else []
+
+
+COVERAGE_RE = re.compile(r"<!--tauceti-coverage:v1 (\{.*?\})-->")
+
+
+def finished_roadmap_areas() -> set[str]:
+    """The roadmap areas a random pick should leave out because nothing is left to author: the
+    coverage marker of the area's STATUS.md says every layer is done, the README heads no layer the
+    report did not assess, and the area holds no sub-roadmap (those carry no marker of their own, so
+    their state is unknown). Empty when the roadmap repository cannot be read locally."""
+    from .shared_repositories import snapshot
+
+    try:
+        tree = snapshot(ROADMAP, ttl=3600)
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        return set()
+    root = tree / "TauCetiRoadmap" if tree else None
+    if root is None or not root.is_dir():
+        return set()
+    return {d.name for d in root.iterdir() if d.is_dir() and _area_finished(d)}
+
+
+def _area_finished(d: Path) -> bool:
+    try:
+        status = (d / "STATUS.md").read_text(encoding="utf-8")
+        readme = (d / "README.md").read_bytes()
+        marker = json.loads(m.group(1)) if (m := COVERAGE_RE.search(status)) else None
+    except (OSError, ValueError):
+        return False
+    layers = marker.get("layers") if isinstance(marker, dict) else None
+    if not layers or not all(isinstance(layer, dict) and layer.get("state") == "done" for layer in layers):
+        return False
+    if any((p / "Suggested.lean").is_file() for p in d.iterdir() if p.is_dir()):
+        return False
+    if hashlib.sha256(readme).hexdigest() == marker.get("readme_sha"):
+        return True
+    # The README changed after the report (often a cross-reference). It is still finished unless it
+    # now heads a layer the report never saw, which only ids of the form "Layer 3" let us check.
+    ids = {str(layer.get("id", "")) for layer in layers}
+    words = {i.split()[0] for i in ids if " " in i}
+    if len(words) != 1 or not all(" " in i for i in ids):
+        return False
+    word = words.pop()
+    text = readme.decode("utf-8", "replace")
+    headed = {f"{word} {n}" for n in re.findall(rf"^#+\s+{re.escape(word)}\s+([0-9A-Za-z.]+)", text, re.M)}
+    return headed <= ids
 
 
 def roadmap_subareas(gh, area: str) -> list[str]:
