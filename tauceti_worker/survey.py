@@ -487,13 +487,14 @@ class Survey:
         self.n_mine_open = (
             automatic
             if automatic is not None
-            else roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
+            else roadmap_open_count(self.own_open_prs(), self.roadmap_only, self.roadmap_skip)
         )
         self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
         self.next_auto_stage = _next_auto_stage(self)
 
     def own_open_prs(self) -> list[PRInfo]:
-        """My open PRs that this fleet tends (see own_branch): what its fixers work on and are sized by."""
+        """My open PRs that this fleet tends (see own_branch): what its fixers work on and are sized by,
+        and what its open-PR cap counts."""
         return [p for p in self._mine_open_prs if own_branch(getattr(p, "head_ref", ""))]
 
     def mine_awaiting_author(self) -> int:
@@ -919,13 +920,15 @@ def survey(
         return sv
     prs = [PRInfo.from_json(d) for d in raw]
     if count_all_roadmaps:
-        counts = getattr(compact, "author_counts", None)
+        # The compact survey's per-author totals cannot tell this fleet's branches from the others'.
+        counts = None if own_branches() else getattr(compact, "author_counts", None)
         all_prs = prs if not available else ([] if counts is not None else [PRInfo.from_json(d) for d in gh.open_prs()])
         sv._automatic_open_count = (
             counts.get(me(), 0)
             if counts is not None
             else roadmap_open_count(
-                [p for p in all_prs if not p.is_draft and p.author == me()], "auto", sv.roadmap_skip
+                [p for p in all_prs if not p.is_draft and p.author == me() and own_branch(p.head_ref)],
+                "auto", sv.roadmap_skip,
             )
         )
     if deep:

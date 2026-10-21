@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """With TAUCETI_OWN_BRANCHES set, a fleet tends only the PRs on its own branches (a login another
-operator's fleet also runs): rebase, fix-ci and the fixer count skip the other branches and bot PRs,
-while the open-PR count that the account's cap reads stays account-wide. Unset, nothing changes."""
+operator's fleet also runs): rebase, fix-ci, the fixer count and the open-PR count that
+max_open_prs caps skip the other branches and bot PRs. Unset, nothing changes."""
 
 import importlib
 import os
@@ -56,7 +56,7 @@ def classify(pattern):
             "rebase": sorted(c.pr for c in sv.rebaseable.actionable),
             "fix-ci": sorted(c.pr for c in sv.red_ci.actionable),
             "needs-fix": sv.mine_needs_fix(),
-            "mine-open": len(sv._mine_open_prs),
+            "open": sv.n_mine_open,
         }
     finally:
         survey_mod.me, survey_mod.can_push = saved
@@ -66,9 +66,9 @@ def classify(pattern):
 def main():
     checks = [
         ("unset: every PR of the login, and bot PRs", classify(None),
-         {"rebase": [3, 4, 5], "fix-ci": [1, 2], "needs-fix": 4, "mine-open": 4}),
+         {"rebase": [3, 4, 5], "fix-ci": [1, 2], "needs-fix": 4, "open": 4}),
         ("set: only this fleet's branches, no bot PRs", classify("-gqa-"),
-         {"rebase": [3], "fix-ci": [1], "needs-fix": 2, "mine-open": 4}),
+         {"rebase": [3], "fix-ci": [1], "needs-fix": 2, "open": 2}),
     ]
     failures = 0
     for name, got, want in checks:
