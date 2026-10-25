@@ -38,6 +38,7 @@ from .constants import (
     REVIEW_DAILY_CAP,
     ROADMAP,
     TAUCETI,
+    TOOLS,
 )
 from .github import me
 from .paths import HERE
@@ -638,6 +639,22 @@ def fetch_ref(repo: str, dir: Path) -> bool:
 def fetch_git_source(url: str, dir: Path) -> bool:
     """Clone or refresh a worker-owned shallow snapshot of a source Git repository."""
     return _fetch_shallow(url, dir)
+
+
+def _fetch_pinned(url: str, ref: str, dir: Path) -> bool:
+    """A worker-owned checkout of `url` at `ref`; a commit already checked out is not fetched again."""
+    current = subprocess.run(["git", "-C", str(dir), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if current.returncode == 0 and current.stdout.strip() == ref:
+        return True
+    dir.mkdir(parents=True, exist_ok=True)
+    return (
+        subprocess.run(["git", "init", "-q", str(dir)]).returncode == 0
+        and gate_mod.gated_git(
+            ["git", "-C", str(dir), "fetch", "-q", "--depth", "1", url, ref], op="fetch", target=url
+        ).returncode
+        == 0
+        and subprocess.run(["git", "-C", str(dir), "checkout", "-q", "--detach", "FETCH_HEAD"]).returncode == 0
+    )
 
 
 SHIM_DIR = HERE / "scripts" / "shim"
@@ -2273,6 +2290,24 @@ def _open_store_to_container(store: Path) -> None:
                 pass
 
 
+_TOOLS_PIN_RE = re.compile(rf"github\.com/{re.escape(TOOLS)}(?:\.git)?@([^\"'\s#]+)")
+
+
+def _review_engine_tools(cfg: Config, engine_dir: Path) -> Path | None:
+    """The TauCetiTools checkout at the ref the staged engine's pyproject pins (its one Python
+    dependency), or None for an engine that pins none."""
+    try:
+        pin = _TOOLS_PIN_RE.search((engine_dir / "pyproject.toml").read_text())
+    except OSError:
+        return None
+    if pin is None:
+        return None
+    tools_dir = cfg.state / "refs" / "review-tools"
+    if not _fetch_pinned(f"https://github.com/{TOOLS}", pin.group(1), tools_dir):
+        raise Die(f"fetch {TOOLS}@{pin.group(1)} failed")
+    return tools_dir
+
+
 def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
@@ -2282,8 +2317,13 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     outbox but NOT push (the bubble can't reach TauCetiData) — do_review drains that outbox to
     TauCetiData host-side afterwards. The only traffic that
     crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
-    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine has no
-    Python deps, so we run the mounted source with the image's python3 — no uvx/uv/PyPI.
+    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine's one
+    Python dependency, TauCetiTools, is mounted as source at the ref the engine pins, and both run with
+    the image's python3 — no uvx/uv/PyPI.
+
+    An engine that coordinates through Git claims would push its lease from inside the bubble, where
+    the proxy refuses it; the host takes the same `review/<repo>/<pr>/<head>` claim around the run and
+    the engine is passed --no-coordinate. A head another reviewer holds is skipped, not charged.
 
     The store is mounted READ-WRITE from the worker's persistent store_dir (not /tmp): it holds the
     scoreboard/thread comment ids the next round edits in place — an ephemeral store would post a
@@ -2295,6 +2335,11 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
     if not eng and not fetch_ref(REVIEW, engine_dir):  # keeps .git (no cross-repo rev fallback)
         raise Die(f"fetch {REVIEW} failed")
+    tools_dir = _review_engine_tools(cfg, engine_dir)
+    try:
+        coordinates = "--no-coordinate" in (engine_dir / "runner" / "cli.py").read_text()
+    except OSError:
+        coordinates = False
     roadmap_dir = cfg.state / "refs" / "roadmap"
     if not fetch_ref(ROADMAP, roadmap_dir):
         raise Die(f"fetch {ROADMAP} failed")
@@ -2302,6 +2347,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     store.mkdir(parents=True, exist_ok=True)
     _open_store_to_container(store)
     mounts = [f"{engine_dir}:/opt/engine:ro", f"{roadmap_dir}:/opt/roadmap:ro", f"{store}:/opt/review-store:rw"]
+    if tools_dir is not None:
+        mounts.append(f"{tools_dir / 'tauceti_tools'}:/opt/tools/tauceti_tools:ro")
     # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview). --no-mathlib for now; wiring
     # --mathlib-dir at the bubble's vendored .lake/packages/mathlib is the reuse-rubric refinement.
     # run_in_bubble prefixes `env PATH=… `, so the inner command must start with an executable, not the
@@ -2320,9 +2367,9 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     # expands run_in_bubble's own prefix, so /opt/round is named again here.
     inner = (
         "env PATH=/opt/round/review-git:/opt/round:$PATH "
-        "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
+        "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine:/opt/tools python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
-        f"--no-mathlib --no-sync --store /opt/review-store --post "
+        f"--no-mathlib --no-sync{' --no-coordinate' if coordinates else ''} --store /opt/review-store --post "
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
@@ -2346,8 +2393,22 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
             f"exec {inner}"
         )
         inner = "sh -c " + shlex.quote(setup)
-    # target is the PR so bubble checks it out; prompt unused by the engine.
-    return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts, inner_cmd=inner, cred_model=reviewers)
+
+    def run() -> int:
+        # target is the PR so bubble checks it out; prompt unused by the engine.
+        return run_in_bubble(
+            w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts, inner_cmd=inner, cred_model=reviewers
+        )
+
+    if not coordinates:
+        return run()
+    if w.claims.begin_global_work(f"review/{TAUCETI.lower()}/{pr}/{head}") == 1:
+        raise NoProgress(f"review #{pr}: {head[:12]} is claimed by another reviewer — skipping")
+    try:
+        return run()
+    finally:
+        w.claims.stop_heartbeat()
+        w.claims.release()
 
 
 def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:

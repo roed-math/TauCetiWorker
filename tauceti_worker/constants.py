@@ -15,6 +15,8 @@ ROADMAP = "TauCetiProject/TauCetiRoadmap"
 
 REVIEW = "TauCetiProject/TauCetiReview"
 
+TOOLS = "TauCetiProject/TauCetiTools"
+
 # The shared cooperative-claim namespace: a repository that holds nothing but `refs/tauceti-claims/*`
 # leases, so operators can coordinate without anyone holding write access to canonical. Push access is
 # granted automatically to the author of any merged TauCeti PR (canonical's `claims-access` workflow);
