@@ -143,7 +143,7 @@ RUN_STDLIB=(
   rebase_handoff.py
   rebase_budget.py
   review_sync_failure.py
-  quota_claude_bootstrap.py
+  quota_weekly_only.py
   quota_claude_windows.py
   quota_launch_stage.py
   quota_codex_windows.py

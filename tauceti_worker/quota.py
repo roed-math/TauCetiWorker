@@ -43,6 +43,10 @@ QUOTA_TTL = {"codex": 600, "claude": 3600}
 # tokens hit it several times a day (2026-10-06); with Codex out, a 1-hour bound idled them for the
 # whole wait. A reading still describes only the windows it was fetched in (valid_until applies).
 CLAUDE_FALLBACK_MAX_AGE = 6 * 3600
+# How long a payload with an idle window may be reused. Since 2026-10-30 subscription accounts report
+# no session window at all (`five_hour: null`, no session entry in `limits`), so an idle window is the
+# steady state and re-reading it every poll would only earn 429s from the usage endpoint.
+CLAUDE_IDLE_CACHE_S = 900
 # Added to a 429's Retry-After before the token asks again: requests made right as a shorter wait ran
 # out were answered with a fresh 3600 s wait in all five cases logged on 2026-10-05/06.
 USAGE_RETRY_MARGIN = 120
@@ -337,6 +341,9 @@ STATE_ACTIVE = "active"
 
 STATE_IDLE = "idle"
 
+# An idle window the operator's pace curve forbids spending in (a zero-budget plateau at the start).
+STATE_IDLE_BLOCKED = "idle-blocked"
+
 STATE_ABSENT = "absent"
 
 STATE_MALFORMED = "malformed"
@@ -359,7 +366,7 @@ STATUS_EXHAUSTED = "exhausted"
 # against. `unknown` is the generic fail-closed status the codex reader still emits.
 SOFT_STATUSES = (STATUS_AT_BUDGET, STATUS_OVER_PACE)
 
-HARD_STATUSES = (STATUS_EXHAUSTED, STATE_IDLE, STATE_ABSENT, STATE_MALFORMED, "unknown")
+HARD_STATUSES = (STATUS_EXHAUSTED, STATE_IDLE_BLOCKED, STATE_ABSENT, STATE_MALFORMED, "unknown")
 
 # How a single JSON field read: omitted, explicitly null, a usable value, or garbage. Collapsing these
 # is what let an invalid reset timestamp read the same as an explicit null (⇒ "fresh window").
@@ -670,7 +677,7 @@ def _claude_readings(payload: dict, now: float | None = None) -> list[Reading]:
     return [_claude_window_reading(payload, w, now) for w in ("session", "weekly")]
 
 
-def _claude_valid_until(readings: list[Reading]) -> float | None:
+def _claude_valid_until(readings: list[Reading], observed_at: float | None = None) -> float | None:
     """The instant a payload stops describing reality — the EARLIEST reset clock among its windows —
     or None when the payload is not fully resolved (any window not `active`).
 
@@ -679,9 +686,15 @@ def _claude_valid_until(readings: list[Reading]) -> float | None:
     complete response survive across its own 5-hour reset, after which the worker paced the NEW window
     against the OLD window's usage; and an idle/absent/malformed payload must never be pinned at all,
     because re-reading it is the only thing that can resolve it."""
-    if any(r.state != STATE_ACTIVE or r.resets_at is None for r in readings):
-        return None
-    return min(r.resets_at for r in readings)
+    deadlines = []
+    for r in readings:
+        if r.state == STATE_ACTIVE and r.resets_at is not None:
+            deadlines.append(r.resets_at)
+        elif r.state == STATE_IDLE and observed_at is not None:
+            deadlines.append(observed_at + CLAUDE_IDLE_CACHE_S)
+        else:
+            return None
+    return min(deadlines) if deadlines else None
 
 
 def _codex_clocks(w: object) -> tuple[float, float] | None:
@@ -733,7 +746,7 @@ def _idle_phrase(r: Reading) -> str:
     provider or on their own curve."""
     blocked = _idle_init_block()
     why = blocked or r.detail
-    return "window reset; awaiting initialization" + (f" ({why})" if why else "")
+    return "window idle" + (f" ({why})" if why else "")
 
 
 def _window_from_reading(r: Reading, note: str | None = None, now: float | None = None) -> Window:
@@ -751,8 +764,10 @@ def _window_from_reading(r: Reading, note: str | None = None, now: float | None 
     # An idle window is interpreted for PACING as the synthetic reading used=0 at elapsed=0 — recorded
     # on the Window so the status output and the bootstrap policy agree about what budget applies. The
     # STATE stays `idle`: this is a policy interpretation, not telemetry we were given.
-    budget = pace_budget(pace_curve("claude"), 0.0) if r.state == STATE_IDLE else None
-    return Window(r.window, r.used, 0.0 if r.state == STATE_IDLE else None, r.resets_at, r.state, budget, detail, "claude")
+    idle = r.state == STATE_IDLE
+    budget = pace_budget(pace_curve("claude"), 0.0) if idle else None
+    status = STATE_IDLE_BLOCKED if idle and _idle_init_block() else r.state
+    return Window(r.window, r.used, 0.0 if idle else None, r.resets_at, status, budget, detail, "claude")
 
 
 def _tail_detail(out: str | None, limit: int = 120) -> str:
@@ -2308,7 +2323,7 @@ class Quota:
         # Cache ONLY a payload that is fully resolved, and only until the first reset it describes.
         # An idle/absent/malformed payload is never pinned: re-reading it is the only thing that can
         # resolve it, and one extra fetch per poll is the cheapest part of this system.
-        valid_until = _claude_valid_until(readings)
+        valid_until = _claude_valid_until(readings, observed_at)
         if valid_until is not None:
             self._store_raw("claude", payload, fp, valid_until, observed_at)
         notes, bootstrap_recorded = self._idle_notes(readings)
@@ -2353,7 +2368,7 @@ class Quota:
         # enforces whatever expiry was stored, but an entry written before that rule carries none — and a
         # reading stays `active` for CLAUDE_RESET_SKEW_S past its reset, so "still parses" is not "still
         # describes this window".
-        valid_until = _claude_valid_until(_claude_readings(payload))
+        valid_until = _claude_valid_until(_claude_readings(payload, float(fetched_at)), float(fetched_at))
         if valid_until is None or time.time() >= valid_until:
             return None
         return payload, float(fetched_at)
@@ -2375,31 +2390,17 @@ class Quota:
         window active with positive headroom (a sibling at budget, over pace, exhausted, absent or
         malformed forbids it — we would be spending against a constraint we cannot honour or cannot
         read); and a pace curve under which a fresh window has budget at all."""
-        notes = notes or {}
-        wins = [_window_from_reading(r, notes.get(r.window), now) for r in readings]
+        # An idle window permits work (upstream b42a3fe): accounts without a session window report it
+        # idle forever, and the bootstrap request that used to "open" it can never succeed. The notes
+        # only describe that bootstrap, so they are no longer shown.
+        wins = [_window_from_reading(r, None, now) for r in readings]
         err = None
         if wins and all(w.status == STATE_ABSENT for w in wins):
             # Not one recognizable record in the whole body: this is not a quota reading at all — the
             # schema moved, or we were handed something that isn't the usage response.
             err = "claude usage response schema unsupported (no session or weekly record)"
-        avail = bool(wins) and all(w.status == STATUS_UNDER_PACE for w in wins)
-        idle = [w.name for w in wins if w.status == STATE_IDLE]
-        others_ok = all(w.status == STATUS_UNDER_PACE for w in wins if w.status != STATE_IDLE)
-        # A live ledger record means this episode already has a request in flight or completed. Keep
-        # the parent loop asleep as well as refusing the launch-stage reservation: otherwise it would
-        # repeatedly pay for a deep GitHub survey only to discover the same reservation again.
-        eligible = bool(idle) and others_ok and not bootstrap_recorded and _idle_init_block() is None
-        return Provider(
-            "claude",
-            avail,
-            "opus" if avail else None,
-            wins,
-            err,
-            self._next_eligible(wins, now),
-            None,
-            eligible,
-            idle if eligible else [],
-        )
+        avail = bool(wins) and all(w.status in (STATUS_UNDER_PACE, STATE_IDLE) for w in wins)
+        return Provider("claude", avail, "opus" if avail else None, wins, err, self._next_eligible(wins, now), None)
 
     def _claude_from_payload(self, payload: dict) -> Provider:
         """Provider straight from a payload, with no cache, reservation or bootstrap — the pure parse.

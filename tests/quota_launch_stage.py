@@ -93,9 +93,9 @@ class FakeTime:
 CALLS["bootstrap"] = 0
 cfg = make_cfg()
 model, pending = tc.resolve_work_model(cfg, "claude", dry=False, ignore_quota=False, quota_cmd=None)
-check("an unopened window is selectable, provisionally", (model, pending), ("claude", True))
+check("an idle window is selectable outright", (model, pending), ("claude", False))
 check("selecting it spends nothing", CALLS["bootstrap"], 0)
-check("choosing is pure", (tc.Quota(cfg).choose("claude")[0], CALLS["bootstrap"]), (None, 0))
+check("choosing is pure", (tc.Quota(cfg).choose("claude")[0], CALLS["bootstrap"]), ("claude", 0))
 
 # --- the driver loop: preflight first, request later ------------------------------------------------
 real_time = tc.loop.time
@@ -135,7 +135,7 @@ except Stop:
     pass
 check("a round is spawned", len(spawned), 1)
 check("...pinned to claude", "claude" in spawned[0], True)
-check("...carrying the launch-stage authorization", "--claude-bootstrap" in spawned[0], True)
+check("...with no bootstrap authorization (an idle window needs none)", "--claude-bootstrap" in spawned[0], False)
 check("the loop itself never made the request", CALLS["bootstrap"], 0)
 
 tc.loop.time = real_time
@@ -184,7 +184,7 @@ ran.clear()
 
 def stub_refuse(_self):
     authorized["n"] += 1
-    win = tc.Window("session", None, 0.0, None, tc.STATE_IDLE, 0.0, "bootstrap failed: claude exited 1")
+    win = tc.Window("session", None, 0.0, None, tc.STATE_IDLE_BLOCKED, 0.0, "window idle (pace budget stays 0%)")
     return tc.Provider("claude", False, None, [win])
 
 
@@ -193,7 +193,7 @@ try:
     tc.work_units.dispatch("review", w, tc.Survey(worker_id=cfg.wid), tc.Candidate(1, "head", ""), opts)
     check("a refused launch stops the round", False, True)
 except tc.NoProgress as e:
-    check("a refused launch stops the round", "bootstrap failed" in str(e), True)
+    check("a refused launch stops the round", "pace budget stays 0%" in str(e), True)
 check("...before the model runs", ran, [])
 check("...having asked exactly once", authorized["n"], 1)
 
