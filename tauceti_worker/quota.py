@@ -47,6 +47,13 @@ CLAUDE_FALLBACK_MAX_AGE = 6 * 3600
 # no session window at all (`five_hour: null`, no session entry in `limits`), so an idle window is the
 # steady state and re-reading it every poll would only earn 429s from the usage endpoint.
 CLAUDE_IDLE_CACHE_S = 900
+# A full `claude auth login` that the pacer reads usage with, when the agents themselves run on a
+# `claude setup-token` token: that token carries only the user:inference scope, and the usage endpoint
+# answers it 403 oauth_scope_insufficient (measured 2026-11-02).
+CLAUDE_USAGE_CREDENTIALS_ENV = "TAUCETI_CLAUDE_USAGE_CREDENTIALS"
+# Every worker on that account then asks the usage endpoint with one token, and it rate-limits per token,
+# so they share one cache beside the login, and a launch's forced re-read takes a reading this recent.
+CLAUDE_SHARED_REFRESH_FLOOR_S = 300
 # Added to a 429's Retry-After before the token asks again: requests made right as a shorter wait ran
 # out were answered with a fresh 3600 s wait in all five cases logged on 2026-10-05/06.
 USAGE_RETRY_MARGIN = 120
@@ -1058,6 +1065,13 @@ def codex_dir(home: Path) -> Path:
     return Path(d) if d else home / ".codex"
 
 
+def claude_usage_credentials() -> Path | None:
+    """The usage login's .credentials.json ($TAUCETI_CLAUDE_USAGE_CREDENTIALS), or None to read usage with
+    the worker's own credential."""
+    v = os.environ.get(CLAUDE_USAGE_CREDENTIALS_ENV, "")
+    return Path(v) if v else None
+
+
 def claude_dir(home: Path) -> Path:
     """Where Claude Code keeps its config + credentials. $CLAUDE_CONFIG_DIR wins (the same var Claude
     Code itself honors for a non-default config location, e.g. switching personal/work accounts); else
@@ -1342,6 +1356,14 @@ class Quota:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.cache_dir = cfg.quota_cache
+        usage = claude_usage_credentials()
+        self.claude_shared_cache = usage.parent / CLAUDE_QUOTA_DIRNAME / "usage-cache" if usage else None
+
+    def _cache(self, provider: str) -> Path | None:
+        """Where this provider's readings, 429 holds and cooldowns live: the worker's own cache, except
+        Claude read through a usage login, whose workers share one (see CLAUDE_SHARED_REFRESH_FLOOR_S)."""
+        shared = getattr(self, "claude_shared_cache", None)
+        return shared if provider == "claude" and shared else getattr(self, "cache_dir", None)
 
     @staticmethod
     def _fingerprint(*parts: str | None) -> str | None:
@@ -1353,7 +1375,7 @@ class Quota:
     def _cached_entry(self, provider: str, fp: str | None, max_age: float | None = None) -> dict | None:
         """The whole validated cache entry — {payload, fetched_at, ...} — for a caller that needs to know
         WHEN the payload was true, not just what it says. See _cached_raw for the payload alone."""
-        p = self.cache_dir / f"quota-{provider}.json"
+        p = self._cache(provider) / f"quota-{provider}.json"
         d = _read_json_file(p)
         if not d:
             return None
@@ -1395,25 +1417,28 @@ class Quota:
     ) -> None:
         # `fetched_at` is the instant the caller OBSERVED this payload, kept whole (not truncated to the
         # second) so that re-reading the entry reproduces the verdict the caller already acted on.
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        d = self._cache(provider)
+        d.mkdir(parents=True, exist_ok=True)
         entry = {"fetched_at": time.time() if fetched_at is None else fetched_at, "fp": fp, "payload": payload}
         if valid_until is not None:
             entry["valid_until"] = valid_until
-        (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
+        tmp = d / f"quota-{provider}.json.{os.getpid()}.tmp"  # a shared cache has concurrent readers
+        tmp.write_text(json.dumps(entry))
+        os.replace(tmp, d / f"quota-{provider}.json")
 
     def _hold_usage(self, fp: str | None, retry_after: float | None) -> None:
         """Record a 429's Retry-After for this token, plus USAGE_RETRY_MARGIN, in `<cache>/usage-hold.json`:
         a request before it runs out is refused again, and every worker process sharing the cache waits."""
         until = time.time() + (retry_after if retry_after else 300) + USAGE_RETRY_MARGIN
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            (self.cache_dir / "usage-hold.json").write_text(json.dumps({"fp": fp, "until": until}))
+            self._cache("claude").mkdir(parents=True, exist_ok=True)
+            (self._cache("claude") / "usage-hold.json").write_text(json.dumps({"fp": fp, "until": until}))
         except Exception:  # noqa: BLE001 - a missing hold costs one refused request, never a failed read
             pass
 
     def _usage_hold(self, fp: str | None) -> float:
         """Seconds left before this token may ask the usage endpoint again, or 0."""
-        d = _read_json_file(self.cache_dir / "usage-hold.json") if getattr(self, "cache_dir", None) else None
+        d = _read_json_file(self._cache("claude") / "usage-hold.json") if self._cache("claude") else None
         if not d or d.get("fp") != fp or not _finite_num(d.get("until")):
             return 0.0
         return max(0.0, float(d["until"]) - time.time())
@@ -1429,8 +1454,8 @@ class Quota:
         if error:
             rec["error"] = error[:200]
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            p = self.cache_dir / "usage-requests.jsonl"
+            self._cache("claude").mkdir(parents=True, exist_ok=True)
+            p = self._cache("claude") / "usage-requests.jsonl"
             with open(p, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             if p.stat().st_size > 2_000_000:
@@ -1438,7 +1463,7 @@ class Quota:
         except Exception:  # noqa: BLE001 - a log line must never turn into a failed quota read
             pass
     def _cooldown_path(self, provider: str, key: str | None) -> Path:
-        return self.cache_dir / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"
+        return self._cache(provider) / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"
 
     def _cooldown(self, provider: str, key: str | None) -> tuple[float, int | None]:
         """(seconds until this account's usage endpoint may be asked again, the HTTP status that started
@@ -1447,7 +1472,7 @@ class Quota:
         Kept on disk beside the cache, one record per account, so it binds every caller sharing this
         cache: an `auto` loop re-reads both providers before each round, and without this a healthy
         codex kept the loop busy while it re-asked a rate-limited Claude endpoint after every round."""
-        memory = _cooldown_left(_COOLDOWNS.get((str(self.cache_dir), provider, key or "")))
+        memory = _cooldown_left(_COOLDOWNS.get((str(self._cache(provider)), provider, key or "")))
         disk = _cooldown_left(_read_json_file(self._cooldown_path(provider, key)))
         return max(memory, disk, key=lambda left_code: left_code[0])
 
@@ -1469,13 +1494,13 @@ class Quota:
         if wait <= 0:
             return
         record = {"until": time.time() + wait, "wait": wait, "code": code}
-        mem = (str(self.cache_dir), provider, key or "")
+        mem = (str(self._cache(provider)), provider, key or "")
         if not _outlasts(_COOLDOWNS.get(mem), record["until"]):
             _COOLDOWNS[mem] = record
         path = self._cooldown_path(provider, key)
         fd = None
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._cache(provider).mkdir(parents=True, exist_ok=True)
             # Re-check and write under a lock, so two callers answering at once cannot replace a longer
             # cooldown with a shorter one; write-then-rename, so a reader never sees a truncated record.
             fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
@@ -1509,7 +1534,7 @@ class Quota:
         """Drop a provider's cached payload so the next read must go to the network. Used after a
         bootstrap request: whatever we hold predates the request that was meant to change it."""
         try:
-            (self.cache_dir / f"quota-{provider}.json").unlink()
+            (self._cache(provider) / f"quota-{provider}.json").unlink()
         except OSError:
             pass
 
@@ -1963,7 +1988,11 @@ class Quota:
         a file), so we read it FIRST and only fall back to a file; from_keychain marks creds we must NOT
         refresh/persist, since rotating the shared token would log out the operator's claude. Reading the
         Keychain first also means a credentials file we materialize for the bubble never shadows the live
-        Keychain here. On Linux the file is the store."""
+        Keychain here. On Linux the file is the store, or the usage login (claude_usage_credentials) when
+        the agents' own token cannot read usage."""
+        if usage := claude_usage_credentials():
+            d = _read_json_file(usage)
+            return (d.get("claudeAiOauth") if d else None) or None, False
         if sys.platform == "darwin":
             kc = _claude_keychain_creds()
             if kc and kc.get("claudeAiOauth"):
@@ -2006,14 +2035,18 @@ class Quota:
         rather than once per poll, and a rotation another process just performed is not immediately
         spent again. A failure is reported and swallowed: an unrefreshable credential still reads as an
         unavailable provider, which is the honest answer."""
-        if sys.platform == "darwin":
+        usage = claude_usage_credentials()
+        if sys.platform == "darwin" and usage is None:
             return self._warm_claude_keychain(force=force)
         if os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
             return False
         # The ORIGINAL, never the mirror the pacer reads: mirror_creds overwrites the mirror from the
         # original every cycle, so rotating the mirror would be undone and leave the real credential
         # expired. _claude_creds_source resolves the isolate_home marker for exactly this.
-        prov = credential_refresh.provider("claude", credentials=self._claude_creds_source() / ".credentials.json")
+        # The usage login, when there is one, is the credential the pacer reads; the agents' setup-token
+        # has no refresh token and needs none.
+        source = usage or self._claude_creds_source() / ".credentials.json"
+        prov = credential_refresh.provider("claude", credentials=source)
         if not credential_refresh.renewable(prov):
             return False
         if not force:
@@ -2186,7 +2219,7 @@ class Quota:
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         oauth, _from_keychain = self._claude_creds()
         if not oauth:
-            err = f"no {claude_dir(self.cfg.home) / '.credentials.json'}"
+            err = f"no {claude_usage_credentials() or claude_dir(self.cfg.home) / '.credentials.json'}"
             if sys.platform == "darwin":
                 err += ' (and no "Claude Code-credentials" Keychain entry)'
             return Provider("claude", False, None, error=err)
@@ -2195,20 +2228,41 @@ class Quota:
         # The bootstrap RESERVATION deliberately does not use this — see _claude_account_key.
         fp = self._fingerprint(oauth.get("accessToken"))
         account = self._claude_account_key(oauth)  # from the same snapshot as the token it fetches with
-        prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh, account=account)
+        prov, _readings = self._claude_shared_pass(fp, oauth.get("accessToken"), refresh=refresh, account=account)
         if renew and _claude_unauthorized(prov):
             # The stored expiry said the token was live and the endpoint disagreed — a clock skew, a
             # server-side revocation, or a credential rotated behind our back. Believe the endpoint over
             # the file: rotate once (rate-limited), and re-read rather than reporting a 401 we can fix.
-            if self._refresh_claude_credential(force=True):
+            # A usage login shared by several workers may simply have been rotated by another of them
+            # since we read it, which a re-read fixes without spending its refresh token.
+            refused = oauth.get("accessToken")
+            moved = claude_usage_credentials() is not None and (self._claude_creds()[0] or {}).get("accessToken") != refused
+            if moved or self._refresh_claude_credential(force=True):
                 mirror_creds(self.cfg)
                 oauth, _from_keychain = self._claude_creds()
                 if oauth:
                     fp = self._fingerprint(oauth.get("accessToken"))
-                    prov, _readings = self._claude_pass(
+                    prov, _readings = self._claude_shared_pass(
                         fp, oauth.get("accessToken"), refresh=True, account=self._claude_account_key(oauth)
                     )
         return prov
+
+    def _claude_shared_pass(
+        self, fp: str | None, tok: str | None, *, refresh: bool, account: str | None
+    ) -> tuple[Provider, list[Reading] | None]:
+        """_claude_pass, serialized across the workers sharing a usage login's cache so that one fetch
+        answers them all, and with a forced re-read satisfied by a reading under
+        CLAUDE_SHARED_REFRESH_FLOOR_S old."""
+        shared = getattr(self, "claude_shared_cache", None)
+        if shared is None:
+            return self._claude_pass(fp, tok, refresh=refresh, account=account)
+        shared.mkdir(parents=True, exist_ok=True)
+        with open(shared / "fetch.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            entry = self._cached_entry("claude", fp) if refresh else None
+            if entry is not None and time.time() - entry["fetched_at"] < CLAUDE_SHARED_REFRESH_FLOOR_S:
+                refresh = False
+            return self._claude_pass(fp, tok, refresh=refresh, account=account)
 
     def authorize_claude_launch(self) -> Provider:
         """The launch stage: the ONLY place a Claude request may be spent on initializing a window.

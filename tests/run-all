@@ -144,6 +144,7 @@ RUN_STDLIB=(
   rebase_budget.py
   review_sync_failure.py
   quota_weekly_only.py
+  quota_usage_login.py
   quota_claude_windows.py
   quota_launch_stage.py
   quota_codex_windows.py
