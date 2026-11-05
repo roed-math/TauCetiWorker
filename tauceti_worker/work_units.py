@@ -37,6 +37,7 @@ from .agents import (
     run_agent_host,
     run_in_bubble,
     run_to_logfile,
+    take_last_agent_disconnect,
     take_last_agent_infra_failure,
     take_last_agent_setup_failure,
     validate_kiro_model_access,
@@ -64,6 +65,7 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     CURATE_MAX_CANDIDATES,
     EX_NOPROGRESS,
+    MAX_DISCONNECT_REFUNDS,
     MAX_INFRA_REFUNDS,
     MAX_SETUP_FAILURES,
     NEXT_ELIGIBLE_COUNTER,
@@ -1532,6 +1534,22 @@ def _shift_setup_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     )
 
 
+def _refund_disconnect(w, c, label: str, charged: tuple[str, ...]) -> None:
+    """A round whose sandbox dropped under the agent hands back the attempts it charged, up to
+    MAX_DISCONNECT_REFUNDS per head (fleet-wide). On 2026-11-04 one host stall dropped seven gq2
+    bubbles in the same minute, and such drops had spent #22428's and #27295's budgets on every fleet."""
+    reason = take_last_agent_disconnect()
+    if not reason:
+        return
+    n = w.counters.incr(f"disconnect-{c.pr}-{c.head[:12]}")
+    if n > MAX_DISCONNECT_REFUNDS:
+        log(f"  {label} #{c.pr}: {reason}, past the {MAX_DISCONNECT_REFUNDS} handed back at this head — charging the attempt")
+        return
+    for key in charged:
+        w.counters.decr(key)
+    log(f"  {label} #{c.pr}: {reason} — not charged (disconnect {n}/{MAX_DISCONNECT_REFUNDS} at this head)")
+
+
 def _do_fixlike(
     w: Worker,
     sv: Survey,
@@ -1649,6 +1667,7 @@ def _do_fixlike(
         w.rs.bust(pr)
     else:
         _shift_setup_failure(w, c, label, charged)
+        _refund_disconnect(w, c, label, charged)
         _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
 
@@ -3862,10 +3881,12 @@ def _lookahead_outcome(w, rc: int) -> int:
     tip = tips.get((area, slug), "")
     if tip and tip != cand.resume:
         h = lookahead.read_header(view.fork, tip)
-        log(f"lookahead: pushed {branch} at {tip[:12]} ({h.status if h else 'header unreadable'})")
+        fetched = h is not None or lookahead.header_fetched(tip)
+        log(f"lookahead: pushed {branch} at {tip[:12]} "
+            f"({h.status if h else 'header unreadable' if fetched else 'header not read; the next listing retries'})")
         lookahead.history("session", area, slug, rc=rc, outcome="pushed", tip=tip, seconds=seconds,
                           status=h.status if h else None, resumed=cand.resume or None)
-        if h is None:
+        if h is None and fetched:
             lookahead.record("unreadable", area, slug, f"{branch} was pushed at {tip[:12]}, but its LOOKAHEAD.md has no "
                              "readable header: it will be neither resumed nor ported until that is fixed")
         return rc

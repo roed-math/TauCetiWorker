@@ -915,6 +915,10 @@ _LAST_AGENT_SETUP_FAILURE: str | None = None
 # What this round's agents reported spending (see AgentTranscriptRenderer.cost_usd / tokens); a round is
 # its own process, so this is per round. work_units records it with the round (round_spend).
 ROUND_SPEND: dict = {"cost_usd": None, "tokens": {}, "provider": None}
+# Set when the agent ran but bubble's ssh session dropped under it (exit 255 after a disconnect line):
+# the sandbox went away mid-round, so the round says nothing about whether the PR can be fixed.
+_LAST_AGENT_DISCONNECT: str | None = None
+_DISCONNECT_RE = re.compile(r"Connection to bubble-\S+ closed by remote host|Lost connection to the event listener")
 
 
 def take_last_agent_infra_failure() -> str | None:
@@ -923,6 +927,14 @@ def take_last_agent_infra_failure() -> str | None:
     caller must not be able to spend the same one twice."""
     global _LAST_AGENT_FAILURE
     reason, _LAST_AGENT_FAILURE = _LAST_AGENT_FAILURE, None
+    return reason
+
+
+def take_last_agent_disconnect() -> str | None:
+    """Why the last agent subprocess lost its sandbox mid-round, or None. Reads AND CLEARS, like
+    take_last_agent_infra_failure."""
+    global _LAST_AGENT_DISCONNECT
+    reason, _LAST_AGENT_DISCONNECT = _LAST_AGENT_DISCONNECT, None
     return reason
 
 
@@ -964,9 +976,10 @@ def run_agent_proc(
     the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
     failures aren't silent.
     """
-    global _LAST_AGENT_FAILURE, _LAST_AGENT_SETUP_FAILURE
+    global _LAST_AGENT_FAILURE, _LAST_AGENT_SETUP_FAILURE, _LAST_AGENT_DISCONNECT
     _LAST_AGENT_FAILURE = None
     _LAST_AGENT_SETUP_FAILURE = None
+    _LAST_AGENT_DISCONNECT = None
     setup_failed = False
     telemetry_stamp = time.strftime("%Y%m%d-%H%M%S")
     cwds = str(cwd) if cwd is not None else None
@@ -1103,10 +1116,16 @@ def run_agent_proc(
             classification_text = renderer.terminal_failure_text
         return classify_agent_failure(classification_text)
 
+    def classify_disconnect(rc: int) -> None:
+        global _LAST_AGENT_DISCONNECT
+        hit = rc == 255 and next((m for line in tail if (m := _DISCONNECT_RE.search(line))), None)
+        _LAST_AGENT_DISCONNECT = f"the sandbox dropped mid-round ({hit.group(0)})" if hit else None
+
     if os.environ.get("TAUCETI_STREAM"):
         rc = run_rendered(sys.stdout)
         if rc != 0:
             _LAST_AGENT_FAILURE = None if classify_setup_failure() else classify_rendered_failure()
+            classify_disconnect(rc)
             report_failure(f"{label.removeprefix('agent-')} agent exited with status {rc}", code=rc)
         return rc
     logdir.mkdir(parents=True, exist_ok=True)
@@ -1123,6 +1142,7 @@ def run_agent_proc(
         if summary:
             reason += f": {summary}"
         _LAST_AGENT_FAILURE = None if classify_setup_failure() else classify_rendered_failure()
+        classify_disconnect(rc)
         report_failure(reason, code=rc, log_file=logf)
     return rc
 

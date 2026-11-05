@@ -363,6 +363,13 @@ def list_branches(fork: str) -> dict[tuple[str, str], str] | None:
     return out
 
 
+def header_fetched(sha: str) -> bool:
+    """Whether LOOKAHEAD.md at `sha` was read: read_header caches only a successful read, so a None
+    from it means the file does not parse only when this holds, and the read failed otherwise."""
+    d = state_dir()
+    return d is not None and (d / "headers" / f"{sha}.json").is_file()
+
+
 def read_header(fork: str, sha: str, run=None) -> Header | None:
     """The LOOKAHEAD.md header at commit `sha` of the fork, cached by sha (a commit never changes).
     One gated API read on a miss; the tip's commit date rides along so staleness needs no second read."""

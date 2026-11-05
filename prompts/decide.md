@@ -42,7 +42,11 @@ For each case choose exactly one:
   fixer misread the scoreboard), or there is new evidence the fixer lacked (the prerequisite a scope
   finding asks for now exists in an open PR or on main; a contradiction between two findings the
   fixer did not notice). `note` tells the next fixer exactly what to do differently. Allowed only when
-  `retry_allowed` is true.
+  `retry_allowed` is true. Never `retry` a PR the fixer stopped on because main already has its
+  target: no fixer can rebase a duplicate away, and each retry spends another fleet's attempts on
+  the same conclusion. When only some lemmas beyond main remain, escalate, recommending `close`
+  (naming the PRs that landed the target and the leftovers, when no target needs them) or a
+  cut-down PR (when one does).
 - `wait`: the PR is blocked on something already under way: open PR(s) in `open_prs` that build the
   missing stage (`blocked_on_prs`), and/or items already in the target list (`blocked_on_targets`,
   their slugs). The PR is looked at again when those move.

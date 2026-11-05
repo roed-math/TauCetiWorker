@@ -42,6 +42,9 @@ MAX_SETUP_FAILURES = 3  # per-head: rounds whose pre-agent setup in bubble faile
 # The line bubble_work_cmd prints when that setup fails, and the only evidence run_agent_proc takes for
 # "the agent never started" (with no structured agent event seen).
 PRE_AGENT_SETUP_FAILED = "tauceti: pre-agent setup failed; the agent did not start"
+MAX_DISCONNECT_REFUNDS = 2  # per-head: rounds whose sandbox dropped mid-round (bubble's ssh exit 255)
+# that hand their stage attempt back. The agent did run, so unlike a provider outage this is capped
+# low: a PR whose build itself kills the sandbox must still reach its budget.
 MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without posting a verdict
 
 # The tauceti-review engine's exit status for "I stopped because the provider is unusable, and I

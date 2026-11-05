@@ -128,15 +128,32 @@ if ! pub_begin push --sha "$LOCAL_TIP" --branch "$REF"; then
 fi
 
 # 4) Branch-level CAS push. lease="" ⇒ create-only; else the branch must still be at that oid.
+#    A GitHub server error moves nothing, so it is tried twice more after a pause, each try admitted by
+#    the gate: on 2026-11-04 three 500s in a row cost a lookahead round its proof, which lived only in
+#    the round's sandbox.
+SERVER_ERROR='Internal Server Error|remote rejected .*\(failure\)|returned error: 5[0-9][0-9]|HTTP 5[0-9][0-9]|RPC failed|remote end hung up'
 echo "git-safe-push: $REMOTE HEAD:$REF (--force-with-lease=$REF:${LEASE:-<create-only>})" >&2
 OUT=$(mktemp)
-"$REAL_GIT" push --force-with-lease="$REF:$LEASE" "$REMOTE" "HEAD:$REF" 2> >(tee "$OUT" >&2)
-rc=$?
-wait
+for try in 1 2 3; do
+    "$REAL_GIT" push --force-with-lease="$REF:$LEASE" "$REMOTE" "HEAD:$REF" 2> >(tee "$OUT" >&2)
+    rc=$?
+    wait
+    server=0
+    [[ "$rc" -ne 0 ]] && grep -Eq "$SERVER_ERROR" "$OUT" && server=1
+    [[ "$rc" -eq 0 || "$server" -eq 0 || "$try" -eq 3 ]] && break
+    gate_record "rc:$rc" "$OUT"
+    echo "git-safe-push: GitHub answered with a server error; nothing moved — trying again (try $((try + 1)) of 3)" >&2
+    sleep $((try * ${TAUCETI_PUSH_RETRY_SLEEP:-30}))
+    gate_admit git_push push "$TARGET" || { pub_end push fail --detail-file "$OUT"; rm -f "$OUT"
+        echo "git-safe-push: the fleet gate refused the retry — nothing was pushed" >&2; exit 75; }
+done
 if [[ "$rc" -eq 0 ]]; then gate_record ok "$OUT"; else gate_record "rc:$rc" "$OUT"; fi
 if [[ "$rc" -eq 0 ]]; then pub_end push ok --remote-id "$LOCAL_TIP" --detail-file "$OUT"; else pub_end push fail --detail-file "$OUT"; fi
 rm -f "$OUT"
 [[ "$rc" -eq 0 ]] && exit 0
+[[ "$server" -eq 1 ]] && die "GitHub answered three pushes with a server error; nothing moved on '$REF'.
+Your commits exist only in this sandbox, which is discarded when the round ends. Keep working or wait a
+few minutes, then run git-safe-push again before you finish; do not use a plain 'git push'."
 die "push rejected — the branch '$REF' moved since checkout (a concurrent push), or it already exists.
 This is the safety mechanism working: we did NOT overwrite anyone. Re-sync to the current head and retry
 next round; do not retry a plain 'git push'."

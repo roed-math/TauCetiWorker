@@ -483,6 +483,10 @@ check("read_header decodes LOOKAHEAD.md and the tip's date", hh is not None and 
       and hh.built_at == 1790856000.0, str(hh and hh.built_at))
 again = L.read_header("alice/TauCeti", tip, run=lambda argv: (_ for _ in ()).throw(AssertionError("no second read")))
 check("a header is read once per tip", again is not None and again.built_at == hh.built_at and len(calls) == 2)
+refused = L.read_header("alice/TauCeti", "f" * 40, run=lambda argv: SimpleNamespace(returncode=1, stdout=""))
+check("a failed read is not taken for a header that does not parse", refused is None and not L.header_fetched("f" * 40))
+garbled = L.read_header("alice/TauCeti", "e" * 40, run=lambda argv: SimpleNamespace(returncode=0, stdout="bm8gaGVhZGVy"))
+check("...while a fetched file without one is", garbled is None and L.header_fetched("e" * 40) and L.header_fetched(tip))
 
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)

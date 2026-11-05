@@ -79,7 +79,7 @@ class RebaseBudgetUnavailable(ValueError):
 # heads for the others.
 SHARED_COUNTER_RE = re.compile(
     r"(?:fix|ci|bump|lint-repair)-\d+-\w+|(?:ci|bump|lint-repair)-pr-\d+|rebase-pr-\d+(?:-\w+)?"
-    r"|rebase-progress-\d+\.json|infra-(?:fix|fix-ci|rebase|bump|lint-repair)-\d+"
+    r"|rebase-progress-\d+\.json|infra-(?:fix|fix-ci|rebase|bump|lint-repair)-\d+|disconnect-\d+-\w+"
 )
 SHARED_COUNTERS_DIR = "attempts"
 
