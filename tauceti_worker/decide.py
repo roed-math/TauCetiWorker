@@ -643,7 +643,7 @@ def _check_item(item, pr: int, targets, refs: Path, taken: list[str]) -> tuple[s
 # branch to the account's TauCetiRoadmap fork and opens the pull request, then parks the TauCeti PR on
 # it (a `wait` whose blocker is the roadmap PR; see _recheck_wait). The two steps are separate so the
 # owner reads the change before it is posted, as TauCetiRoadmap's CONTRIBUTING.md asks; the fleet's
-# `tauceti-fleet attention --file-roadmap PR` runs both with a confirmation between them.
+# `tauceti-aim attention --file-roadmap PR` runs both with a confirmation between them.
 #
 # One clone serves every proposal, each on its own branch, so its `.lake` (Mathlib and the Tau Ceti
 # dependency, several GB) is fetched once rather than per proposal. Callers hold the fleet's periodic
@@ -689,7 +689,7 @@ def _roadmap_record(pr: int) -> tuple[Path, dict]:
             continue
         if rec.get("pr") == pr and rec.get("decision") == ROADMAP and rec.get("proposal"):
             return path, rec
-    raise Die(f"#{pr}: no roadmap ruling awaits filing (`tauceti-fleet attention` lists them)")
+    raise Die(f"#{pr}: no roadmap ruling awaits filing (`tauceti-aim attention` lists them)")
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -899,7 +899,7 @@ def _state(pr: int) -> dict:
         return json.loads((decisions_dir() / f"roadmap-{pr}" / "state.json").read_text())
     except (OSError, ValueError):
         raise Die(
-            f"#{pr}: nothing prepared yet; prepare it and read the diff with `tauceti-fleet attention --file-roadmap {pr}` (or `tauceti roadmap-change prepare {pr}`)"
+            f"#{pr}: nothing prepared yet; prepare it and read the diff with `tauceti-aim attention --file-roadmap {pr}` (or `tauceti roadmap-change prepare {pr}`)"
         ) from None
 
 

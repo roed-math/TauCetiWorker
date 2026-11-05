@@ -1167,7 +1167,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     return rc
 
 
-# What a round spent, for the fleet's budget pacing (tauceti-fleet: fallback_max_open = "auto"). One
+# What a round spent, for the fleet's budget pacing (tauceti-aim: fallback_max_open = "auto"). One
 # JSON line per round in state/<id>/rounds.jsonl, which the fleet reads; trimmed past ROUNDS_KEEP lines.
 ROUNDS_LOG = "rounds.jsonl"
 ROUNDS_KEEP = 2000
@@ -2332,7 +2332,7 @@ def _do_curate_inner(w, sv, opts) -> int | None:
 @contextlib.contextmanager
 def _targets_lock(path: Path):
     """Hold the target list's lock: `.<name>.lock` beside it, taken by everything that writes the list
-    (the curate and decide stages of every fleet that shares the file, and `tauceti-fleet targets
+    (the curate and decide stages of every fleet that shares the file, and `tauceti-aim targets
     --apply`). Yields False, after logging why, when the lock cannot be opened; the caller then leaves
     the list alone rather than write it unlocked.
 

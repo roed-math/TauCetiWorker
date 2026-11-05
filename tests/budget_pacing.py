@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The worker's half of budget pacing (tauceti-fleet `authoring.fallback_max_open = "auto"`):
+"""The worker's half of budget pacing (tauceti-aim `authoring.fallback_max_open = "auto"`):
   * fallback_cap: the fleet's cap file when pacing is on and the file is fresh, else the environment's;
   * the outside-list fallback decides by that cap and says it is budget-paced;
   * round_kind: a round's spend is target work, outside work or shared work;

@@ -107,7 +107,7 @@ def record_incident(kind: str, key: str, **fields) -> Path | None:
 
 
 BUDGET_SPENT = "budget-spent"
-ACKED = "acked"  # the fleet moves an acknowledged incident here (tauceti-fleet `attention --ack`)
+ACKED = "acked"  # the fleet moves an acknowledged incident here (tauceti-aim `attention --ack`)
 
 
 def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:

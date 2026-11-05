@@ -169,10 +169,10 @@ check("curate comes after every PR stage of the cascade, with only decide after 
 # nowhere else; never canonical; no other op inherits the permission.
 from tauceti_worker import gate as _gate
 
-os.environ["TAUCETI_TARGETS_REPO"] = "roed-math/tauceti-fleet"
-check("curate may push to the target-list repo", _gate.push_target_allowed("curate", "https://github.com/roed-math/tauceti-fleet.git"))
+os.environ["TAUCETI_TARGETS_REPO"] = "roed-math/tauceti-aim"
+check("curate may push to the target-list repo", _gate.push_target_allowed("curate", "https://github.com/roed-math/tauceti-aim.git"))
 check("curate may not push elsewhere", not _gate.push_target_allowed("curate", "https://github.com/roed-math/other.git"))
-check("the permission does not extend to other ops", not _gate.push_target_allowed("push", "https://github.com/roed-math/tauceti-fleet.git"))
+check("the permission does not extend to other ops", not _gate.push_target_allowed("push", "https://github.com/roed-math/tauceti-aim.git"))
 os.environ["TAUCETI_TARGETS_REPO"] = _gate.TAUCETI
 check("never canonical", not _gate.push_target_allowed("curate", f"https://github.com/{_gate.TAUCETI}.git"))
 del os.environ["TAUCETI_TARGETS_REPO"]

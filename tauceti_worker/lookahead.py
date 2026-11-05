@@ -33,7 +33,7 @@ HOLD_HOURS_ENV = "TAUCETI_LOOKAHEAD_HOLD_HOURS"
 # Exported for a lookahead session only: git-safe-push then pushes nothing but this branch, and
 # gh-safe-pr-create refuses outright.
 BRANCH_ENV = "TAUCETI_LOOKAHEAD_BRANCH"
-# An operator's one-off round (`tauceti-fleet lookahead SLUG`): only this list item, as a session
+# An operator's one-off round (`tauceti-aim lookahead SLUG`): only this list item, as a session
 # while it is blocked or as a port once it is eligible, and never anything else instead.
 TARGET_ONLY_ENV = "TAUCETI_TARGET_ONLY"
 PREFIX = "lookahead/"
