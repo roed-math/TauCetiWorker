@@ -118,6 +118,7 @@ RUN_STDLIB=(
   setup_failure_budget.py
   disconnect_refund.py
   push_server_error.py
+  shared_attempts.py
   inflight_review.py
   isolate_home_macos.py
   isolate_home_paths.py

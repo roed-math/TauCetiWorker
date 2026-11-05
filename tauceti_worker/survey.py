@@ -74,9 +74,11 @@ class RebaseBudgetUnavailable(ValueError):
 
 # The attempt budgets of the branch-writing stages, the rebase checkpoints their keys derive from, and
 # the provider-outage refunds charged against them. In a fleet (TAUCETI_GATE_DIR set) they live in the
-# gate store, so the fleet spends one budget per PR head rather than one per worker. Setup failures
-# (`setup-*`) stay per worker: they cost no agent time, and one worker's broken sandbox must not retire
-# heads for the others.
+# gate store, so the fleet spends one budget per PR head rather than one per worker, and with
+# $TAUCETI_SHARED_ATTEMPTS_DIR in a directory several fleets share, so one stuck PR costs its budget
+# once rather than once per fleet (2026-11-04: #22428 spent 3 rebase attempts on each of three fleets).
+# Setup failures (`setup-*`) stay per worker: they cost no agent time, and one worker's broken sandbox
+# must not retire heads for the others.
 SHARED_COUNTER_RE = re.compile(
     r"(?:fix|ci|bump|lint-repair)-\d+-\w+|(?:ci|bump|lint-repair)-pr-\d+|rebase-pr-\d+(?:-\w+)?"
     r"|rebase-progress-\d+\.json|infra-(?:fix|fix-ci|rebase|bump|lint-repair)-\d+|disconnect-\d+-\w+"
@@ -88,7 +90,10 @@ class Counters:
     def __init__(self, cfg: Config):
         self.state = cfg.state
         gate = os.environ.get("TAUCETI_GATE_DIR", "").strip()
-        self.shared = Path(gate) / SHARED_COUNTERS_DIR if gate else None
+        fleets = os.environ.get("TAUCETI_SHARED_ATTEMPTS_DIR", "").strip()
+        self.shared = Path(fleets) if fleets else Path(gate) / SHARED_COUNTERS_DIR if gate else None
+        # Several fleet users write the same files there, through their common group.
+        self._group = bool(fleets)
         # This process's net charge per key (incr minus decr), so a round can hand back exactly what
         # it charged without overwriting what peers charged to the same shared key meanwhile.
         self._own: dict[str, int] = {}
@@ -107,6 +112,9 @@ class Counters:
             return
         self.shared.mkdir(parents=True, exist_ok=True)
         with open(self.shared / ".lock", "a") as lock:
+            if self._group:
+                with contextlib.suppress(OSError):  # only its creator may, and one already has
+                    os.fchmod(lock.fileno(), 0o664)
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
                 yield
@@ -139,6 +147,8 @@ class Counters:
                 target.write(text)
                 target.flush()
                 os.fsync(target.fileno())
+            if self._group and store == self.shared:
+                os.chmod(temporary, 0o664)  # NamedTemporaryFile makes it 0600
             os.replace(temporary, store / name)
             directory = os.open(store, os.O_RDONLY)
             try:
