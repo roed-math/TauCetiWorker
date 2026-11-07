@@ -12,6 +12,7 @@ import sys
 import time
 
 from . import gate as gate_mod
+from . import host_load
 from .agents import resolve_authoring_profile
 from .budget import Budget, BudgetError, admission_pause
 from .claude_api import api_mode
@@ -115,6 +116,16 @@ def idle_nap(backoff: float, hint: float | None, now: float | None = None) -> fl
     return int(min(max(want, IDLE_SURVEY_FLOOR), max(BACKOFF_MAX, IDLE_SURVEY_FLOOR)))
 
 
+def _wait_for_load(held: host_load.Hold, since: float | None) -> float:
+    """Report and sleep out a load hold; returns when this run of holds began, logging only its start."""
+    if since is None:
+        log(f"holding the next round: {held.detail}")
+    report_runtime("waiting-load", detail=held.detail, phase=None, target=None, next_action_at=time.time() + held.nap)
+    started = since if since is not None else time.time()
+    time.sleep(held.nap)
+    return started
+
+
 def _round_done_hook(rc: int, wid: str) -> None:
     """Run $TAUCETI_ROUND_DONE_CMD after every round, productive or not, with the round's exit code
     and worker id in its environment. A fleet reconciler hangs off this: a finished round is the
@@ -156,6 +167,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
     admission_streak = 0
+    load_held_since: float | None = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate(_signum, _frame) -> None:
@@ -166,6 +178,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            # First, so a held worker reads no quota or GitHub state however long the host stays loaded.
+            if held := host_load.hold(only):
+                load_held_since = _wait_for_load(held, load_held_since)
+                continue
             if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
                 try:
                     snapshot = Budget().snapshot(worker=cfg.wid)
@@ -316,6 +332,14 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 time.sleep(nap)
                 continue
 
+            # 1c) The start slot goes last: a worker parked by quota or GitHub above must not spend one.
+            if held := host_load.hold(only, take=cfg.wid):
+                load_held_since = _wait_for_load(held, load_held_since)
+                continue
+            if load_held_since is not None:
+                log(f"starting after {(time.time() - load_held_since) / 60:.0f} min held for host load")
+                load_held_since = None
+
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
             tail = ["--worker-id", cfg.wid]
             if overlap_batch := os.environ.get("TAUCETI_OVERLAP_BATCH_COMMITS"):
@@ -370,6 +394,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 tail += ["--source", source]
             report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
             rc = run_round_subprocess(tail)
+            host_load.release(cfg.wid)
             hint = _take_next_eligible(cfg)
             _round_done_hook(rc, cfg.wid)
 

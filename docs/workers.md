@@ -397,7 +397,7 @@ else `~/Library/Application Support/tauceti/state/workers` on macOS, else
 and inaccessible to other users, or the manager refuses to start.
 
 Each managed worker publishes a structured state such as `waiting-quota`,
-`surveying`, `running`, or `backoff`, along with its current phase and target and
+`waiting-load`, `surveying`, `running`, or `backoff`, along with its current phase and target and
 the path to its logfile. That is what `tauceti workers status` and the
 dashboard's workers view read.
 

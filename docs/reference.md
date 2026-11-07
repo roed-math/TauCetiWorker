@@ -545,6 +545,9 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
 | `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
 | `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
+| `TAUCETI_MAX_LOAD` | _(unset = off)_ | A loop waits (`waiting-load`) before a build-heavy round while the host's 1- or 5-minute load is at or above this. Reviewers and the other light stages (`curate`, `decide`, `progress`, `overlap-scan`) do not wait, nor does a single `tauceti work` round. |
+| `TAUCETI_LOAD_GATE_DIR` | _(unset = no spacing)_ | Directory holding the start slot that spaces those rounds out; the fleets on one host share it (group-writable, setgid). |
+| `TAUCETI_LOAD_SPACING` | `180` | Seconds a start slot lasts unless its round ends first; `0` removes the spacing. |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |

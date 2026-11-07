@@ -908,7 +908,14 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
         desired.pop(field, None)
     if old != desired:
         return False
-    if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
+    if live.get("state") not in (
+        "idle",
+        "backoff",
+        "waiting-github",
+        "waiting-budget",
+        "waiting-quota",
+        "waiting-load",
+    ):
         return True
     if (live.get("next_action_at") or 0) - time.time() < 15:
         return True
@@ -1392,6 +1399,7 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             "backoff": "backing off",
             "checking-quota": "checking quota",
             "waiting-github": "waiting for GitHub",
+            "waiting-load": "waiting for host load",
             "waiting-quota": "waiting for quota",
         }.get(state, state)
         heading = f"{item['id']} — {display_state}"
@@ -1420,7 +1428,7 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             if state == "running":
                 detail_values = [_runtime_summary(part) for part in detail_values]
             lines.extend(_status_field(label, detail_values, width))
-        if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
+        if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-load", "waiting-quota"}:
             label = "retry" if state == "backoff" else "recheck"
             lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))
         if budget := item.get("budget"):
