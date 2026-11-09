@@ -657,6 +657,52 @@ def _fetch_pinned(url: str, ref: str, dir: Path) -> bool:
     )
 
 
+TOOLS_MIRROR_MOUNT = "/opt/tauceti-tools.git"
+TOOLS_MIRROR_TTL = 600
+
+
+def tools_mirror(cfg: Config, *, refresh: bool = True) -> Path | None:
+    """The bare TauCetiTools mirror that /opt/round/uvx serves pinned commits from (see scripts/uvx).
+
+    TauCeti's shell entrypoints, `scripts/lint-env.sh` among them, may name any TauCetiTools commit a
+    branch was cut with, so this holds every branch and tag rather than one ref. It is fetched at most
+    every TOOLS_MIRROR_TTL seconds; a failed fetch keeps serving the last good mirror. None when there
+    has never been one. `refresh=False` (the echo path) only names it."""
+    mirror = cfg.state / "refs" / "tauceti-tools.git"
+    if not refresh:
+        return mirror
+    url = os.environ.get("TAUCETI_TOOLS_URL") or f"https://github.com/{TOOLS}"
+    stamp = mirror / "tauceti-fetched"
+    try:
+        if time.time() - stamp.stat().st_mtime < TOOLS_MIRROR_TTL:
+            return mirror
+    except OSError:
+        pass
+    fresh = not (mirror / "HEAD").is_file()
+    target = mirror.with_name(f"{mirror.name}.{os.getpid()}") if fresh else mirror
+    if fresh:
+        shutil.rmtree(target, ignore_errors=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", "--bare", str(target)], check=False)
+    fetched = gate_mod.gated_git(
+        ["git", "--git-dir", str(target), "fetch", "-q", "--prune", url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
+        op="fetch",
+        target=url,
+    )
+    if fetched.returncode == 0:
+        if fresh:
+            shutil.rmtree(mirror, ignore_errors=True)
+            target.rename(mirror)
+        stamp.touch()
+        return mirror
+    if fresh:
+        shutil.rmtree(target, ignore_errors=True)
+        log("TauCetiTools mirror: fetch failed; this round's uvx entrypoints (lint-env.sh) cannot run")
+        return None
+    log("TauCetiTools mirror: fetch failed; serving the last good mirror")
+    return mirror
+
+
 SHIM_DIR = HERE / "scripts" / "shim"
 _SCRUBBED_TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "CLAIMS_TOKEN")
 
@@ -1954,6 +2000,7 @@ BUBBLE_ROUND_SCRIPTS = (
     "tauceti-gate",
     "lookahead-check",
     "link-mathlib-store",
+    "uvx",
 )
 
 
@@ -2101,6 +2148,10 @@ def run_in_bubble(
         mount_flags += ["--mount", resolved_mount(m)]
     for m in shared_build_mounts(cfg) if inner_cmd is None else []:  # only work rounds build
         mount_flags += ["--mount", resolved_mount(m)]
+    if inner_cmd is None:  # only work rounds lint
+        tools = tools_mirror(cfg, refresh=not os.environ.get("TAUCETI_AGENT_ECHO"))
+        if tools is not None:
+            mount_flags += ["--mount", resolved_mount(f"{tools}:{TOOLS_MIRROR_MOUNT}:ro")]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
     # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch

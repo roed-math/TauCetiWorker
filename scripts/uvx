@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# uvx for sandboxed rounds, staged at /opt/round/uvx. TauCeti's shell entrypoints (scripts/lint-env.sh
+# and its siblings) are `exec uvx --from git+https://github.com/TauCetiProject/TauCetiTools@<sha> ...`,
+# but the bubble image has no uv, PyPI is not on its allowlist, and its auth proxy serves no repository
+# but TauCeti. So this runs exactly that pinned commit from the read-only mirror the worker mounts at
+# /opt/tauceti-tools.git, with the image's python3 (TauCetiTools needs only the standard library from
+# 3.11). Any other request goes to a real uvx further down PATH, or fails saying why.
+set -euo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+mirror="${TAUCETI_UVX_MIRROR:-/opt/tauceti-tools.git}"
+pin='^git\+https://github\.com/TauCetiProject/TauCetiTools(\.git)?@([0-9a-f]{40})$'
+
+die() {
+  echo "uvx (sandboxed round): $*" >&2
+  exit 2
+}
+
+real_uvx() {
+  local dir
+  local IFS=:
+  for dir in $PATH; do
+    if [ -x "$dir/uvx" ] && [ "$(readlink -f "$dir/uvx")" != "$self" ]; then
+      exec "$dir/uvx" "$@"
+    fi
+  done
+  die "only 'uvx --from git+https://github.com/TauCetiProject/TauCetiTools@<full sha> <command> ...' is available here (no uv, no PyPI): $*"
+}
+
+spec=
+cmd=
+argv=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from) [ $# -ge 2 ] || real_uvx "${argv[@]}"; spec=$2; shift 2 ;;
+    --from=*) spec=${1#--from=}; shift ;;
+    -q | --quiet | --offline | --no-progress) shift ;;
+    -*) real_uvx "${argv[@]}" ;;
+    *) cmd=$1; shift; break ;;
+  esac
+done
+[[ -n "$cmd" && "$spec" =~ $pin ]] || real_uvx "${argv[@]}"
+sha=${BASH_REMATCH[2]}
+[[ "$cmd" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad command name: $cmd"
+
+git_m() { git -c safe.directory='*' --git-dir="$mirror" "$@"; }
+src="${XDG_CACHE_HOME:-$HOME/.cache}/tauceti-uvx/$sha"
+if [ ! -f "$src/pyproject.toml" ]; then
+  [ -d "$mirror" ] || die "the TauCetiTools mirror is not mounted at $mirror; this round cannot run TauCetiTools@$sha"
+  git_m cat-file -e "$sha^{commit}" 2>/dev/null \
+    || die "TauCetiTools@$sha is not in the mirror the worker fetched when this round started; the next round refreshes it"
+  mkdir -p "$(dirname "$src")"
+  tmp="$(mktemp -d "$src.XXXXXX")"
+  git_m archive "$sha" | tar -x -C "$tmp"
+  python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$tmp" "$src" 2>/dev/null || rm -rf "$tmp"
+fi
+
+# The console script, resolved from [project.scripts] the way uvx installs it.
+entry="$(python3 - "$src/pyproject.toml" "$cmd" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    print(tomllib.load(f).get("project", {}).get("scripts", {}).get(sys.argv[2], ""))
+PY
+)" || die "python3 >= 3.11 is needed to read TauCetiTools@$sha's pyproject.toml"
+[ -n "$entry" ] || die "TauCetiTools@$sha has no console script '$cmd'"
+
+export PYTHONPATH="$src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -P -c '
+import importlib, sys
+name, entry = sys.argv[1], sys.argv[2]
+module, _, attr = entry.partition(":")
+sys.argv = [name, *sys.argv[3:]]
+target = importlib.import_module(module.strip())
+for part in attr.strip().split("."):
+    target = getattr(target, part)
+sys.exit(target())
+' "$cmd" "$entry" "$@"
