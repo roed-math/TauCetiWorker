@@ -55,6 +55,10 @@ if [ ! -f "$src/pyproject.toml" ]; then
   python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$tmp" "$src" 2>/dev/null || rm -rf "$tmp"
 fi
 
+export PYTHONPATH="$src${PYTHONPATH:+:$PYTHONPATH}"
+# uvx's environment has its own python, which TauCeti's Python scripts need to import tauceti_tools.
+case "$cmd" in python | python3 | python3.*) exec python3 "$@" ;; esac
+
 # The console script, resolved from [project.scripts] the way uvx installs it.
 entry="$(python3 - "$src/pyproject.toml" "$cmd" <<'PY'
 import sys, tomllib
@@ -64,7 +68,6 @@ PY
 )" || die "python3 >= 3.11 is needed to read TauCetiTools@$sha's pyproject.toml"
 [ -n "$entry" ] || die "TauCetiTools@$sha has no console script '$cmd'"
 
-export PYTHONPATH="$src${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -P -c '
 import importlib, sys
 name, entry = sys.argv[1], sys.argv[2]

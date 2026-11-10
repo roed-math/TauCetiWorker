@@ -122,6 +122,10 @@ p = run(uvx_line(new), UVX_TEST_RC="3")
 check("the console script's exit code is the shim's", p.returncode == 3, f"rc={p.returncode}")
 p = run(f"exec uvx --from=git+https://github.com/TauCetiProject/TauCetiTools.git@{v3} tauceti-tools\n")
 check("--from=SPEC and a .git URL are accepted", p.returncode == 0 and p.stdout.startswith("v3|"), p.stdout + p.stderr)
+p = run(f"exec uvx --from git+https://github.com/TauCetiProject/TauCetiTools@{new} python -c "
+        "'import sys, tauceti_tools.cli as c; print(c.__file__.split(\"/tauceti-uvx/\")[1], sys.argv[1:])' a\n")
+check("python as the command imports the pinned package, as uvx's environment python does",
+      p.returncode == 0 and p.stdout.strip() == f"{new}/tauceti_tools/cli.py ['a']", p.stdout + p.stderr)
 p = run(uvx_line("0" * 40))
 check("a commit the mirror lacks fails with a reason",
       p.returncode == 2 and "not in the mirror" in p.stderr, f"rc={p.returncode} {p.stderr}")
