@@ -7,11 +7,12 @@ when the supplier lands. Offline checks:
     themselves unblocked: never a stub of a stub), most depended-on first; `lookahead: no` on the item
     or a supplier, a decline, a recent failure or a complete branch excludes; a partial branch resumes;
   * port plans: a split is ready once the splits it needs have merged, and an in-flight item is offered
-    for porting only while every open PR carrying its marker is one of its port PRs (owner's ruling:
-    no waiting for merges between independent splits); merged ports come from a search on the port
-    marker (remembered for a round whose search fails), so a split that merged days ago still counts;
+    for porting only while no PR carrying its marker is open (one split at a time: TauCeti's
+    housekeeping closes the newer of two); merged ports come from a search on the port marker
+    (remembered for a round whose search fails), so a split that merged days ago still counts;
   * `_pick_target`: lookahead first when nothing on the list can be taken (owner's ruling), no cap on
-    live branches, the port plan handed to do_roadmap, and without lookahead the hold and its expiry;
+    live branches, the port plan handed to do_roadmap, under `ports` the ports without sessions, and
+    without lookahead the hold and its expiry;
   * a session's outcome is its branch: moved = pushed, unmoved = a `failed` incident and a pause;
   * the port section names the split, the marker and whether the target marker is partial;
   * the curator's sweep deletes the branch of a done item and reports the rest;
@@ -143,12 +144,21 @@ LIVE2 = parse_targets(TEXT.replace("- [~] `flying` — L1, \"In flight.\" (serve
                                    "- [x] `flying` — L1, \"Landed.\" (serves: B1; needs: none; landed: #10)"))
 LIVE2 = overlay_live(LIVE2, {("Item", "on-flying")}, set())  # an open PR carries its marker
 plans = {("Item", "on-flying"): L.port_plan(B, H3, {(B, 1): 501}, {})}
-check("an in-flight item whose open PRs are its port PRs is offered for its next split",
-      [it.slug for _a, it in L.port_ready(LIVE2, plans, {("Item", "on-flying"): {501}})] == ["on-flying"])
+check("one split at a time: not while one of its port PRs is open",
+      L.port_ready(LIVE2, plans, {("Item", "on-flying"): {501}}) == [])
 check("not while another PR carries its marker",
-      L.port_ready(LIVE2, plans, {("Item", "on-flying"): {501, 777}}) == [])
+      L.port_ready(LIVE2, {("Item", "on-flying"): L.port_plan(B, H3, {}, {})}, {("Item", "on-flying"): {777}}) == [])
+INFLIGHT = "- [~] `on-flying` — L3, \"Needs the in-flight one.\" (serves: B1; needs: `flying`, `base`; in flight: #501)"
+LIVE3 = parse_targets(TEXT.replace("- [~] `flying` — L1, \"In flight.\" (serves: B1; needs: none; in flight: #10)",
+                                   "- [x] `flying` — L1, \"Landed.\" (serves: B1; needs: none; landed: #10)")
+                      .replace("- [ ] `on-flying` — L3, \"Needs the in-flight one.\" (serves: B1; needs: `flying`, `base`)",
+                               INFLIGHT))
+merged1 = {("Item", "on-flying"): L.port_plan(B, H3, {}, {(B, 1): 501})}
+check("an in-flight item with nothing open is offered for its next split",
+      [it.slug for _a, it in L.port_ready(LIVE3, merged1, {})] == ["on-flying"])
 check("not while its supplier is still in flight",
-      L.port_ready(overlay_live(live, {("Item", "on-flying")}, set()), plans, {("Item", "on-flying"): {501}}) == [])
+      L.port_ready(parse_targets(TEXT.replace("- [ ] `on-flying` — L3, \"Needs the in-flight one.\" (serves: B1; needs: "
+                                              "`flying`, `base`)", INFLIGHT)), merged1, {}) == [])
 FREE = L.parse_header(header("Item", "on-flying", suppliers=()))
 free_plans = {("Item", "on-flying"): L.port_plan(B, FREE, {}, {})}
 check("a complete branch that stubs nothing is ported now, its supplier still in flight",
@@ -230,8 +240,8 @@ check("an eligible item with a branch is picked with its port plan", got is not 
 
 # an in-flight item with a ready split is offered before eligible items
 plans_view = lambda w, sv, live: view_for(  # noqa: E731
-    live, {("Item", "on-flying"): "f3"}, {"f3": H3}, open_ports={(B, 1): 501}, open_item_prs={("Item", "on-flying"): {501}})
-FLYING_DONE = overlay_live(parse_targets(TEXT.replace("- [~] `flying`", "- [x] `flying`")), {("Item", "on-flying")}, set())
+    live, {("Item", "on-flying"): "f3"}, {"f3": H3}, merged_ports={(B, 1): 501})
+FLYING_DONE = LIVE3
 W._lookahead_view = plans_view
 w = worker()
 got = W._pick_target(w, sv, FLYING_DONE, Path("t.md"), "auto", [])
@@ -258,6 +268,34 @@ got = W._pick_target(w, sv, ELIG, Path("t.md"), "auto", [])
 check("TAUCETI_TARGET_ONLY: an eligible item with a branch is ported", got is not None and got[2].slug == "eligible"
       and w.lookahead_port is not None)
 os.environ.pop("TAUCETI_TARGET_ONLY")
+
+modes = {}
+for value in ("1", "ports", "0", ""):
+    os.environ["TAUCETI_LOOKAHEAD"] = value
+    modes[value] = (L.active(), L.enabled(), L.sessions())
+check("modes: 1 ports and proves, ports only ports, 0 is passive, unset is nothing",
+      modes == {"1": (True, True, True), "ports": (True, True, False), "0": (True, False, False),
+                "": (False, False, False)}, str(modes))
+
+os.environ["TAUCETI_LOOKAHEAD"] = "ports"  # finishing the branches there are, proving nothing new
+W._lookahead_view = lambda w, sv, live: view_for(live)
+w = worker()
+try:
+    W._pick_target(w, sv, BLOCKED, Path("t.md"), "auto", [])
+except NoProgress:
+    pass
+check("ports: nothing eligible starts no session", w.lookahead_session is None and "lookahead/Item/on-ready" not in w.claims.keys,
+      str(w.claims.keys))
+W._lookahead_view = plans_view
+w = worker()
+got = W._pick_target(w, sv, FLYING_DONE, Path("t.md"), "auto", [])
+check("ports: an in-flight item with a ready split still comes first",
+      got is not None and got[2].slug == "on-flying" and w.lookahead_port[0].next.n == 2, str(got and got[2].slug))
+W._lookahead_view = lambda w, sv, live: view_for(live, {("Item", "eligible"): "e1"}, {"e1": fresh})
+w = worker()
+got = W._pick_target(w, sv, ELIG, Path("t.md"), "auto", [])
+check("ports: an eligible item with a branch is ported, not held", got is not None and got[2].slug == "eligible"
+      and w.lookahead_port is not None and not (INCIDENTS / "lookahead-held-Item-eligible.json").exists())
 
 os.environ["TAUCETI_LOOKAHEAD"] = "0"  # a fleet without lookahead: it holds, it does not port or prove
 W._lookahead_view = lambda w, sv, live: view_for(live, {("Item", "eligible"): "e1"}, {"e1": fresh})

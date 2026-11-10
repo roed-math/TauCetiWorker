@@ -3419,11 +3419,13 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
     branch has another split ready to port, taken before the eligible items, and, when nothing on the
     list can be taken, a session proving a blocked item ahead, taken before authoring outside the list
     (owner's ruling, 2026-10-04). They are handed to do_roadmap as `w.lookahead_port` (the item's
-    port plan) and `w.lookahead_session`."""
+    port plan) and `w.lookahead_session`. Under `TAUCETI_LOOKAHEAD=ports` there are ports and no
+    sessions."""
     w.lookahead_port = w.lookahead_session = None
     live, n_inflight, n_merged = _live_target_view(targets, path, sv, w.gh)
     view = _lookahead_view(w, sv, live)
     on = view is not None and lookahead.enabled()
+    prove = on and lookahead.sessions()
     one = lookahead.target_only()
     try:
         try:
@@ -3446,7 +3448,7 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
         candidates = _without_held(candidates, view)
         area, item, claimed = _claim_target(w.claims, candidates, path)
     except NoProgress as e:
-        if on:
+        if prove:
             session = _claim_lookahead(w, live, view, only, skip)
             if session is not None:
                 log(f"roadmap: {e} — proving `{session.item.slug}` ahead of its supplier(s) instead")
@@ -3454,7 +3456,7 @@ def _pick_target(w, sv, targets: Targets, path: Path, only: str, skip: list[str]
                 return live, session.area, session.item, True, [], n_inflight, n_merged
         if one:
             raise NoProgress(f"`{one}` only ({lookahead.TARGET_ONLY_ENV}): {e}"
-                             + ("; no lookahead session for it either" if on else "")) from None
+                             + ("; no lookahead session for it either" if prove else "")) from None
         # An idle author is waste: while there is room under the project's cap, it authors outside the
         # list instead (owner's ruling, 2026-09-27); the list itself is untouched.
         mine = getattr(sv, "_mine_open_prs", None)

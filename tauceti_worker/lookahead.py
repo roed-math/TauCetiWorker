@@ -4,7 +4,8 @@ An item of the operator's list that waits on a supplier still in flight can be p
 `sorry`'d stubs of the supplier's pinned statements, on a branch `lookahead/<area>/<slug>` of the
 account's TauCeti fork. The branch is never opened as a pull request. When the supplier lands, an
 ordinary author round finds the branch and ports it: each stub is replaced by the landed declaration
-and the branch's planned splits are opened, one PR per round. Off unless `TAUCETI_LOOKAHEAD=1`.
+and the branch's planned splits are opened, one PR per round. `TAUCETI_LOOKAHEAD=1` runs sessions and
+ports, `TAUCETI_LOOKAHEAD=ports` ports the branches there are and starts no session.
 
 All state lives on GitHub, so whichever fleet is active can use a branch another fleet built: the
 branches themselves (one `ls-remote` lists them), the `LOOKAHEAD.md` header on each branch (status,
@@ -50,15 +51,28 @@ PORT_SEARCH_LIMIT = 1000
 NOT_USED_RE = re.compile(r"^\W*Lookahead:\W*not used\W*(.*)$", re.I | re.M)
 
 
+PORTS = "ports"
+
+
+def _mode() -> str:
+    return os.environ.get(ENV, "").strip().lower()
+
+
 def enabled() -> bool:
-    """Lookahead sessions and ports: `TAUCETI_LOOKAHEAD=1`."""
-    return os.environ.get(ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    """Ports of the fork's lookahead branches: `TAUCETI_LOOKAHEAD=1`, or `=ports` for ports alone."""
+    return _mode() in ("1", "true", "yes", "on", PORTS)
+
+
+def sessions() -> bool:
+    """Lookahead sessions, new and resumed, besides the ports: `TAUCETI_LOOKAHEAD=1` only. Under `ports`
+    the fleet finishes porting the branches it has and proves nothing new ahead (owner, 2026-11-09)."""
+    return enabled() and _mode() != PORTS
 
 
 def active() -> bool:
-    """Any lookahead machinery at all, the fork's branches listed: `TAUCETI_LOOKAHEAD` is set, to 1, or
-    to 0 for a fleet that only holds items for their port and sweeps finished branches (the fleet tool
-    always sets one of the two). Unset, nothing here touches GitHub: a test, or a hand-run `work`,
+    """Any lookahead machinery at all, the fork's branches listed: `TAUCETI_LOOKAHEAD` is set, to 1 or
+    `ports`, or to 0 for a fleet that only holds items for their port and sweeps finished branches (the
+    fleet tool always sets one of them). Unset, nothing here touches GitHub: a test, or a hand-run `work`,
     once deleted a real branch through the sweep (2026-10-04)."""
     return bool(os.environ.get(ENV, "").strip())
 
@@ -308,10 +322,12 @@ def port_plan(branch: str, header: Header, open_ports: dict[tuple[str, int], int
 def port_ready(live: Targets, plans: dict[tuple[str, str], PortPlan],
                open_item_prs: dict[tuple[str, str], set[int]]) -> list[tuple[str, TargetItem]]:
     """Items an author may port a split of now, beyond the eligible ones the list offers anyway: an
-    in-flight item whose needs have all landed (the owner's ruling, 2026-10-04: no waiting for merges
-    between independent splits), and an open or in-flight item whose branch stubs nothing, whatever
-    its needs. Either way every open PR carrying its marker is one of this branch's port PRs, and the
-    plan has a ready split."""
+    in-flight item whose needs have all landed, and an open or in-flight item whose branch stubs
+    nothing, whatever its needs. Either way the plan has a ready split and no PR carrying the item's
+    marker is open. One split at a time: TauCeti's housekeeping closes the newer of two open PRs that
+    carry one target id, so a second port opened beside the first is closed unread (35 were,
+    2026-10-25 to 11-09), and the owner's 2026-10-04 ruling (no waiting for merges between independent
+    splits) cannot hold under it."""
     out = []
     for area, items in live.areas.items():
         for it in items:
@@ -321,7 +337,7 @@ def port_ready(live: Targets, plans: dict[tuple[str, str], PortPlan],
             if not plan.header.stub_free:
                 if it.status != "inflight" or any(_status(live, n) != "done" for n in it.needs):
                     continue
-            if not open_item_prs.get((area, it.slug), set()) <= set(plan.opened.values()):
+            if plan.opened or open_item_prs.get((area, it.slug)):
                 continue
             out.append((area, it))
     return out
