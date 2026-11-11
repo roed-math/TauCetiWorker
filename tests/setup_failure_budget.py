@@ -43,8 +43,9 @@ STUBS = "timeout(){ shift; \"$@\"; }; "
 
 def bootstrap(lake_body):
     cmd = agents.bubble_work_cmd("echo AGENT-STARTED")
+    # Outside any git checkout, so the step that fetches origin/main for a branch behind it stays off.
     return subprocess.run(["bash", "-c", f"lake(){{ {lake_body}; }}; {STUBS}{cmd}"],
-                          capture_output=True, text=True)
+                          cwd=tempfile.mkdtemp(), capture_output=True, text=True)
 
 
 r = bootstrap("echo lake-failed >&2; return 1")

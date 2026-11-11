@@ -83,7 +83,8 @@ def run_bootstrap(*, mathlib=0, tauceti=0, build=0, tauceti_msg=""):
         "MARKER": str(marker),
     }
     cmd = tc.bubble_work_cmd("sh -c 'touch \"$MARKER\"'")
-    result = subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True)
+    # Outside any git checkout, so the step that fetches origin/main for a branch behind it stays off.
+    result = subprocess.run(["bash", "-c", cmd], env=env, cwd=shimdir, capture_output=True, text=True)
     return result, calls.read_text().splitlines()
 
 

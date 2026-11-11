@@ -1925,6 +1925,26 @@ def bubble_work_cmd(inner: str) -> str:
         "fi; "
         "fi; "
         'rm -f "$tc_log"; '
+        # A branch behind main also gets the mapping of main's newest cached commit; Lake downloads an
+        # artifact when a build first needs it. The agent's own `lake cache get` after merging main runs
+        # before the merge is committed, so it walks the branch's history and restores the branch's old
+        # base, and the build then compiled everything main changed since: 30% of rebase rounds died at
+        # the round timeout (2026-10-25 to 11-10, all fleets).
+        'if git fetch -q origin main 2>/dev/null && ! git merge-base --is-ancestor origin/main HEAD 2>/dev/null; then '
+        'mc_log="$(mktemp)"; '
+        'main_rev="$(python3 "${TAUCETI_ROUND_DIR:-/opt/round}/main-cache-rev" '
+        f'--service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} 2>"$mc_log")" || main_rev=; '
+        'main_tc="$(git show origin/main:lean-toolchain 2>/dev/null | tr -d "[:space:]")"; '
+        'if [ -n "$main_rev" ] && '
+        f'{fetch} --rev="$main_rev" ${{main_tc:+--toolchain="$main_tc"}} --mappings-only >>"$mc_log" 2>&1; then '
+        'echo "main cache: outputs of $main_rev, the newest cached commit on main, are ready for merging main" >&2; '
+        "grep -m1 'newer ones have none' \"$mc_log\" | sed 's/^/  /' >&2 || true; "
+        "else "
+        "echo 'warning: no cached outputs fetched for main; merging main will rebuild what main changed' >&2; "
+        "sed 's/^/  main cache: /' \"$mc_log\" >&2; "
+        "fi; "
+        'rm -f "$mc_log"; '
+        "fi; "
         "if ! timeout 1800 lake build; then "
         "echo 'warning: pre-agent lake build failed or timed out; the agent starts from a red tree' >&2; "
         "fi; "
@@ -2000,6 +2020,7 @@ BUBBLE_ROUND_SCRIPTS = (
     "tauceti-gate",
     "lookahead-check",
     "link-mathlib-store",
+    "main-cache-rev",
     "uvx",
 )
 

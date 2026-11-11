@@ -62,6 +62,8 @@ RUN_STDLIB=(
   auto_stage_priority.py
   authoring_profiles.py
   bubble_cache.py
+  bubble_main_cache.py
+  main_cache_rev.py
   cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
