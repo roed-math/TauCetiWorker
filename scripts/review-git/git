@@ -3,34 +3,54 @@
 
 Inside a bubble, git reaches GitHub only through bubble's auth proxy, and that routing lives in the
 container user's ~/.gitconfig (`url.<proxy>.insteadOf = https://github.com/` plus the proxy's token
-header). TauCetiReview's pr_diff (#146, 2026-09-26) runs git with GIT_CONFIG_GLOBAL=/dev/null so no
-user or system config can affect the diff; in a bubble that also dropped the routing, git tried
-github.com directly, the sandbox refused, and every review died after a 135 s connect timeout
-("could not compute the diff"). This wrapper re-applies exactly those two kinds of setting, from the
-same file, as `-c` options, and only when the caller has blanked the global config; otherwise it is
-plain git. It is first on PATH only for review rounds.
+header). TauCetiReview runs source git with GIT_CONFIG_GLOBAL=/dev/null (pr_diff since #146, 09-26) and,
+for scoped credentials, only https allowed (#229, 11-11), so git dialled github.com directly, the sandbox
+refused, and every review died after a 135 s connect timeout. When the global config is blanked, this
+re-applies those two kinds of setting for http(s) proxies as `-c` options and allows the proxy's
+scheme; otherwise it is plain git. It is first on PATH only for review rounds.
 """
 
 import os
 import shutil
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 here = os.path.dirname(os.path.abspath(__file__))
-rest = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
-                       if p and os.path.abspath(p) != here)
+rest = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if p and os.path.abspath(p) != here)
 real = shutil.which("git", path=rest)
 if real is None:
     sys.exit("review-git: no git on PATH")
 args = [real]
 if os.environ.get("GIT_CONFIG_GLOBAL") == os.devnull:
-    cfg = os.path.join(os.environ.get("HOME", ""), ".gitconfig")
-    if os.path.isfile(cfg):
-        out = subprocess.run(
-            [real, "config", "--file", cfg, "--get-regexp", r"^(url\..*\.insteadof|http\..*\.extraheader)$"],
-            capture_output=True, text=True,
+    config = os.path.join(os.environ.get("HOME", ""), ".gitconfig")
+    if os.path.isfile(config):
+        # The caller's GIT_CONFIG_* entries must not leak into reading Bubble's own file.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG")}
+        listed = subprocess.run(
+            [
+                real,
+                "config",
+                "--file",
+                config,
+                "--null",
+                "--get-regexp",
+                r"^(url\..*\.insteadof|http\..*\.extraheader)$",
+            ],
+            capture_output=True,
+            text=True,
+            env=clean,
         ).stdout
-        for line in out.splitlines():
-            key, _, value = line.partition(" ")
+        schemes = set()
+        for entry in filter(None, listed.split("\0")):
+            key, _, value = entry.partition("\n")
+            section, _, name = key.rpartition(".")
+            scheme = urlsplit(section.split(".", 1)[1]).scheme
+            if scheme not in ("http", "https") or "=" in key:
+                continue
             args += ["-c", f"{key}={value}"]
+            if name == "insteadof":
+                schemes.add(scheme)
+        for scheme in sorted(schemes):
+            args += ["-c", f"protocol.{scheme}.allow=always"]
 os.execv(real, args + sys.argv[1:])
